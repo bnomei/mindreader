@@ -28,6 +28,7 @@ const SCHEMA_STRUCTURAL_RELS: &[&str] = &[
 ];
 const SYSTEM_OWNED_RELS: &[&str] = &["CONTRADICTS", "SUPERSEDES"];
 const FACT_LOCK_SCOPE: &str = "@fact";
+const LAYERS_PROPERTY: &str = "mindreader:property/layers";
 
 fn reject_system_owned_predicate(predicate: &str) -> Result<()> {
     if structural_rel_for(predicate)
@@ -1177,17 +1178,30 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
     }
     .resolved_iri(&subject_kind);
     let object_value = ObjectValue::from_input(args.o)?;
+    let object_iri = object_value.resolved_iri();
     let prop_iri = predicate.iri().to_string();
     let structural = structural_rel_for(&prop_iri);
     let mut txn = graph.start_txn().await?;
     let write = async {
         acquire_fact_locks_in_txn(
             &mut txn,
-            &[(
-                subject_iri.clone(),
-                prop_iri.clone(),
-                FACT_LOCK_SCOPE.into(),
-            )],
+            &[
+                (
+                    subject_iri.clone(),
+                    prop_iri.clone(),
+                    FACT_LOCK_SCOPE.into(),
+                ),
+                (
+                    subject_iri.clone(),
+                    LAYERS_PROPERTY.into(),
+                    FACT_LOCK_SCOPE.into(),
+                ),
+                (
+                    object_iri.clone(),
+                    LAYERS_PROPERTY.into(),
+                    FACT_LOCK_SCOPE.into(),
+                ),
+            ],
         )
         .await?;
         let subject = merge_node_in_txn(
@@ -1395,11 +1409,28 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
     let mut txn = graph.start_txn().await?;
     acquire_fact_locks_in_txn(
         &mut txn,
-        &[(
-            subject_iri.clone(),
-            prop_iri.clone(),
-            FACT_LOCK_SCOPE.into(),
-        )],
+        &[
+            (
+                subject_iri.clone(),
+                prop_iri.clone(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+            (
+                subject_iri.clone(),
+                LAYERS_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+            (
+                old_iri.clone(),
+                LAYERS_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+            (
+                new_iri.clone(),
+                LAYERS_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+        ],
     )
     .await?;
     let old_currents = find_current_pairs_txn(
@@ -1891,16 +1922,43 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
         )
         .into());
     }
+    let relationship_fact = if args.target.kind == "relationship" {
+        Some(
+            fetch_one(
+                graph,
+                query(
+                    "MATCH (s:Entity)-[target]->() \
+                     WHERE target.iri = $iri AND target.validTo IS NULL \
+                     RETURN s.iri AS subject, \
+                       coalesce(target.propertyIri, 'mindreader:property/' + type(target)) AS property",
+                )
+                .param("iri", args.target.iri.clone()),
+            )
+            .await?
+            .map(|row| {
+                Ok::<_, anyhow::Error>((
+                    row.get::<String>("subject")?,
+                    row.get::<String>("property")?,
+                ))
+            })
+            .transpose()?
+            .ok_or_else(|| {
+                DomainError::Precondition("layer target is missing, hidden, or historical".into())
+            })?,
+        )
+    } else {
+        None
+    };
+    let mut locks = vec![(
+        args.target.iri.clone(),
+        LAYERS_PROPERTY.into(),
+        FACT_LOCK_SCOPE.into(),
+    )];
+    if let Some((subject, property)) = relationship_fact {
+        locks.push((subject, property, FACT_LOCK_SCOPE.into()));
+    }
     let mut txn = graph.start_txn().await?;
-    acquire_fact_locks_in_txn(
-        &mut txn,
-        &[(
-            args.target.iri.clone(),
-            "mindreader:property/layers".into(),
-            FACT_LOCK_SCOPE.into(),
-        )],
-    )
-    .await?;
+    acquire_fact_locks_in_txn(&mut txn, &locks).await?;
     let row = if args.target.kind == "node" {
         fetch_one_txn(
             &mut txn,
@@ -2042,15 +2100,18 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
     } else {
         "MATCH ()-[target]->() WHERE target.iri = $iri AND target.validTo IS NULL"
     };
-    txn.run(
+    fetch_one_txn(
+        &mut txn,
         query(&format!(
-            "{target_match} SET target.layers = $layers, target.layersUpdatedAt = datetime(), target.layerEpisodeId = $episode"
+            "{target_match} SET target.layers = $layers, target.layersUpdatedAt = datetime(), \
+             target.layerEpisodeId = $episode RETURN target.iri AS iri"
         ))
         .param("iri", args.target.iri.clone())
         .param("layers", after.clone())
         .param("episode", episode.iri.clone()),
     )
-    .await?;
+    .await?
+    .ok_or_else(|| DomainError::Precondition("layer target changed concurrently".into()))?;
     txn.commit()
         .await
         .map_err(|error| anyhow!("commit memory_layers transaction failed: {error}"))?;
@@ -2215,21 +2276,30 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
     }
     let mut txn = graph.start_txn().await?;
     let write = async {
-        acquire_fact_locks_in_txn(
-            &mut txn,
-            &definitions
-                .iter()
-                .map(|(_, property, _, _)| {
-                    (iri.clone(), (*property).to_string(), FACT_LOCK_SCOPE.into())
-                })
-                .collect::<Vec<_>>(),
-        )
-        .await?;
+        let mut locks = definitions
+            .iter()
+            .map(|(_, property, _, _)| {
+                (iri.clone(), (*property).to_string(), FACT_LOCK_SCOPE.into())
+            })
+            .collect::<Vec<_>>();
+        locks.push((iri.clone(), LAYERS_PROPERTY.into(), FACT_LOCK_SCOPE.into()));
+        locks.extend(definitions.iter().map(|(_, _, target, _)| {
+            (
+                target
+                    .iri
+                    .clone()
+                    .expect("schema definition targets always have an IRI"),
+                LAYERS_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            )
+        }));
+        acquire_fact_locks_in_txn(&mut txn, &locks).await?;
         let existing_ready = fetch_one_txn(
             &mut txn,
             query(
                 "OPTIONAL MATCH (n:Entity {iri: $iri}) RETURN n IS NOT NULL \
-                 AND $label IN labels(n) AND coalesce(n.stub, false) = false AS ready",
+                 AND $label IN labels(n) AND coalesce(n.stub, false) = false \
+                 AND size(coalesce(n.layers, [])) = 0 AS ready",
             )
             .param("iri", iri.clone())
             .param("label", label.to_string()),
@@ -2240,14 +2310,26 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
         let node = merge_node_in_txn(&mut txn, &subject_spec, &kind, &[]).await?;
         let mut resolved = Vec::new();
         let mut changed = !existing_ready || node.created;
+        changed |= apply_node_memberships_txn(&mut txn, &node, &[]).await?;
         for (rel, property, target_spec, target_kind) in definitions {
             let target = merge_node_in_txn(&mut txn, &target_spec, target_kind, &[]).await?;
+            let target_globalized = apply_node_memberships_txn(&mut txn, &target, &[]).await?;
             let current =
-                !find_current_pairs_txn(&mut txn, &node.iri, property, Some(rel), &target.iri)
-                    .await?
-                    .is_empty();
-            changed |= target.created || !current;
-            resolved.push((rel, property, target, current));
+                find_current_pairs_txn(&mut txn, &node.iri, property, Some(rel), &target.iri)
+                    .await?;
+            if current.len() > 1 {
+                return Err(anyhow!(
+                    "multiple current schema relationship identities for ({}, {}, {})",
+                    node.iri,
+                    property,
+                    target.iri
+                ));
+            }
+            let relationship_needs_global = current
+                .first()
+                .is_none_or(|current| !current.layers.is_empty());
+            changed |= target.created || target_globalized || relationship_needs_global;
+            resolved.push((rel, property, target));
         }
         if !changed {
             return Ok::<_, anyhow::Error>((None, node_json_from_merged(&node), Vec::new()));
@@ -2258,32 +2340,22 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
         )
         .await?;
         let mut links = Vec::new();
-        for (rel, property, target, current) in resolved {
+        for (rel, property, target) in resolved {
             let text = format!("{} {rel} {}", node.iri, target.iri);
-            let (relationship_iri, _) = if current {
-                let current =
-                    find_current_pairs_txn(&mut txn, &node.iri, property, Some(rel), &target.iri)
-                        .await?
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| anyhow!("schema relationship disappeared"))?;
-                (current.iri, false)
-            } else {
-                ensure_relation_txn(
-                    &mut txn,
-                    &RelationWrite {
-                        rel_type: rel,
-                        s: &node.iri,
-                        o: &target.iri,
-                        prop_iri: property,
-                        layers: &[],
-                        episode: &episode,
-                        reason: None,
-                        fact_text: &text,
-                    },
-                )
-                .await?
-            };
+            let (relationship_iri, _) = ensure_relation_txn(
+                &mut txn,
+                &RelationWrite {
+                    rel_type: rel,
+                    s: &node.iri,
+                    o: &target.iri,
+                    prop_iri: property,
+                    layers: &[],
+                    episode: &episode,
+                    reason: None,
+                    fact_text: &text,
+                },
+            )
+            .await?;
             links.push(json!({ "rel": rel, "to": target.iri, "iri": relationship_iri }));
         }
         let refreshed = refreshed_node_json_txn(&mut txn, &node.iri).await?;

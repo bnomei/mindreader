@@ -10,7 +10,7 @@ if [[ "$publishing_checkout_count" != "5" ]]; then
   exit 1
 fi
 
-for validation in 'git show-ref --verify --quiet' '^{commit}' 'git rev-parse HEAD' 'scripts/resolve-version.sh'; do
+for validation in 'git show-ref --verify --quiet' '^{commit}' 'git rev-parse HEAD' 'scripts/resolve-version.sh' 'stable SemVer prefixed with v'; do
   grep -Fq "$validation" "$WORKFLOW" || {
     echo "Release workflow is missing validation: $validation" >&2
     exit 1
