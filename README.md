@@ -60,3 +60,7 @@ cargo run --bin mindreader-smoke
 Bolt: `bolt://127.0.0.1:7687` (HTTP browser `http://127.0.0.1:7474`). Container `neo4j-graph-memory`, Community 2026.07.1.
 
 If it is down, read `/workspace/neo4j/STATUS.md`. `dockerd` may need a manual start, then `sudo docker start neo4j-graph-memory`.
+
+## Skills
+
+What belongs in the graph, and how to assert it: [skills/writing-to-mindreader/SKILL.md](skills/writing-to-mindreader/SKILL.md).
