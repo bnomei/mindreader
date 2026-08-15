@@ -1,23 +1,16 @@
 use crate::domain::DomainError;
 use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, fetch_all_txn, fetch_one_txn, node_json,
-    Episode,
+    structural_rel_for, Episode,
 };
-use anyhow::{anyhow, Result};
-use neo4rs::{query, Graph, Node, Relation, Txn};
+use anyhow::{anyhow, Context, Result};
+use neo4rs::{query, Error as Neo4jDriverError, Graph, Neo4jErrorKind, Node, Relation, Txn};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::time::{sleep, Duration};
 
-const NON_DOMAIN_LABELS: &[&str] = &[
-    "Entity",
-    "FactLock",
-    "MindreaderMeta",
-    "SemanticActivation",
-    "TTL",
-];
 const FORBIDDEN_ENTITY_LABELS: &[&str] = &[
     "Literal",
     "Episode",
@@ -25,6 +18,36 @@ const FORBIDDEN_ENTITY_LABELS: &[&str] = &[
     "MindreaderMeta",
     "SemanticActivation",
     "TTL",
+];
+const CANONICAL_KIND_LABELS: &[&str] = &[
+    "Class",
+    "Property",
+    "Element",
+    "Signal",
+    "Pattern",
+    "Insight",
+    "Knowledge",
+];
+const FACT_LOCK_SCOPE: &str = "@fact";
+const LAYERS_PROPERTY: &str = "mindreader:property/layers";
+const PREDICATE_USAGE_PROPERTY: &str = "mindreader:property/predicate-usage";
+const WEIGHT_PROPERTY: &str = "mindreader:property/weight";
+const SYSTEM_OWNED_RELS: &[&str] = &["CONTRADICTS", "SUPERSEDES"];
+const BOOTSTRAP_SEEDED_IRIS: &[&str] = &[
+    "mindreader:class/Class",
+    "mindreader:class/Property",
+    "mindreader:class/Element",
+    "mindreader:property/ABOUT",
+    "mindreader:property/INSTANCE_OF",
+    "mindreader:property/SUBCLASS_OF",
+    "mindreader:property/SUBPROPERTY_OF",
+    "mindreader:property/DOMAIN",
+    "mindreader:property/RANGE",
+    "mindreader:property/EVIDENCE_FOR",
+    "mindreader:property/DERIVED_FROM",
+    "mindreader:property/SUPPORTS",
+    "mindreader:property/CONTRADICTS",
+    "mindreader:property/SUPERSEDES",
 ];
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -46,7 +69,13 @@ pub async fn memory_merge(graph: &Graph, args: MergeArgs) -> Result<Value> {
 }
 
 fn is_transient(error: &anyhow::Error) -> bool {
-    error.to_string().contains("TransientError")
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<Neo4jDriverError>()
+            .is_some_and(|driver| {
+                matches!(driver, Neo4jDriverError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
+            })
+    })
 }
 
 async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
@@ -58,13 +87,19 @@ async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
     if source == target {
         return Err(DomainError::InvalidInput("source and target must be different".into()).into());
     }
+    if is_bootstrap_seeded(source) {
+        return Err(DomainError::InvalidInput(
+            "bootstrap-seeded Class and Property IRIs cannot be merge sources".into(),
+        )
+        .into());
+    }
     let mut txn = graph.start_txn().await?;
     let result = merge_in_txn(&mut txn, source, target).await;
     match result {
         Ok(node) => {
             txn.commit()
                 .await
-                .map_err(|error| anyhow!("commit memory_merge transaction failed: {error}"))?;
+                .context("commit memory_merge transaction failed")?;
             Ok(node)
         }
         Err(error) => {
@@ -78,8 +113,42 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     acquire_fact_locks_in_txn(
         txn,
         &[
-            (source_iri.into(), "@merge".into(), "@merge".into()),
-            (target_iri.into(), "@merge".into(), "@merge".into()),
+            (
+                source_iri.into(),
+                PREDICATE_USAGE_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+            (
+                target_iri.into(),
+                PREDICATE_USAGE_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+        ],
+    )
+    .await?;
+    acquire_fact_locks_in_txn(
+        txn,
+        &[
+            (
+                source_iri.into(),
+                LAYERS_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+            (
+                source_iri.into(),
+                WEIGHT_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+            (
+                target_iri.into(),
+                LAYERS_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
+            (
+                target_iri.into(),
+                WEIGHT_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            ),
         ],
     )
     .await?;
@@ -102,12 +171,18 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     let target: Node = row.get("target")?;
     reject_internal_node(&source, "source")?;
     reject_internal_node(&target, "target")?;
+    let kind = require_same_kind(&source, &target)?;
+    let property_merge = kind == "Property";
+    if property_merge {
+        require_compatible_property_merge(source_iri, target_iri)?;
+    }
 
     let affected_facts = fetch_all_txn(
         txn,
         query(
             "MATCH (s:Entity)-[r]->(o:Entity) \
              WHERE s.iri IN [$source, $target] OR o.iri IN [$source, $target] \
+                OR r.propertyIri IN [$source, $target] \
              RETURN DISTINCT s.iri AS subject, \
                coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property",
         )
@@ -198,8 +273,94 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
         )
         .await?;
     }
-    consolidate_current_duplicates(txn, target_iri, &episode).await?;
+    if property_merge {
+        txn.run(
+            query(
+                "MATCH ()-[r]->() WHERE r.propertyIri = $source \
+                 SET r.propertyIri = $target, r.mergeEpisodeId = $episode",
+            )
+            .param("source", source_iri.to_string())
+            .param("target", target_iri.to_string())
+            .param("episode", episode.iri.clone()),
+        )
+        .await?;
+    }
+    txn.run(
+        query(
+            r#"
+            MATCH (s:Entity)-[r]->(o:Entity)
+            WHERE r.mergeEpisodeId = $episode
+               OR ($propertyMerge AND r.propertyIri = $target)
+            WITH s, r, o,
+                 coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
+            WITH s, r, o,
+                 CASE
+                   WHEN property CONTAINS '/' THEN last(split(property, '/'))
+                   WHEN property CONTAINS ':' THEN last(split(property, ':'))
+                   ELSE property
+                 END AS propertyName
+            SET r.factText = trim(
+              coalesce(s.name, s.iri) + ' ' + propertyName + ' ' +
+              coalesce(o.value, o.name, o.iri)
+            )
+            "#,
+        )
+        .param("episode", episode.iri.clone())
+        .param("propertyMerge", property_merge)
+        .param("target", target_iri.to_string()),
+    )
+    .await?;
+    consolidate_current_duplicates(txn, target_iri, property_merge, &episode).await?;
     Ok(node_json(&merged_node))
+}
+
+fn canonical_kinds(node: &Node) -> BTreeSet<String> {
+    node.labels()
+        .into_iter()
+        .filter(|label| CANONICAL_KIND_LABELS.contains(label))
+        .map(str::to_string)
+        .collect()
+}
+
+fn require_same_kind(source: &Node, target: &Node) -> Result<String> {
+    let source_kinds = canonical_kinds(source);
+    let target_kinds = canonical_kinds(target);
+    if source_kinds.len() != 1 || source_kinds != target_kinds {
+        return Err(DomainError::InvalidInput(
+            "source and target must have the same single canonical kind".into(),
+        )
+        .into());
+    }
+    Ok(source_kinds.into_iter().next().expect("one kind checked"))
+}
+
+fn require_compatible_property_merge(source_iri: &str, target_iri: &str) -> Result<()> {
+    let source_rel = structural_rel_for(source_iri);
+    let target_rel = structural_rel_for(target_iri);
+    if source_rel
+        .as_deref()
+        .is_some_and(|rel| SYSTEM_OWNED_RELS.contains(&rel))
+        || target_rel
+            .as_deref()
+            .is_some_and(|rel| SYSTEM_OWNED_RELS.contains(&rel))
+    {
+        return Err(DomainError::InvalidInput(
+            "system-owned CONTRADICTS and SUPERSEDES Properties cannot be merged".into(),
+        )
+        .into());
+    }
+    if source_rel != target_rel {
+        return Err(DomainError::InvalidInput(
+            "Properties can be merged only when both use the same structural relationship type"
+                .into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn is_bootstrap_seeded(iri: &str) -> bool {
+    BOOTSTRAP_SEEDED_IRIS.contains(&iri)
 }
 
 fn reject_internal_node(node: &Node, field: &str) -> Result<()> {
@@ -254,17 +415,20 @@ struct DuplicateFact {
 async fn consolidate_current_duplicates(
     txn: &mut Txn,
     target_iri: &str,
+    include_property_facts: bool,
     episode: &Episode,
 ) -> Result<()> {
     let rows = fetch_all_txn(
         txn,
         query(
             "MATCH (s:Entity)-[r]->(o:Entity) \
-             WHERE r.validTo IS NULL AND (s.iri = $target OR o.iri = $target) \
+             WHERE r.validTo IS NULL AND (s.iri = $target OR o.iri = $target \
+                OR ($includePropertyFacts AND r.propertyIri = $target)) \
              RETURN s.iri AS s, type(r) AS type, coalesce(r.propertyIri, '') AS property, \
                     o.iri AS o, r",
         )
-        .param("target", target_iri.to_string()),
+        .param("target", target_iri.to_string())
+        .param("includePropertyFacts", include_property_facts),
     )
     .await?;
     let mut groups: BTreeMap<(String, String, String, String), Vec<DuplicateFact>> =
@@ -345,8 +509,10 @@ async fn consolidate_current_duplicates(
 pub async fn merge_suggestions_in_txn(
     txn: &mut Txn,
     created_iris: &[String],
+    layers: &[String],
 ) -> Result<Vec<Value>> {
     let mut suggestions = Vec::new();
+    let created_set = created_iris.iter().cloned().collect::<BTreeSet<_>>();
     for created_iri in created_iris {
         let rows = fetch_all_txn(
             txn,
@@ -355,21 +521,29 @@ pub async fn merge_suggestions_in_txn(
                 MATCH (created:Entity {iri: $iri}), (candidate:Entity)
                 WHERE candidate <> created
                   AND created.name IS NOT NULL AND candidate.name IS NOT NULL
+                  AND (size(coalesce(candidate.layers, [])) = 0
+                       OR any(layer IN coalesce(candidate.layers, []) WHERE layer IN $layers))
                   AND none(label IN labels(created) WHERE label IN $forbidden)
                   AND none(label IN labels(candidate) WHERE label IN $forbidden)
-                  AND any(label IN labels(created)
-                          WHERE NOT label IN $nonDomain AND label IN labels(candidate))
+                  AND size([label IN labels(created) WHERE label IN $canonicalKinds]) = 1
+                  AND size([label IN labels(candidate) WHERE label IN $canonicalKinds]) = 1
+                  AND all(label IN labels(created)
+                          WHERE NOT label IN $canonicalKinds OR label IN labels(candidate))
+                  AND all(label IN labels(candidate)
+                          WHERE NOT label IN $canonicalKinds OR label IN labels(created))
                   AND apoc.text.fuzzyMatch(toLower(created.name), toLower(candidate.name))
                 WITH created, candidate,
                      apoc.text.levenshteinSimilarity(toLower(created.name), toLower(candidate.name)) AS similarity
                 RETURN created.iri AS createdIri, created.name AS createdName,
                        candidate.iri AS candidateIri, candidate.name AS candidateName,
+                       head([label IN labels(created) WHERE label IN $canonicalKinds]) AS canonicalKind,
                        similarity
                 ORDER BY similarity DESC, size(candidate.name) ASC, candidate.iri ASC
                 LIMIT 3
                 "#,
             )
             .param("iri", created_iri.clone())
+            .param("layers", layers.to_vec())
             .param(
                 "forbidden",
                 FORBIDDEN_ENTITY_LABELS
@@ -378,8 +552,8 @@ pub async fn merge_suggestions_in_txn(
                     .collect::<Vec<_>>(),
             )
             .param(
-                "nonDomain",
-                NON_DOMAIN_LABELS
+                "canonicalKinds",
+                CANONICAL_KIND_LABELS
                     .iter()
                     .map(|label| label.to_string())
                     .collect::<Vec<_>>(),
@@ -391,12 +565,24 @@ pub async fn merge_suggestions_in_txn(
             let created_name: String = row.get("createdName")?;
             let candidate_iri: String = row.get("candidateIri")?;
             let candidate_name: String = row.get("candidateName")?;
-            let (source, source_name, target, target_name) =
-                if created_name.chars().count() < candidate_name.chars().count() {
-                    (candidate_iri, candidate_name, created_iri, created_name)
-                } else {
-                    (created_iri, created_name, candidate_iri, candidate_name)
-                };
+            let canonical_kind: String = row.get("canonicalKind")?;
+            if canonical_kind == "Property"
+                && require_compatible_property_merge(&created_iri, &candidate_iri).is_err()
+            {
+                continue;
+            }
+            let candidate_was_created = created_set.contains(&candidate_iri);
+            let created_first_on_tie = candidate_was_created && created_iri < candidate_iri;
+            let created_is_target = is_bootstrap_seeded(&created_iri)
+                || (!is_bootstrap_seeded(&candidate_iri)
+                    && (created_name.chars().count() < candidate_name.chars().count()
+                        || (created_name.chars().count() == candidate_name.chars().count()
+                            && created_first_on_tie)));
+            let (source, source_name, target, target_name) = if created_is_target {
+                (candidate_iri, candidate_name, created_iri, created_name)
+            } else {
+                (created_iri, created_name, candidate_iri, candidate_name)
+            };
             suggestions.push(json!({
                 "source": { "iri": source, "name": source_name },
                 "target": { "iri": target, "name": target_name },
@@ -427,7 +613,7 @@ pub async fn merge_suggestions_in_txn(
 
 #[cfg(test)]
 mod tests {
-    use super::merge_memberships;
+    use super::{is_bootstrap_seeded, merge_memberships, require_compatible_property_merge};
 
     #[test]
     fn global_membership_dominates_merge() {
@@ -436,5 +622,34 @@ mod tests {
             merge_memberships(&["project:b".into()], &["project:a".into()]),
             vec!["project:a", "project:b"]
         );
+    }
+
+    #[test]
+    fn property_merges_preserve_relationship_representation() {
+        assert!(require_compatible_property_merge(
+            "mindreader:property/custom-a",
+            "mindreader:property/custom-b"
+        )
+        .is_ok());
+        assert!(
+            require_compatible_property_merge("example:ABOUT", "mindreader:property/ABOUT").is_ok()
+        );
+        assert!(require_compatible_property_merge(
+            "mindreader:property/custom",
+            "mindreader:property/ABOUT"
+        )
+        .is_err());
+        assert!(require_compatible_property_merge(
+            "example:CONTRADICTS",
+            "mindreader:property/CONTRADICTS"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bootstrap_seeded_entities_are_permanent_targets_only() {
+        assert!(is_bootstrap_seeded("mindreader:class/Element"));
+        assert!(is_bootstrap_seeded("mindreader:property/ABOUT"));
+        assert!(!is_bootstrap_seeded("mindreader:property/custom"));
     }
 }

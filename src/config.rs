@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::{collections::HashMap, env};
 
 const CONFIG_FILE: &str = "config.toml";
 const SECRETS_FILE: &str = ".env";
@@ -89,6 +90,13 @@ impl SemanticConfig {
     fn validate(&self) -> Result<()> {
         if self.ttl_days == 0 {
             return Err(anyhow!("semantic.ttl_days must be greater than zero"));
+        }
+        if self
+            .ttl_days
+            .checked_mul(86_400_000)
+            .is_none_or(|milliseconds| milliseconds > i64::MAX as u64)
+        {
+            return Err(anyhow!("semantic.ttl_days is too large"));
         }
         if !(1..=100).contains(&self.neighbor_limit) {
             return Err(anyhow!("semantic.neighbor_limit must be between 1 and 100"));
@@ -221,11 +229,18 @@ fn initialize_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
+fn nonempty(value: Option<String>) -> Option<String> {
+    value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
+}
+
+fn prefer_nonempty(process: Option<String>, file: Option<String>) -> Option<String> {
+    nonempty(process).or_else(|| nonempty(file))
+}
+
+fn resolve_secret(name: &str, file: &HashMap<String, String>) -> Option<String> {
+    prefer_nonempty(env::var(name).ok(), file.get(name).cloned())
 }
 
 impl Config {
@@ -236,24 +251,26 @@ impl Config {
     fn from_dir(config_dir: PathBuf) -> Result<Self> {
         initialize_directory(&config_dir)?;
         let secrets_path = config_dir.join(SECRETS_FILE);
-        dotenvy::from_path(&secrets_path)
-            .with_context(|| format!("load Mindreader secrets from {}", secrets_path.display()))?;
+        let file_secrets = dotenvy::from_path_iter(&secrets_path)
+            .with_context(|| format!("load Mindreader secrets from {}", secrets_path.display()))?
+            .collect::<std::result::Result<HashMap<_, _>, _>>()
+            .with_context(|| format!("parse Mindreader secrets from {}", secrets_path.display()))?;
         let config_path = config_dir.join(CONFIG_FILE);
         let contents = fs::read_to_string(&config_path)
             .with_context(|| format!("read Mindreader config from {}", config_path.display()))?;
         let file: FileConfig = toml::from_str(&contents)
             .with_context(|| format!("parse Mindreader config from {}", config_path.display()))?;
         file.semantic.validate()?;
-        let password = nonempty_env("NEO4J_PASSWORD");
+        let password = resolve_secret("NEO4J_PASSWORD", &file_secrets);
 
-        let embedding = if let Some(api_key) = nonempty_env("OPENAI_API_KEY") {
+        let embedding = if let Some(api_key) = resolve_secret("OPENAI_API_KEY", &file_secrets) {
             Some(selected_embedding(
                 EmbeddingProviderKind::OpenAi,
                 &file.embeddings.openai,
                 api_key,
                 "embeddings.openai",
             )?)
-        } else if let Some(api_key) = nonempty_env("XAI_API_KEY") {
+        } else if let Some(api_key) = resolve_secret("XAI_API_KEY", &file_secrets) {
             Some(selected_embedding(
                 EmbeddingProviderKind::XAi,
                 &file.embeddings.xai,
@@ -355,5 +372,17 @@ mod tests {
         config.convergence_similarity_threshold = 0.9;
         config.neighbor_limit = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn empty_process_style_value_falls_back_to_nonempty_file_value() {
+        assert_eq!(
+            prefer_nonempty(Some("  ".into()), Some(" file-secret ".into())),
+            Some("file-secret".into())
+        );
+        assert_eq!(
+            prefer_nonempty(Some(" process-secret ".into()), Some("file-secret".into())),
+            Some("process-secret".into())
+        );
     }
 }

@@ -363,7 +363,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_merge",
-        description = "Permanently merge source into target across all memberships and history. The target IRI and name survive. Use advisory mergeSuggestions for direction, but review them first and reverse them when appropriate.",
+        description = "Permanently merge a source into a target of the same canonical kind across all memberships and history. The target IRI and name survive. Use advisory mergeSuggestions for direction, but review them first and reverse them when appropriate.",
         input_schema = schema_memory_merge()
     )]
     async fn memory_merge(

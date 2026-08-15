@@ -322,7 +322,8 @@ async fn persist_activation(
         .config
         .ttl_days
         .checked_mul(86_400_000)
-        .ok_or_else(|| anyhow!("semantic TTL is too large"))? as i64;
+        .and_then(|milliseconds| i64::try_from(milliseconds).ok())
+        .ok_or_else(|| anyhow!("semantic TTL is too large"))?;
     if let Some(existing) = convergence {
         let midpoint = existing
             .embedding

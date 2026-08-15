@@ -247,7 +247,7 @@ All tools return structured JSON. Every scoped tool requires a `layers` array; t
 | `memory_feedback` | `layers`, tagged `target`, `mode` | None | Apply exactly `+1` (`strengthen`) or `-1` (`weaken`) to a visible node or current relationship's shared weight. |
 | `memory_layers` | `layers`, tagged `target` | `add`, `remove` (at least one entry across them) | Audit and atomically edit one node or current relationship's memberships. |
 | `memory_schema` | `kind`, plus `name` or `iri` | `subClassOf`, `subPropertyOf`, `domain`, `range` | Declare a Class or Property and its structural links as global records. |
-| `memory_merge` | `source`, `target` IRIs | None | Permanently merge two user-visible non-literal entities across every membership and historical relationship; the target IRI and name survive. |
+| `memory_merge` | same-kind `source`, `target` IRIs | None | Permanently merge two user-visible non-literal entities across every membership and historical relationship; the target IRI and name survive. Property merges also rewrite facts to the surviving predicate and consolidate exact duplicates. |
 
 `memory_assert`, `memory_replace`, and `memory_schema` return `mergeSuggestions` when they create a user-visible entity with a fuzzy same-kind name match. Each suggestion includes the two names, its similarity, and a directly callable `merge: {source, target}` payload. The shorter name is recommended as the target; ties keep the pre-existing candidate. This direction is only a recommendation: inspect identity carefully and reverse or ignore it when appropriate. Names such as `007` and `007s` can be similar while still naming different entities.
 
@@ -342,7 +342,7 @@ Mutations acquire deterministic graph locks and retry Neo4j transient transactio
 
 `CONTRADICTS` is multi-valued. Setting `contradicts: true` on an assertion records explicit links to conflicting visible current objects.
 
-`memory_merge` is the intentional destructive exception to soft history: it removes the source node after moving its memberships and current and historical relationships onto the target. It records exactly one merge `Episode`, preserves the target IRI and name, combines memberships and weights, marks moved relationships with merge provenance, and soft-closes merge-created self-relations and duplicate facts. It creates no alias. Review the direction before calling it.
+`memory_merge` is the intentional destructive exception to soft history: it requires matching canonical kinds and removes the source node after moving its memberships and current and historical relationships onto the target. Bootstrap-seeded Class and Property IRIs are permanent targets and cannot be sources. It records exactly one merge `Episode`, preserves the target IRI and name, combines memberships and weights, marks moved relationships with merge provenance, and soft-closes merge-created self-relations and duplicate facts. Merging Properties rewrites their predicate references and refreshed search text transactionally, but both Properties must use the same structural relationship representation; system-owned `CONTRADICTS` and `SUPERSEDES` Properties cannot be merged. It creates no alias. Review the direction before calling it.
 
 ### Deterministic IRIs
 

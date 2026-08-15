@@ -775,6 +775,133 @@ async fn run() -> Result<u32> {
         ),
     );
 
+    let target_property_name = format!("mergeProperty{tag}");
+    let source_property_name = format!("mergeProperty{tag}s");
+    let target_property = tools::memory_schema(
+        &graph,
+        SchemaArgs {
+            kind: "property".into(),
+            name: Some(target_property_name.clone()),
+            iri: None,
+            sub_class_of: None,
+            sub_property_of: None,
+            domain: None,
+            range: None,
+        },
+    )
+    .await?;
+    let source_property = tools::memory_schema(
+        &graph,
+        SchemaArgs {
+            kind: "property".into(),
+            name: Some(source_property_name.clone()),
+            iri: None,
+            sub_class_of: None,
+            sub_property_of: None,
+            domain: None,
+            range: None,
+        },
+    )
+    .await?;
+    let target_property_iri = target_property
+        .pointer("/node/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("target property has no IRI: {target_property}"))?
+        .to_string();
+    let source_property_iri = source_property
+        .pointer("/node/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("source property has no IRI: {source_property}"))?
+        .to_string();
+    let property_fact = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("property-merge-subject-{tag}")),
+            p: target_property_iri.clone(),
+            o: object(format!("property-merge-object-{tag}")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity_iri(subject_iri(&property_fact)?),
+            p: source_property_iri.clone(),
+            o: object_iri(object_result_iri(&property_fact)?),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    memory_merge(
+        &graph,
+        MergeArgs {
+            source: source_property_iri.clone(),
+            target: target_property_iri.clone(),
+        },
+    )
+    .await?;
+    let property_state = fetch_one(
+        &graph,
+        query(
+            "MATCH (s:Entity {iri: $subject})-[r]->(o:Entity {iri: $object}) \
+             WHERE r.validTo IS NULL \
+             RETURN count(r) AS count, collect(r.propertyIri) AS properties, \
+                    collect(r.factText) AS factTexts",
+        )
+        .param("subject", subject_iri(&property_fact)?)
+        .param("object", object_result_iri(&property_fact)?),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("property merge aggregate returned no row"))?;
+    let wrong_kind = memory_merge(
+        &graph,
+        MergeArgs {
+            source: short_iri.clone(),
+            target: target_property_iri.clone(),
+        },
+    )
+    .await;
+    let incompatible_property = memory_merge(
+        &graph,
+        MergeArgs {
+            source: target_property_iri.clone(),
+            target: "mindreader:property/ABOUT".into(),
+        },
+    )
+    .await;
+    let system_property = memory_merge(
+        &graph,
+        MergeArgs {
+            source: target_property_iri.clone(),
+            target: "mindreader:property/CONTRADICTS".into(),
+        },
+    )
+    .await;
+    report.check(
+        "property merges preserve predicate representation and reject incompatible or system-owned kinds",
+        property_state.get::<i64>("count").unwrap_or(0) == 1
+            && property_state
+                .get::<Vec<String>>("properties")
+                .unwrap_or_default()
+                == vec![target_property_iri]
+            && property_state
+                .get::<Vec<String>>("factTexts")
+                .unwrap_or_default()
+                .iter()
+                .all(|text| !text.contains(&source_property_name))
+            && wrong_kind.is_err()
+            && incompatible_property.is_err()
+            && system_property.is_err(),
+        format!(
+            "propertyState={property_state:?} wrongKind={wrong_kind:?} incompatible={incompatible_property:?} system={system_property:?}"
+        ),
+    );
+
     let semantic_runtime =
         SemanticRuntime::new(Arc::new(SmokeEmbedding), SemanticConfig::default());
     let semantic_args = SemanticSearchArgs {

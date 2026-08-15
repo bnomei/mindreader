@@ -30,6 +30,7 @@ const SCHEMA_STRUCTURAL_RELS: &[&str] = &[
 const SYSTEM_OWNED_RELS: &[&str] = &["CONTRADICTS", "SUPERSEDES"];
 const FACT_LOCK_SCOPE: &str = "@fact";
 const LAYERS_PROPERTY: &str = "mindreader:property/layers";
+const PREDICATE_USAGE_PROPERTY: &str = "mindreader:property/predicate-usage";
 
 fn reject_system_owned_predicate(predicate: &str) -> Result<()> {
     if structural_rel_for(predicate)
@@ -1186,6 +1187,15 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
     let write = async {
         acquire_fact_locks_in_txn(
             &mut txn,
+            &[(
+                prop_iri.clone(),
+                PREDICATE_USAGE_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            )],
+        )
+        .await?;
+        acquire_fact_locks_in_txn(
+            &mut txn,
             &[
                 (
                     subject_iri.clone(),
@@ -1287,7 +1297,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         if property_created {
             created_iris.push(prop_iri.clone());
         }
-        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris).await?;
+        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris, &layers).await?;
         Ok::<_, anyhow::Error>((
             changed,
             episode,
@@ -1424,6 +1434,15 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
     let mut txn = graph.start_txn().await?;
     acquire_fact_locks_in_txn(
         &mut txn,
+        &[(
+            prop_iri.clone(),
+            PREDICATE_USAGE_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        )],
+    )
+    .await?;
+    acquire_fact_locks_in_txn(
+        &mut txn,
         &[
             (
                 subject_iri.clone(),
@@ -1554,7 +1573,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
         if property_created {
             created_iris.push(prop_iri.clone());
         }
-        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris).await?;
+        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris, &layers).await?;
         Ok::<_, anyhow::Error>((
             episode,
             subject_json,
@@ -1664,15 +1683,23 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
         .map(|value| (*value).to_string())
         .collect::<Vec<_>>();
     let mut txn = graph.start_txn().await?;
-    acquire_fact_locks_in_txn(
-        &mut txn,
-        &[(
-            subject_iri.clone(),
-            predicate.clone().unwrap_or_else(|| "*".into()),
-            FACT_LOCK_SCOPE.into(),
-        )],
-    )
-    .await?;
+    if let Some(predicate) = &predicate {
+        acquire_fact_locks_in_txn(
+            &mut txn,
+            &[(
+                predicate.clone(),
+                PREDICATE_USAGE_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            )],
+        )
+        .await?;
+    }
+    let locks = vec![(
+        subject_iri.clone(),
+        predicate.clone().unwrap_or_else(|| "*".into()),
+        FACT_LOCK_SCOPE.into(),
+    )];
+    acquire_fact_locks_in_txn(&mut txn, &locks).await?;
     let rows = match scope {
         RetractScope::Subject => {
             fetch_all_txn(
@@ -2407,7 +2434,7 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
             links.push(json!({ "rel": rel, "to": target.iri, "iri": relationship_iri }));
         }
         let refreshed = refreshed_node_json_txn(&mut txn, &node.iri).await?;
-        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris).await?;
+        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris, &[]).await?;
         Ok::<_, anyhow::Error>((Some(episode), refreshed, links, merge_suggestions))
     }
     .await;
