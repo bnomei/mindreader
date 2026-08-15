@@ -1,10 +1,9 @@
 use crate::config::Config;
-use crate::domain::ProjectId;
 use crate::graph;
 use crate::service::MemoryService;
 use crate::tools::{
-    self, AssertArgs, GetArgs, ReplaceArgs, RetractArgs, SchemaArgs, SearchArgs, StatsArgs,
-    TraverseArgs,
+    self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs, SchemaArgs,
+    SearchArgs, StatsArgs, TraverseArgs,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -22,14 +21,38 @@ fn object_schema(value: serde_json::Value) -> Arc<rmcp::model::JsonObject> {
     Arc::new(rmcp::model::object(value))
 }
 
+fn layers_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "array",
+        "description": "@layers visibility union. [] selects global/unlayered records only. Named records match any requested layer. IDs use lowercase kebab-case with colon namespaces, for example project:mindreader or analysis:hypothesis; colons are naming, not hierarchy.",
+        "items": {
+            "type": "string",
+            "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)*$"
+        }
+    })
+}
+
+fn target_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "A stable node or relationship feedback/audit target returned by retrieval.",
+        "properties": {
+            "kind": { "type": "string", "enum": ["node", "relationship"] },
+            "iri": { "type": "string", "minLength": 1 }
+        },
+        "required": ["kind", "iri"]
+    })
+}
+
 fn schema_memory_get() -> Arc<rmcp::model::JsonObject> {
     object_schema(serde_json::json!({
         "type": "object",
         "properties": {
             "iri": { "type": "string" },
+            "layers": layers_schema(),
             "hops": { "type": "integer" }
         },
-        "required": ["iri"]
+        "required": ["iri", "layers"]
     }))
 }
 
@@ -39,8 +62,10 @@ fn schema_memory_search() -> Arc<rmcp::model::JsonObject> {
         "properties": {
             "text": { "type": "string" },
             "labels": { "type": "array", "items": { "type": "string" } },
-            "limit": { "type": "integer" }
-        }
+            "limit": { "type": "integer" },
+            "layers": layers_schema()
+        },
+        "required": ["layers"]
     }))
 }
 
@@ -49,18 +74,20 @@ fn schema_memory_traverse() -> Arc<rmcp::model::JsonObject> {
         "type": "object",
         "properties": {
             "from": { "type": "string" },
+            "layers": layers_schema(),
             "rels": { "type": "array", "items": { "type": "string" } },
             "depth": { "type": "integer" },
             "limit": { "type": "integer" }
         },
-        "required": ["from"]
+        "required": ["from", "layers"]
     }))
 }
 
 fn schema_memory_stats() -> Arc<rmcp::model::JsonObject> {
     object_schema(serde_json::json!({
         "type": "object",
-        "properties": {}
+        "properties": { "layers": layers_schema() },
+        "required": ["layers"]
     }))
 }
 
@@ -102,14 +129,14 @@ fn schema_memory_assert() -> Arc<rmcp::model::JsonObject> {
             "s": entity_input_schema(),
             "p": { "type": "string", "minLength": 1 },
             "o": object_input_schema(),
-            "layer": { "type": "string" },
+            "layers": layers_schema(),
             "spike": {
                 "type": "string",
                 "enum": ["Signal", "Pattern", "Insight", "Knowledge"]
             },
             "contradicts": { "type": "boolean" }
         },
-        "required": ["s", "p", "o"]
+        "required": ["s", "p", "o", "layers"]
     }))
 }
 
@@ -121,7 +148,7 @@ fn schema_memory_replace() -> Arc<rmcp::model::JsonObject> {
             "p": { "type": "string", "minLength": 1 },
             "old": object_input_schema(),
             "new": object_input_schema(),
-            "layer": { "type": "string" },
+            "layers": layers_schema(),
             "spike": {
                 "type": "string",
                 "enum": ["Signal", "Pattern", "Insight", "Knowledge"]
@@ -129,7 +156,7 @@ fn schema_memory_replace() -> Arc<rmcp::model::JsonObject> {
             "contradicts": { "type": "boolean" },
             "reason": { "type": "string" }
         },
-        "required": ["s", "p", "old", "new"]
+        "required": ["s", "p", "old", "new", "layers"]
     }))
 }
 
@@ -151,10 +178,35 @@ fn schema_memory_retract() -> Arc<rmcp::model::JsonObject> {
                 },
                 "required": ["kind", "s"]
             },
-            "layer": { "type": "string" },
+            "layers": layers_schema(),
             "reason": { "type": "string" }
         },
-        "required": ["target"]
+        "required": ["target", "layers"]
+    }))
+}
+
+fn schema_memory_feedback() -> Arc<rmcp::model::JsonObject> {
+    object_schema(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "layers": layers_schema(),
+            "target": target_schema(),
+            "mode": { "type": "string", "enum": ["strengthen", "weaken"] }
+        },
+        "required": ["layers", "target", "mode"]
+    }))
+}
+
+fn schema_memory_layers() -> Arc<rmcp::model::JsonObject> {
+    object_schema(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "layers": layers_schema(),
+            "target": target_schema(),
+            "add": { "type": "array", "items": layers_schema()["items"].clone() },
+            "remove": { "type": "array", "items": layers_schema()["items"].clone() }
+        },
+        "required": ["layers", "target"]
     }))
 }
 
@@ -178,7 +230,6 @@ fn schema_memory_schema() -> Arc<rmcp::model::JsonObject> {
 pub struct Mindreader {
     pub tool_router: ToolRouter<Self>,
     service: Arc<OnceCell<MemoryService>>,
-    pub project: String,
     cfg: Config,
 }
 
@@ -187,7 +238,6 @@ impl Mindreader {
         Self {
             tool_router: Self::tool_router(),
             service: Arc::new(OnceCell::new()),
-            project: cfg.project.clone(),
             cfg,
         }
     }
@@ -211,8 +261,7 @@ impl Mindreader {
             .get_or_try_init(|| async {
                 let g = graph::connect(&self.cfg).await?;
                 graph::bootstrap(&g).await?;
-                let project = ProjectId::parse(self.cfg.project.clone())?;
-                Ok::<_, anyhow::Error>(MemoryService::new(g, project))
+                Ok::<_, anyhow::Error>(MemoryService::new(g))
             })
             .await?;
         Ok(())
@@ -245,7 +294,7 @@ fn map_err(e: anyhow::Error) -> McpError {
 impl Mindreader {
     #[tool(
         name = "memory_get",
-        description = "Use when you already have an IRI and need that node. hops=0 is the node; hops=1 adds current visible neighbors. Do not use this to discover unknown things — that is memory_search. Do not use hops to walk the graph — that is memory_traverse.",
+        description = "Use when you already have an IRI and need that visible node. hops=0 returns it; hops=1 adds current visible neighbors. @layers: [] is global-only; multiple lowercase colon-namespaced layers are an OR union. Every returned edge and endpoint must be visible.",
         input_schema = schema_memory_get()
     )]
     async fn memory_get(
@@ -258,7 +307,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_search",
-        description = "Use this first when you do not already have an IRI and need what we currently know about a person, thing, or topic. Returns current layer-visible facts (s,p,o) plus ABOUT SPIKE, ranked Knowledge > Insight > Pattern > Signal. Not a node directory and not a dump of the graph. Skip this if you already have the IRI — use memory_get.",
+        description = "Use first to recover facts and stable feedback targets. @layers: [] is global-only; multiple lowercase colon-namespaced layers form an OR union. Ranking is Knowledge > Insight > Pattern > Signal, then subject + relationship + object weight, then text relevance.",
         input_schema = schema_memory_search()
     )]
     async fn memory_search(
@@ -271,7 +320,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_traverse",
-        description = "Use after search or get, when you have a starting IRI and need to walk typed edges (ABOUT, ASSERTS, DERIVED_FROM, CONTRADICTS, SUPERSEDES, INSTANCE_OF, and the other fixed rels). Depth is hard-capped at 3. Not for keyword lookup and not for writing.",
+        description = "Walk typed edges from a visible IRI, depth capped at 3. @layers: [] is global-only; multiple lowercase colon-namespaced layers form an OR union. Every path relationship and endpoint is filtered by the same scope.",
         input_schema = schema_memory_traverse()
     )]
     async fn memory_traverse(
@@ -284,7 +333,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_stats",
-        description = "Operational graph-model readiness plus counters for nodes, active/historical edges, episodes, and per-layer active edge totals visible to this project.",
+        description = "Return model readiness and graph counters under the requested visibility union. @layers: [] is global-only; multiple lowercase colon-namespaced layers are ORed.",
         input_schema = schema_memory_stats()
     )]
     async fn memory_stats(
@@ -297,7 +346,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_assert",
-        description = "Use to add one exact fact as a triple (s, p, o). Facts are set-valued: another current object for the same subject and property remains current. Reasserting the exact current triple is a no-op. Optional spike labels this as Signal, Pattern, Insight, or Knowledge ABOUT an Element. Optional contradicts=true records a fight with another visible layer's current (s,p). CONTRADICTS and SUPERSEDES are system-owned. Encode a triple — do not dump prose or markdown.",
+        description = "Add one exact set-valued triple. layers are memberships inherited by the relationship and endpoints; [] makes the fact global, while repeated assertions merge named memberships and an existing global fact stays global. IDs use lowercase kebab-case colon namespaces. Exact unchanged reassertions are no-ops.",
         input_schema = schema_memory_assert()
     )]
     async fn memory_assert(
@@ -310,7 +359,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_replace",
-        description = "Use to correct one exact current fact. old must identify a current object; only that triple is closed, new is added if needed, unrelated current objects remain, and SUPERSEDES history is recorded atomically. Use memory_assert when adding another valid value instead.",
+        description = "Correct one exact fact in the listed memberships. Named layers move only those memberships from old to new; [] replaces a global fact. The old relationship retires when its last named membership is removed, and SUPERSEDES is recorded atomically.",
         input_schema = schema_memory_replace()
     )]
     async fn memory_replace(
@@ -323,7 +372,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_retract",
-        description = "Use to withdraw current facts you no longer stand behind. Retraction is soft (validTo); nodes and system-owned history are preserved. target.kind=fact closes one exact triple, predicate intentionally closes all objects for one subject/property, and subject intentionally closes retractable outgoing facts for one subject. Omit layer to use this project's write layer. Use memory_replace for corrections.",
+        description = "Withdraw selected fact memberships without deleting nodes or history. Named layers remove only those memberships and retire an edge after its last one; [] retracts global facts only. Use memory_replace for corrections.",
         input_schema = schema_memory_retract()
     )]
     async fn memory_retract(
@@ -332,6 +381,32 @@ impl Mindreader {
     ) -> Result<CallToolResult, McpError> {
         let service = self.service().await?;
         service.retract(args).await.map_err(map_err).and_then(ok)
+    }
+
+    #[tool(
+        name = "memory_feedback",
+        description = "After using a retrieved node or relationship, explicitly strengthen (+1) or weaken (-1) its shared signed weight. Feedback may happen many turns later. The stable target must still be current and visible in @layers; retrieval never changes weight automatically and there is no time decay.",
+        input_schema = schema_memory_feedback()
+    )]
+    async fn memory_feedback(
+        &self,
+        Parameters(args): Parameters<FeedbackArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let service = self.service().await?;
+        service.feedback(args).await.map_err(map_err).and_then(ok)
+    }
+
+    #[tool(
+        name = "memory_layers",
+        description = "Audit one visible node or current relationship membership with atomic add/remove arrays. Empty membership means global. This tool changes only the target, never propagates, and rejects a final state that would expose a relationship without both endpoints.",
+        input_schema = schema_memory_layers()
+    )]
+    async fn memory_layers(
+        &self,
+        Parameters(args): Parameters<LayersArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let service = self.service().await?;
+        service.layers(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
@@ -366,7 +441,7 @@ impl ServerHandler for Mindreader {
                 website_url: None,
             },
             instructions: Some(
-                "Mindreader: RDFS schema-as-data memory over Neo4j. Tools: memory_get, memory_search, memory_traverse, memory_stats, memory_assert, memory_replace, memory_retract, memory_schema. project_id is env-only (MINDREADER_PROJECT). No raw Cypher."
+                "Mindreader: RDFS schema-as-data memory over Neo4j. Ten tools provide scoped retrieval, fact writes, explicit feedback, layer auditing, and global schema. @layers uses [] for global-only and lowercase kebab-case colon namespaces for named OR-union visibility. No raw Cypher."
                     .into(),
             ),
         }
@@ -395,11 +470,13 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn registers_eight_tools() {
+    fn registers_ten_tools() {
         let names = Mindreader::registered_tool_names();
         let expected = [
             "memory_assert",
+            "memory_feedback",
             "memory_get",
+            "memory_layers",
             "memory_replace",
             "memory_retract",
             "memory_schema",
@@ -412,7 +489,7 @@ mod tests {
         for name in expected {
             assert!(router.has_route(name), "missing route {name}");
         }
-        assert_eq!(router.map.len(), 8);
+        assert_eq!(router.map.len(), 10);
     }
 
     #[test]
@@ -463,6 +540,7 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("s")));
         assert!(required.iter().any(|v| v.as_str() == Some("p")));
         assert!(required.iter().any(|v| v.as_str() == Some("o")));
+        assert!(required.iter().any(|v| v.as_str() == Some("layers")));
         assert!(!required.iter().any(|v| v.as_str() == Some("contradicts")));
 
         let replace_schema = tools
@@ -471,7 +549,7 @@ mod tests {
             .unwrap()
             .schema_as_json_value();
         let replace_required = replace_schema["required"].as_array().unwrap();
-        for name in ["s", "p", "old", "new"] {
+        for name in ["s", "p", "old", "new", "layers"] {
             assert!(replace_required.iter().any(|value| value == name));
         }
         assert_eq!(replace_schema["properties"]["old"]["type"], "object");
@@ -492,6 +570,38 @@ mod tests {
         assert_eq!(target["properties"]["s"]["type"], "object");
         assert_eq!(target["properties"]["o"]["type"], "object");
         assert_eq!(target["properties"]["p"]["minLength"], 1);
+
+        let feedback_schema = tools
+            .iter()
+            .find(|tool| tool.name == "memory_feedback")
+            .unwrap()
+            .schema_as_json_value();
+        assert_eq!(
+            feedback_schema["properties"]["mode"]["enum"],
+            serde_json::json!(["strengthen", "weaken"])
+        );
+        assert_eq!(
+            feedback_schema["properties"]["target"]["properties"]["kind"]["enum"],
+            serde_json::json!(["node", "relationship"])
+        );
+    }
+
+    #[test]
+    fn scoped_tools_require_layers() {
+        let router = Mindreader::tool_router();
+        for tool in router.list_all() {
+            let schema = tool.schema_as_json_value();
+            let required = schema["required"].as_array().cloned().unwrap_or_default();
+            if tool.name == "memory_schema" {
+                assert!(!required.iter().any(|value| value == "layers"));
+            } else {
+                assert!(
+                    required.iter().any(|value| value == "layers"),
+                    "{} must require layers",
+                    tool.name
+                );
+            }
+        }
     }
 
     #[test]

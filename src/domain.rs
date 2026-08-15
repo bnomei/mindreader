@@ -1,6 +1,6 @@
 use crate::iri::{default_lower_for_kind, is_iri, kind_for_label, mint_iri, slugify};
 use schemars::JsonSchema;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
@@ -20,22 +20,91 @@ impl fmt::Display for DomainError {
 
 impl std::error::Error for DomainError {}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProjectId(String);
+/// A validated graph visibility layer identifier.
+///
+/// Layer identifiers consist of lowercase kebab-case segments separated by
+/// colons, for example `project:mindreader` or `team:platform:graph-memory`.
+/// Global visibility is represented by an empty membership list.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, JsonSchema)]
+#[schemars(transparent)]
+pub struct LayerId(String);
 
-impl ProjectId {
+impl LayerId {
     pub fn parse(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
-        if !value.starts_with("project:") || value.len() == "project:".len() {
-            return Err(DomainError::InvalidInput(
-                "MINDREADER_PROJECT must use the form project:<slug>".into(),
-            ));
+        if value == "global" || !is_valid_layer_id(&value) {
+            return Err(DomainError::InvalidInput(format!(
+                "invalid layer {value:?}: expected lowercase kebab-case segments separated by colons; use an empty layer list for global visibility"
+            )));
         }
         Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+fn is_valid_layer_id(value: &str) -> bool {
+    value.split(':').all(|segment| {
+        !segment.is_empty()
+            && !segment.starts_with('-')
+            && !segment.ends_with('-')
+            && !segment.contains("--")
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    })
+}
+
+impl fmt::Display for LayerId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl AsRef<str> for LayerId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl TryFrom<String> for LayerId {
+    type Error = DomainError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<&str> for LayerId {
+    type Error = DomainError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl Serialize for LayerId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for LayerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -284,7 +353,47 @@ impl RetractScope {
 
 #[cfg(test)]
 mod tests {
-    use super::{literal_iri, EntityInput, EntityRef, ObjectInput, ObjectValue, PredicateRef};
+    use super::{
+        literal_iri, EntityInput, EntityRef, LayerId, ObjectInput, ObjectValue, PredicateRef,
+    };
+
+    #[test]
+    fn layer_ids_use_lowercase_colon_separated_kebab_case() {
+        for valid in [
+            "project:mindreader",
+            "project:graph-memory",
+            "team2:platform-7:memory",
+        ] {
+            assert_eq!(LayerId::parse(valid).unwrap().as_str(), valid);
+        }
+
+        for invalid in [
+            "",
+            "global",
+            "Global",
+            "project:",
+            ":project",
+            "project::memory",
+            "project:graph_memory",
+            "project:graph memory",
+            "project:-graph",
+            "project:graph-",
+            "project:graph--memory",
+        ] {
+            assert!(LayerId::parse(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn layer_ids_validate_during_deserialization() {
+        assert_eq!(
+            serde_json::from_str::<LayerId>(r#""project:graph-memory""#)
+                .unwrap()
+                .as_str(),
+            "project:graph-memory"
+        );
+        assert!(serde_json::from_str::<LayerId>(r#""project:Graph""#).is_err());
+    }
 
     #[test]
     fn tagged_inputs_reject_ambiguous_shapes() {

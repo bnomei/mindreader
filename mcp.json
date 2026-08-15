@@ -10,8 +10,7 @@
   "environment": [
     "NEO4J_URI",
     "NEO4J_USER",
-    "NEO4J_PASSWORD",
-    "MINDREADER_PROJECT"
+    "NEO4J_PASSWORD"
   ],
   "tools": [
     "memory_get",
@@ -21,6 +20,8 @@
     "memory_assert",
     "memory_replace",
     "memory_retract",
+    "memory_feedback",
+    "memory_layers",
     "memory_schema"
   ]
 }

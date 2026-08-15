@@ -1,0 +1,279 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  BIN_NAME: mindreader
+
+jobs:
+  release_ref:
+    name: Validate release ref and version
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.release_ref.outputs.sha }}
+      tag: ${{ steps.release_ref.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
+      - name: Validate release ref
+        id: release_ref
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag must be SemVer prefixed with v: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          tag_ref="refs/tags/${RELEASE_TAG}"
+          if ! git show-ref --verify --quiet "$tag_ref"; then
+            echo "Release tag does not exist: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          tag_sha="$(git rev-parse "${tag_ref}^{commit}")"
+          head_sha="$(git rev-parse HEAD)"
+          if [[ "$head_sha" != "$tag_sha" ]]; then
+            echo "Checked out commit $head_sha does not match $RELEASE_TAG ($tag_sha)" >&2
+            exit 1
+          fi
+
+          echo "sha=$tag_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$RELEASE_TAG" >> "$GITHUB_OUTPUT"
+      - name: Validate synchronized version
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+        run: scripts/resolve-version.sh
+
+  publish_preflight:
+    name: Validate publishing prerequisites
+    needs: release_ref
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require a public repository
+        env:
+          REPOSITORY_PRIVATE: ${{ github.event.repository.private }}
+        run: |
+          if [[ "$REPOSITORY_PRIVATE" == "true" ]]; then
+            echo "Binary installers require public GitHub Release assets; make the repository public before releasing." >&2
+            exit 1
+          fi
+      - name: Require npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: test -n "$NODE_AUTH_TOKEN" || { echo "NPM_TOKEN is required" >&2; exit 1; }
+
+  verify:
+    name: Verify tagged source
+    needs: [release_ref, publish_preflight]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release_ref.outputs.sha }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-verify-${{ runner.os }}-${{ runner.arch }}
+          cache-on-failure: true
+      - name: Verify Rust source
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked --all-targets
+      - name: Verify distribution contracts
+        run: |
+          bash scripts/test-release-workflow.sh
+          sh scripts/test-install.sh
+          scripts/resolve-version.sh
+          cmp LICENSE npm/mindreader/LICENSE
+        env:
+          RELEASE_TAG: ${{ needs.release_ref.outputs.tag }}
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Test npm wrapper
+        working-directory: npm/mindreader
+        run: npm test
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: [release_ref, publish_preflight, verify]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            use-cross: false
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-gnu
+            use-cross: true
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            use-cross: true
+          - os: ubuntu-24.04
+            target: aarch64-unknown-linux-musl
+            use-cross: true
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            use-cross: false
+          - os: macos-15
+            target: aarch64-apple-darwin
+            use-cross: false
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+            use-cross: false
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release_ref.outputs.sha }}
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-${{ runner.os }}-${{ matrix.target }}
+          cache-on-failure: true
+      - name: Set up cross toolchain
+        if: matrix.use-cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+      - name: Build (Unix)
+        if: runner.os != 'Windows'
+        run: TARGET=${{ matrix.target }} PACKAGE_NAME=${{ env.BIN_NAME }} scripts/build-release.sh
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/build-release.ps1 -Target ${{ matrix.target }} -PackageName ${{ env.BIN_NAME }}
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: TARGET=${{ matrix.target }} VERSION=${{ needs.release_ref.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/package-release.sh
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/package-release.ps1 -Target ${{ matrix.target }} -Version ${{ needs.release_ref.outputs.version }} -BinName ${{ env.BIN_NAME }}
+      - name: Smoke release artifact (Unix)
+        if: runner.os != 'Windows'
+        run: TARGET=${{ matrix.target }} VERSION=${{ needs.release_ref.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/smoke-release.sh
+      - name: Smoke release artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: scripts/smoke-release.ps1 -Target ${{ matrix.target }} -Version ${{ needs.release_ref.outputs.version }} -BinName ${{ env.BIN_NAME }}
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*
+
+  github-release:
+    name: Publish GitHub Release
+    needs: [release_ref, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release_ref.outputs.sha }}
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.release_ref.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+
+  container:
+    name: Publish container image
+    needs: [release_ref, github-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release_ref.outputs.sha }}
+      - name: Resolve image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: packaging/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            MINDREADER_VERSION=${{ needs.release_ref.outputs.version }}
+            MINDREADER_REPOSITORY=${{ github.repository }}
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ needs.release_ref.outputs.version }}
+            ${{ steps.image.outputs.name }}:latest
+
+  npm:
+    name: Publish npm wrapper
+    needs: [release_ref, github-release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.release_ref.outputs.sha }}
+      - name: Require npm token
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: test -n "$NODE_AUTH_TOKEN" || { echo "NPM_TOKEN is required" >&2; exit 1; }
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - name: Test and publish npm package
+        working-directory: npm/mindreader
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          npm version "${{ needs.release_ref.outputs.version }}" --no-git-tag-version --allow-same-version
+          npm test
+          npm publish --access public

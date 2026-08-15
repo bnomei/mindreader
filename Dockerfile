@@ -4,9 +4,10 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 
-RUN cargo build --release --bin mindreader
+RUN cargo build --locked --release --bin mindreader
 
 FROM debian:bookworm-slim
+ARG MINDREADER_VERSION=0.1.0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
@@ -16,6 +17,11 @@ COPY --from=builder /app/target/release/mindreader /usr/local/bin/mindreader
 
 ENV NEO4J_URI=bolt://neo4j:7687
 ENV NEO4J_USER=neo4j
-ENV MINDREADER_PROJECT=project:graph-memory
+
+LABEL org.opencontainers.image.title="Mindreader" \
+      org.opencontainers.image.description="Deterministic, privacy-first Neo4j memory MCP server" \
+      org.opencontainers.image.source="https://github.com/bnomei/mindreader" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${MINDREADER_VERSION}"
 
 ENTRYPOINT ["/usr/local/bin/mindreader"]

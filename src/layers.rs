@@ -1,34 +1,84 @@
-use crate::config::GLOBAL_LAYER;
-use std::fmt;
+use crate::domain::{DomainError, LayerId};
 
-#[derive(Debug)]
-pub struct LayerError(pub String);
+/// Validate request layer strings, remove duplicates, and sort the result.
+pub fn validate_layer_ids<I, S>(layers: I) -> Result<Vec<LayerId>, DomainError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut layers = layers
+        .into_iter()
+        .map(|layer| LayerId::parse(layer.into()))
+        .collect::<Result<Vec<_>, _>>()?;
+    layers.sort();
+    layers.dedup();
+    Ok(layers)
+}
 
-impl fmt::Display for LayerError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
+/// Return the deterministic request scope used by graph queries.
+pub fn visible_layers(requested: &[LayerId]) -> Vec<LayerId> {
+    requested.to_vec()
+}
+
+/// Decide whether a record's memberships intersect a requested layer scope.
+///
+/// Records with no memberships are global. A global record is visible in every
+/// request scope; otherwise at least one record membership must occur in the
+/// requested scope.
+pub fn record_is_visible(record_memberships: &[LayerId], requested: &[LayerId]) -> bool {
+    if record_memberships.is_empty() {
+        return true;
     }
+
+    record_memberships
+        .iter()
+        .any(|membership| requested.contains(membership))
 }
 
-impl std::error::Error for LayerError {}
+#[cfg(test)]
+mod tests {
+    use super::{record_is_visible, validate_layer_ids, visible_layers};
+    use crate::domain::LayerId;
 
-pub fn bound_project(project: &str) -> &str {
-    project
-}
-
-pub fn visible_layers(project: &str) -> Vec<String> {
-    vec![GLOBAL_LAYER.to_string(), project.to_string()]
-}
-
-pub fn default_write_layer(project: &str) -> String {
-    project.to_string()
-}
-
-pub fn assert_writable_layer(layer: &str, project: &str) -> Result<(), LayerError> {
-    if layer == GLOBAL_LAYER || layer == project {
-        return Ok(());
+    fn layer(value: &str) -> LayerId {
+        LayerId::parse(value).unwrap()
     }
-    Err(LayerError(format!(
-        "layer not allowed: {layer}. Writes must use \"{GLOBAL_LAYER}\" or the bound project \"{project}\"."
-    )))
+
+    #[test]
+    fn request_layers_are_validated_deduplicated_and_sorted() {
+        let layers = validate_layer_ids(["project:zeta", "project:alpha", "project:zeta"]).unwrap();
+        assert_eq!(
+            layers.iter().map(LayerId::as_str).collect::<Vec<_>>(),
+            ["project:alpha", "project:zeta"]
+        );
+        assert!(validate_layer_ids(["project:Alpha"]).is_err());
+    }
+
+    #[test]
+    fn empty_request_scope_is_global_only() {
+        let layers = visible_layers(&[]);
+        assert!(layers.is_empty());
+        assert!(record_is_visible(&[], &[]));
+        assert!(!record_is_visible(&[layer("project:alpha")], &[]));
+    }
+
+    #[test]
+    fn nonempty_scope_sees_global_or_intersecting_records() {
+        let requested = validate_layer_ids(["project:beta", "project:alpha"]).unwrap();
+        assert!(record_is_visible(&[], &requested));
+        assert!(record_is_visible(&[layer("project:alpha")], &requested));
+        assert!(record_is_visible(
+            &[layer("project:other"), layer("project:beta")],
+            &requested
+        ));
+        assert!(!record_is_visible(&[layer("project:other")], &requested));
+
+        assert_eq!(
+            visible_layers(&requested)
+                .iter()
+                .map(LayerId::as_str)
+                .collect::<Vec<_>>(),
+            ["project:alpha", "project:beta"]
+        );
+    }
 }

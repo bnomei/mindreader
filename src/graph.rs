@@ -58,7 +58,7 @@ pub const WAKEUP_RELS: &[&str] = &[
 const LABEL_OK: &str = "label";
 
 pub const MODEL_MARKER_KEY: &str = "model";
-pub const MODEL_VERSION: i64 = 2;
+pub const MODEL_VERSION: i64 = 3;
 
 const RESET_REQUIRED: &str = "recreate the Neo4j database or volume before starting Mindreader";
 const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] =
@@ -150,7 +150,8 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
               {iri: 'mindreader:class/Element', name: 'Element'}
             ] AS row
             MERGE (c:Entity:Class {iri: row.iri})
-            ON CREATE SET c.name = row.name, c.createdAt = datetime()
+            ON CREATE SET c.name = row.name, c.createdAt = datetime(),
+              c.weight = 0, c.weightText = '0', c.layers = []
             SET c.searchText = trim(coalesce(c.name, row.name) + ' ' + c.iri)
             "#,
         ))
@@ -174,7 +175,8 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
               {iri: 'mindreader:property/SUPERSEDES', name: 'SUPERSEDES'}
             ] AS row
             MERGE (p:Entity:Property {iri: row.iri})
-            ON CREATE SET p.name = row.name, p.createdAt = datetime()
+            ON CREATE SET p.name = row.name, p.createdAt = datetime(),
+              p.weight = 0, p.weightText = '0', p.layers = []
             SET p.searchText = trim(coalesce(p.name, row.name) + ' ' + p.iri)
             "#,
         ))
@@ -259,11 +261,7 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
         let version = marker
             .get::<i64>("version")
             .map_err(|_| anyhow!("invalid Mindreader database model marker; {RESET_REQUIRED}"))?;
-        if version != MODEL_VERSION {
-            return Err(anyhow!(
-                "Mindreader database model version {version} is incompatible with required version {MODEL_VERSION}; {RESET_REQUIRED}"
-            ));
-        }
+        validate_model_version(version)?;
         ensure_model_marker_constraint(graph).await?;
         return Ok(());
     }
@@ -308,6 +306,15 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
         .context("create Mindreader database model marker")?;
 
     Ok(())
+}
+
+fn validate_model_version(version: i64) -> Result<()> {
+    if version == MODEL_VERSION {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "Mindreader database model version {version} is incompatible with required version {MODEL_VERSION}; {RESET_REQUIRED}"
+    ))
 }
 
 async fn ensure_model_marker_constraint(graph: &Graph) -> Result<()> {
@@ -465,6 +472,30 @@ pub async fn fetch_all_txn(txn: &mut Txn, q: neo4rs::Query) -> Result<Vec<Row>> 
     Ok(rows)
 }
 
+// neo4rs 0.8 can decode negative Bolt integers as unsigned values. `weight`
+// remains the numeric source of truth in Neo4j; `weightText` is its canonical
+// decimal mirror at the driver boundary so signed values round-trip correctly.
+fn node_weight(node: &Node) -> i64 {
+    node.get::<String>("weightText")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| node.get::<i64>("weight").unwrap_or(0))
+}
+
+fn relation_weight(rel: &Relation) -> i64 {
+    rel.get::<String>("weightText")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| rel.get::<i64>("weight").unwrap_or(0))
+}
+
+fn unbounded_relation_weight(rel: &UnboundedRelation) -> i64 {
+    rel.get::<String>("weightText")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| rel.get::<i64>("weight").unwrap_or(0))
+}
+
 pub fn node_json(node: &Node) -> Value {
     let labels: Vec<String> = node
         .labels()
@@ -491,6 +522,8 @@ pub fn node_json(node: &Node) -> Value {
     if let Ok(v) = node.get::<String>("tool") {
         obj["tool"] = json!(v);
     }
+    obj["layers"] = json!(node.get::<Vec<String>>("layers").unwrap_or_default());
+    obj["weight"] = json!(node_weight(node));
     obj
 }
 
@@ -503,8 +536,8 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("propertyIri") {
         obj["propertyIri"] = json!(v);
     }
-    if let Ok(v) = rel.get::<String>("layer") {
-        obj["layer"] = json!(v);
+    if let Ok(v) = rel.get::<String>("iri") {
+        obj["iri"] = json!(v);
     }
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
@@ -512,6 +545,8 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("reason") {
         obj["reason"] = json!(v);
     }
+    obj["layers"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
+    obj["weight"] = json!(relation_weight(rel));
     obj
 }
 
@@ -524,8 +559,8 @@ fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("propertyIri") {
         obj["propertyIri"] = json!(v);
     }
-    if let Ok(v) = rel.get::<String>("layer") {
-        obj["layer"] = json!(v);
+    if let Ok(v) = rel.get::<String>("iri") {
+        obj["iri"] = json!(v);
     }
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
@@ -533,6 +568,8 @@ fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("reason") {
         obj["reason"] = json!(v);
     }
+    obj["layers"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
+    obj["weight"] = json!(unbounded_relation_weight(rel));
     obj
 }
 
@@ -664,7 +701,8 @@ pub async fn merge_node_in_txn(
             r#"
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime()
+            ON CREATE SET n.name = $name, n.createdAt = datetime(),
+              n.weight = 0, n.weightText = '0', n.layers = []
             ON MATCH SET n.name = coalesce(n.name, $name)
             SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
             RETURN n, existing IS NULL AS created
@@ -725,7 +763,7 @@ pub async fn merge_literal_in_txn(
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Literal {iri: $iri})
             ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype,
-              n.createdAt = datetime()
+              n.createdAt = datetime(), n.weight = 0, n.weightText = '0', n.layers = []
             ON MATCH SET n.name = coalesce(n.name, $name),
               n.value = coalesce(n.value, $value), n.datatype = coalesce(n.datatype, $datatype)
             SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, $value))
@@ -763,7 +801,8 @@ pub async fn ensure_property_in_txn(
             r#"
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Property {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = true
+            ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = true,
+              n.weight = 0, n.weightText = '0', n.layers = []
             ON MATCH SET n.name = coalesce(n.name, $name)
             SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
             RETURN n, existing IS NULL AS created
@@ -853,7 +892,15 @@ pub struct Episode {
 fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
     query(
         r#"
-        CREATE (e:Entity:Episode {iri: $iri, tool: $tool, at: datetime(), createdAt: datetime(), name: $iri})
+        CREATE (e:Entity:Episode {
+            iri: $iri,
+            tool: $tool,
+            at: datetime(),
+            createdAt: datetime(),
+            name: $iri,
+            weight: 0,
+            weightText: '0'
+        })
         SET e.note = $note
         RETURN e.iri AS iri, toString(e.at) AS at
         "#,
@@ -937,12 +984,16 @@ pub fn endpoint_json(node: &Node) -> Value {
             "iri": iri,
             "value": value,
             "datatype": datatype,
+            "layers": node.get::<Vec<String>>("layers").unwrap_or_default(),
+            "weight": node_weight(node),
         });
     }
     json!({
         "iri": iri,
         "name": node.get::<String>("name").ok(),
         "labels": labels,
+        "layers": node.get::<Vec<String>>("layers").unwrap_or_default(),
+        "weight": node_weight(node),
     })
 }
 
@@ -967,7 +1018,20 @@ pub fn spike_rank(label: Option<&str>) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{fact_lock_specs, lock_key, safe_label, safe_rel, same_string_members, spike_rank};
+    use super::{
+        fact_lock_specs, lock_key, safe_label, safe_rel, same_string_members, spike_rank,
+        validate_model_version, MODEL_VERSION,
+    };
+
+    #[test]
+    fn model_v3_requires_recreating_older_databases() {
+        assert_eq!(MODEL_VERSION, 3);
+        assert!(validate_model_version(3).is_ok());
+        assert_eq!(
+            validate_model_version(2).unwrap_err().to_string(),
+            "Mindreader database model version 2 is incompatible with required version 3; recreate the Neo4j database or volume before starting Mindreader"
+        );
+    }
 
     #[test]
     fn fact_locks_are_complete_deduplicated_and_deterministically_ordered() {

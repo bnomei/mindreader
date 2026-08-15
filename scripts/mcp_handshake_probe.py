@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Probe mindreader MCP stdio handshake. Loads .env internally; never prints secrets."""
+"""Probe Mindreader's MCP stdio handshake without printing secrets."""
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import subprocess
@@ -10,9 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-BIN = Path("/workspace/mindreader/target/debug/mindreader")
-ENV_FILE = Path("/workspace/mindreader/.env")
-TIMEOUT = 15.0
+ROOT = Path(__file__).resolve().parent.parent
 PROTOCOLS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 
 
@@ -54,10 +53,10 @@ def wait_id(stdout_buf: list[bytes], rid: int, proc: subprocess.Popen, deadline:
     return None
 
 
-def handshake(protocol: str, env: dict):
+def handshake(binary: Path, protocol: str, env: dict[str, str], timeout: float):
     t0 = time.time()
     proc = subprocess.Popen(
-        [str(BIN)],
+        [str(binary)],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -91,12 +90,12 @@ def handshake(protocol: str, env: dict):
             },
         },
     )
-    init = wait_id(stdout_buf, 1, proc, t0 + TIMEOUT)
+    init = wait_id(stdout_buf, 1, proc, t0 + timeout)
     tools = None
     if init is not None:
         send(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
         send(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-        tools = wait_id(stdout_buf, 2, proc, time.time() + TIMEOUT)
+        tools = wait_id(stdout_buf, 2, proc, time.time() + timeout)
     try:
         proc.kill()
         proc.wait(timeout=2)
@@ -105,21 +104,32 @@ def handshake(protocol: str, env: dict):
     return init, tools, b"".join(stderr_buf).decode("utf-8", "replace"), time.time() - t0
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--binary", type=Path, default=ROOT / "target/debug/mindreader")
+    parser.add_argument("--env-file", type=Path, default=ROOT / ".env")
+    parser.add_argument("--timeout", type=float, default=15.0)
+    return parser.parse_args()
+
+
 def main() -> int:
-    if not BIN.exists():
-        print(f"missing binary: {BIN}", file=sys.stderr)
+    args = parse_args()
+    binary = args.binary.resolve()
+    if not binary.exists():
+        print(f"missing binary: {binary}", file=sys.stderr)
         return 2
-    env = load_env(ENV_FILE)
-    print(f"BIN={BIN}")
+    env = load_env(args.env_file)
+    env.setdefault("NEO4J_PASSWORD", "mindreader-handshake-probe")
+    print(f"BIN={binary}")
     print(f"NEO4J_URI={env.get('NEO4J_URI')}")
-    print(f"MINDREADER_PROJECT={env.get('MINDREADER_PROJECT')}")
     print(f"NEO4J_USER={env.get('NEO4J_USER')}")
     print(f"NEO4J_PASSWORD_SET={'yes' if env.get('NEO4J_PASSWORD') else 'no'}")
 
+    succeeded = True
     for proto in PROTOCOLS:
         print("=" * 72)
         print(f"PROTOCOL {proto}")
-        init, tools, stderr, elapsed = handshake(proto, env)
+        init, tools, stderr, elapsed = handshake(binary, proto, env, args.timeout)
         print(f"elapsed_s={elapsed:.3f}")
         print("--- initialize ---")
         print(json.dumps(init, indent=2) if init is not None else "TIMEOUT/NONE")
@@ -127,14 +137,14 @@ def main() -> int:
         print(json.dumps(tools, indent=2) if tools is not None else "TIMEOUT/NONE")
         print("--- stderr ---")
         print(stderr)
-        if init is not None:
-            names = []
-            if tools and isinstance(tools.get("result"), dict):
-                names = [t.get("name") for t in tools["result"].get("tools") or []]
-            print(f"--- tool names ---")
-            print(names)
-            return 0
-    return 1
+        names = []
+        if tools and isinstance(tools.get("result"), dict):
+            names = [t.get("name") for t in tools["result"].get("tools") or []]
+        print("--- tool names ---")
+        print(names)
+        if init is None or len(names) != 10:
+            succeeded = False
+    return 0 if succeeded else 1
 
 
 if __name__ == "__main__":

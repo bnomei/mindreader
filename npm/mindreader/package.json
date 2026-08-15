@@ -1,0 +1,24 @@
+{
+  "name": "@bnomei/mindreader",
+  "version": "0.1.0",
+  "description": "Deterministic, privacy-first Neo4j memory MCP server.",
+  "homepage": "https://github.com/bnomei/mindreader",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bnomei/mindreader.git"
+  },
+  "license": "MIT",
+  "bin": {
+    "mindreader": "bin/mindreader.js"
+  },
+  "files": [
+    "bin/mindreader.js",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,61 +1,47 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use mindreader::config::Config;
 use mindreader::domain::{EntityInput, ObjectInput};
-use mindreader::graph::{self};
+use mindreader::graph::{self, fetch_one};
 use mindreader::tools::{
-    self, AssertArgs, GetArgs, ReplaceArgs, RetractArgs, RetractTargetArgs, SchemaArgs, SearchArgs,
-    StatsArgs, TraverseArgs,
+    self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs,
+    RetractTargetArgs, SchemaArgs, SearchArgs, StatsArgs, TargetArgs,
 };
 use mindreader::Mindreader;
+use neo4rs::query;
 use serde_json::Value;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Report {
+    next: u32,
     failed: u32,
 }
 
 impl Report {
     fn new() -> Self {
-        Self { failed: 0 }
+        Self { next: 1, failed: 0 }
     }
 
-    fn check(&mut self, step: u32, name: &str, ok: bool, detail: &str) {
-        if ok {
-            println!("PASS {step} {name}");
-        } else {
-            println!("FAIL {step} {name}");
-            self.failed += 1;
-        }
+    fn check(&mut self, name: &str, ok: bool, detail: impl std::fmt::Display) {
+        let status = if ok { "PASS" } else { "FAIL" };
+        println!("{status} {} {name}", self.next);
+        let detail = detail.to_string();
         if !detail.is_empty() {
             println!("     {detail}");
         }
+        if !ok {
+            self.failed += 1;
+        }
+        self.next += 1;
     }
 }
 
-fn iri_of(v: &Value) -> Option<String> {
-    v.get("iri")
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| {
-            v.get("node")
-                .and_then(|n| n.get("iri"))
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-        })
-        .or_else(|| {
-            v.get("s")
-                .and_then(|n| n.get("iri"))
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string())
-        })
-}
-
-fn entity(name: impl Into<String>, labels: &[&str]) -> EntityInput {
+fn entity(name: impl Into<String>) -> EntityInput {
     EntityInput {
         kind: "entity".into(),
         iri: None,
         name: Some(name.into()),
-        labels: labels.iter().map(|label| (*label).to_string()).collect(),
+        labels: vec!["Element".into()],
     }
 }
 
@@ -68,12 +54,12 @@ fn entity_iri(iri: impl Into<String>) -> EntityInput {
     }
 }
 
-fn object(name: impl Into<String>, labels: &[&str]) -> ObjectInput {
+fn object(name: impl Into<String>) -> ObjectInput {
     ObjectInput {
         kind: "entity".into(),
         iri: None,
         name: Some(name.into()),
-        labels: labels.iter().map(|label| (*label).to_string()).collect(),
+        labels: vec!["Element".into()],
         value: None,
         datatype: None,
     }
@@ -90,15 +76,90 @@ fn object_iri(iri: impl Into<String>) -> ObjectInput {
     }
 }
 
-fn literal(value: impl Into<String>) -> ObjectInput {
-    ObjectInput {
-        kind: "literal".into(),
-        iri: None,
-        name: None,
-        labels: Vec::new(),
-        value: Some(value.into()),
-        datatype: None,
-    }
+fn relationship_iri(value: &Value) -> Result<String> {
+    value
+        .pointer("/relationship/iri")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("response has no relationship IRI: {value}"))
+}
+
+fn subject_iri(value: &Value) -> Result<String> {
+    value
+        .pointer("/s/iri")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("response has no subject IRI: {value}"))
+}
+
+fn object_result_iri(value: &Value) -> Result<String> {
+    value
+        .pointer("/o/iri")
+        .or_else(|| value.pointer("/new/iri"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("response has no object IRI: {value}"))
+}
+
+fn fact_relationships(value: &Value) -> Vec<String> {
+    value
+        .get("facts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| fact.pointer("/relationship/iri").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
+    value
+        .get("facts")
+        .and_then(Value::as_array)?
+        .iter()
+        .position(|fact| {
+            fact.pointer("/relationship/iri").and_then(Value::as_str) == Some(relationship)
+        })
+}
+
+async fn search(graph: &neo4rs::Graph, scope: Vec<String>, text: &str) -> Result<Value> {
+    tools::memory_search(
+        graph,
+        SearchArgs {
+            layers: scope,
+            text: Some(text.into()),
+            labels: None,
+            limit: Some(100),
+        },
+    )
+    .await
+}
+
+async fn relation_state(
+    graph: &neo4rs::Graph,
+    iri: &str,
+) -> Result<Option<(Vec<String>, bool, i64)>> {
+    let row = fetch_one(
+        graph,
+        query(
+            "MATCH ()-[r]->() WHERE r.iri = $iri \
+             RETURN coalesce(r.layers, []) AS layers, r.validTo IS NULL AS current, \
+                    coalesce(r.weightText, toString(coalesce(r.weight, 0))) AS weight",
+        )
+        .param("iri", iri.to_string()),
+    )
+    .await?;
+    row.map(|row| {
+        Ok((
+            row.get::<Vec<String>>("layers").unwrap_or_default(),
+            row.get::<bool>("current").unwrap_or(false),
+            row.get::<String>("weight")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0),
+        ))
+    })
+    .transpose()
 }
 
 #[tokio::main]
@@ -112,1123 +173,502 @@ async fn main() -> ExitCode {
             println!("SOME STEPS FAILED");
             ExitCode::from(1)
         }
-        Err(e) => {
-            eprintln!("SMOKE ABORT: {e:?}");
+        Err(error) => {
+            eprintln!("SMOKE ABORT: {error:#}");
             ExitCode::from(1)
         }
     }
 }
 
 async fn run() -> Result<u32> {
-    load();
+    mindreader::config::load_env();
     let cfg = Config::from_env()?;
-    println!("mindreader-smoke: uri={} project={}", cfg.uri, cfg.project);
+    println!("mindreader-smoke: uri={}", cfg.uri);
     println!(
         "registered tools: {}",
         Mindreader::registered_tool_names().join(", ")
     );
-    if Mindreader::registered_tool_names().len() != 8 {
-        return Err(anyhow!("expected 8 registered tools"));
-    }
+
+    let mut report = Report::new();
+    let tool_names = Mindreader::registered_tool_names();
+    report.check(
+        "MCP registers the ten-tool contract",
+        tool_names.len() == 10
+            && tool_names.contains(&"memory_feedback".into())
+            && tool_names.contains(&"memory_layers".into()),
+        format!("tools={tool_names:?}"),
+    );
 
     let graph = graph::connect(&cfg).await?;
     graph::bootstrap(&graph).await?;
-    let project = cfg.project.as_str();
-    let stats = tools::memory_stats(&graph, project, StatsArgs::default()).await?;
-    if stats.pointer("/model/ready").and_then(Value::as_bool) != Some(true) {
-        return Err(anyhow!(
-            "memory_stats reports graph model is not ready: {stats}"
-        ));
-    }
-    let mut r = Report::new();
-    // Run-unique fixtures keep repeated smoke runs independent.
-    let tag = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis().to_string())
-        .unwrap_or_else(|_| "x".into());
-    let subject_name = format!("test-subject-{tag}");
-    let subject_fallback_iri = format!("mindreader:element/{subject_name}");
+    let stats = tools::memory_stats(&graph, StatsArgs { layers: Vec::new() }).await?;
+    report.check(
+        "bootstrap is ready in global-only scope",
+        stats.pointer("/model/ready").and_then(Value::as_bool) == Some(true)
+            && stats
+                .get("layers")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+        &stats,
+    );
 
-    // 1. schema
-    let person = tools::memory_schema(
+    let tag = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_nanos()
+        .to_string();
+    let layer_a = format!("project:smoke-a-{tag}");
+    let layer_b = format!("project:smoke-b-{tag}");
+    let layer_c = format!("project:smoke-c-{tag}");
+    let property = format!("smokeProperty{tag}");
+
+    let schema = tools::memory_schema(
         &graph,
-        project,
-        SchemaArgs {
-            kind: "class".into(),
-            name: Some("Person".into()),
-            iri: None,
-            sub_class_of: None,
-            sub_property_of: None,
-            domain: None,
-            range: None,
-        },
-    )
-    .await;
-    let project_cls = tools::memory_schema(
-        &graph,
-        project,
-        SchemaArgs {
-            kind: "class".into(),
-            name: Some("Project".into()),
-            iri: None,
-            sub_class_of: None,
-            sub_property_of: None,
-            domain: None,
-            range: None,
-        },
-    )
-    .await;
-    let works = tools::memory_schema(
-        &graph,
-        project,
         SchemaArgs {
             kind: "property".into(),
-            name: Some("worksOn".into()),
+            name: Some(property.clone()),
             iri: None,
             sub_class_of: None,
             sub_property_of: None,
-            domain: Some("Person".into()),
-            range: Some("Project".into()),
+            domain: Some("Element".into()),
+            range: Some("Element".into()),
         },
-    )
-    .await;
-    let schema_ok = person.is_ok() && project_cls.is_ok() && works.is_ok();
-    r.check(
-        1,
-        "memory_schema Class Person, Class Project, Property worksOn",
-        schema_ok,
-        &format!(
-            "person={} project={} worksOn={}",
-            person
-                .as_ref()
-                .ok()
-                .and_then(iri_of)
-                .unwrap_or_else(|| format!("{person:?}")),
-            project_cls
-                .as_ref()
-                .ok()
-                .and_then(iri_of)
-                .unwrap_or_default(),
-            works.as_ref().ok().and_then(iri_of).unwrap_or_default()
-        ),
-    );
-
-    // 2. assert the fixture subject worksOn graph-memory
-    let asserted = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity(subject_name.clone(), &["Element"]),
-            p: "worksOn".into(),
-            o: object("graph-memory", &["Element"]),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let (subject_iri, project_iri) = match &asserted {
-        Ok(v) => (
-            v.get("s")
-                .and_then(|s| s.get("iri"))
-                .and_then(|x| x.as_str())
-                .unwrap_or(&subject_fallback_iri)
-                .to_string(),
-            v.get("o")
-                .and_then(|s| s.get("iri"))
-                .and_then(|x| x.as_str())
-                .unwrap_or("mindreader:element/graph-memory")
-                .to_string(),
-        ),
-        Err(_) => (
-            subject_fallback_iri.clone(),
-            "mindreader:element/graph-memory".into(),
-        ),
-    };
-    r.check(
-        2,
-        "memory_assert fixture subject worksOn graph-memory Project",
-        asserted.is_ok(),
-        &format!("subject={subject_iri} project={project_iri} raw={asserted:?}"),
-    );
-
-    // 3. Signal ABOUT the fixture subject, layer global
-    let signal = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity(format!("observed-{tag}"), &["Signal"]),
-            p: "ABOUT".into(),
-            o: object_iri(subject_iri.clone()),
-            layer: Some("global".into()),
-            spike: Some("Signal".into()),
-            contradicts: false,
-        },
-    )
-    .await;
-    r.check(
-        3,
-        "memory_assert Signal ABOUT fixture subject layer global",
-        signal.is_ok(),
-        &format!("{signal:?}"),
-    );
-
-    // 4. get the fixture subject with hops=1 and see the project fact
-    let got = tools::memory_get(
-        &graph,
-        project,
-        GetArgs {
-            iri: subject_iri.clone(),
-            hops: Some(1),
-        },
-    )
-    .await;
-    let sees_project = got
-        .as_ref()
-        .ok()
-        .map(|v| {
-            let text = v.to_string();
-            v.get("found").and_then(|x| x.as_bool()).unwrap_or(false)
-                && (text.contains(&project_iri)
-                    || text.contains("worksOn")
-                    || text.contains("graph-memory"))
-        })
-        .unwrap_or(false);
-    r.check(
-        4,
-        "memory_get fixture subject hops=1 sees the project fact",
-        sees_project,
-        &format!("{got:?}"),
-    );
-
-    // 5. search for the fixture subject
-    let search = tools::memory_search(
-        &graph,
-        project,
-        SearchArgs {
-            text: Some(subject_name.clone()),
-            labels: None,
-            limit: Some(20),
-        },
-    )
-    .await;
-    let found_subject = search
-        .as_ref()
-        .ok()
-        .map(|v| {
-            let mode_ok = v.get("mode").and_then(|m| m.as_str()) == Some("wakeup");
-            let facts = v
-                .get("facts")
-                .and_then(|n| n.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let hit = facts.iter().any(|f| {
-                let s = f.get("s");
-                s.and_then(|n| n.get("iri"))
-                    .and_then(|x| x.as_str())
-                    .map(|s| s == subject_iri)
-                    .unwrap_or(false)
-                    || s.and_then(|n| n.get("name"))
-                        .and_then(|x| x.as_str())
-                        .map(|s| s == subject_name)
-                        .unwrap_or(false)
-                    || f.to_string().contains(&subject_name)
-            });
-            mode_ok && hit
-        })
-        .unwrap_or(false);
-    r.check(
-        5,
-        "memory_search fixture subject returns facts (wakeup)",
-        found_subject,
-        &format!("{search:?}"),
-    );
-
-    // 6. traverse from the fixture subject at depth 2
-    let trav = tools::memory_traverse(
-        &graph,
-        project,
-        TraverseArgs {
-            from: subject_iri.clone(),
-            rels: None,
-            depth: Some(2),
-            limit: Some(50),
-        },
-    )
-    .await;
-    let trav_ok = trav
-        .as_ref()
-        .ok()
-        .map(|v| {
-            v.get("found").and_then(|x| x.as_bool()).unwrap_or(false)
-                && v.get("nodes")
-                    .and_then(|n| n.as_array())
-                    .map(|a| !a.is_empty())
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false);
-    r.check(
-        6,
-        "memory_traverse from fixture subject depth 2",
-        trav_ok,
-        &format!("{trav:?}"),
-    );
-
-    // 7. re-assert same worksOn — idempotent
-    let again = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(subject_iri.clone()),
-            p: "worksOn".into(),
-            o: object_iri(project_iri.clone()),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let (cur_n, cur_objs) =
-        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
-            .await?;
-    let idem = again
-        .as_ref()
-        .ok()
-        .and_then(|v| v.get("noop").and_then(|x| x.as_bool()))
-        .unwrap_or(false)
-        && cur_n == 1;
-    r.check(
-        7,
-        "re-assert same worksOn is idempotent (one current ASSERTS)",
-        idem,
-        &format!("count={cur_n} objects={cur_objs:?} again={again:?}"),
-    );
-
-    // 8. assert a different worksOn object — both values remain current
-    let other = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(subject_iri.clone()),
-            p: "worksOn".into(),
-            o: object(format!("other-desk-{tag}"), &["Element"]),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let (cur_n2, cur_objs2) =
-        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
-            .await?;
-    let other_iri = other
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("o")
-                .and_then(|o| o.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    let set_valued = other.is_ok()
-        && cur_n2 == 2
-        && cur_objs2.iter().any(|o| o == &project_iri)
-        && cur_objs2.iter().any(|o| o == &other_iri);
-    r.check(
-        8,
-        "assert worksOn different object keeps both values current",
-        set_valued,
-        &format!("current={cur_n2} objs={cur_objs2:?} other={other:?}"),
-    );
-
-    // 9. replace one exact fact, preserving the unrelated current value
-    let replaced = tools::memory_replace(
-        &graph,
-        project,
-        ReplaceArgs {
-            s: entity_iri(subject_iri.clone()),
-            p: "worksOn".into(),
-            old: object_iri(project_iri.clone()),
-            new: object(format!("replacement-desk-{tag}"), &["Element"]),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: false,
-            reason: Some("smoke exact replacement".into()),
-        },
-    )
-    .await;
-    let replacement_iri = replaced
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("new")
-                .and_then(|o| o.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    let (cur_n3, cur_objs3) =
-        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
-            .await?;
-    let hist =
-        tools::count_historical_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
-            .await?;
-    let supersedes = count_supersedes(
-        &graph,
-        &replacement_iri,
-        &project_iri,
-        "worksOn",
-        "project:graph-memory",
     )
     .await?;
-    let replace_ok = replaced.is_ok()
-        && cur_n3 == 2
-        && hist >= 1
-        && supersedes == 1
-        && cur_objs3.iter().any(|o| o == &replacement_iri)
-        && cur_objs3.iter().any(|o| o == &other_iri)
-        && !cur_objs3.iter().any(|o| o == &project_iri);
-    r.check(
-        9,
-        "memory_replace closes only the exact old fact and writes SUPERSEDES",
-        replace_ok,
-        &format!(
-            "current={cur_n3} hist={hist} supersedes={supersedes} objs={cur_objs3:?} replace={replaced:?}"
+    report.check(
+        "schema writes remain global and provenance-backed",
+        schema
+            .pointer("/node/layers")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+            && schema
+                .pointer("/episode/iri")
+                .and_then(Value::as_str)
+                .is_some(),
+        &schema,
+    );
+
+    let visibility_token = format!("visibility-{tag}");
+    let global = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("{visibility_token}-global-subject")),
+            p: property.clone(),
+            o: object(format!("{visibility_token}-global-object")),
+            layers: Vec::new(),
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let in_a = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("{visibility_token}-a-subject")),
+            p: property.clone(),
+            o: object(format!("{visibility_token}-a-object")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let in_b = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("{visibility_token}-b-subject")),
+            p: property.clone(),
+            o: object(format!("{visibility_token}-b-object")),
+            layers: vec![layer_b.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let global_rel = relationship_iri(&global)?;
+    let a_rel = relationship_iri(&in_a)?;
+    let b_rel = relationship_iri(&in_b)?;
+    let only_global = fact_relationships(&search(&graph, Vec::new(), &visibility_token).await?);
+    let seen_a =
+        fact_relationships(&search(&graph, vec![layer_a.clone()], &visibility_token).await?);
+    let seen_b =
+        fact_relationships(&search(&graph, vec![layer_b.clone()], &visibility_token).await?);
+    let seen_ab = fact_relationships(
+        &search(
+            &graph,
+            vec![layer_a.clone(), layer_b.clone()],
+            &visibility_token,
+        )
+        .await?,
+    );
+    report.check(
+        "request scopes dynamically expose global plus intersecting layers",
+        only_global == vec![global_rel.clone()]
+            && seen_a.contains(&global_rel)
+            && seen_a.contains(&a_rel)
+            && !seen_a.contains(&b_rel)
+            && seen_b.contains(&global_rel)
+            && !seen_b.contains(&a_rel)
+            && seen_b.contains(&b_rel)
+            && [global_rel.clone(), a_rel.clone(), b_rel.clone()]
+                .iter()
+                .all(|iri| seen_ab.contains(iri)),
+        format!("global={only_global:?} A={seen_a:?} B={seen_b:?} AB={seen_ab:?}"),
+    );
+
+    let merge_token = format!("merge-{tag}");
+    let merged_a = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("{merge_token}-subject")),
+            p: property.clone(),
+            o: object(format!("{merge_token}-old")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let merged_b = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity_iri(subject_iri(&merged_a)?),
+            p: property.clone(),
+            o: object_iri(object_result_iri(&merged_a)?),
+            layers: vec![layer_b.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let merged_rel = relationship_iri(&merged_a)?;
+    let merged_state = relation_state(&graph, &merged_rel).await?;
+    report.check(
+        "exact semantic fact unions memberships under one stable relationship IRI",
+        relationship_iri(&merged_b)? == merged_rel
+            && merged_state == Some((vec![layer_a.clone(), layer_b.clone()], true, 0)),
+        format!("first={merged_a} second={merged_b} state={merged_state:?}"),
+    );
+
+    let global_wins_1 = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("global-wins-{tag}-subject")),
+            p: property.clone(),
+            o: object(format!("global-wins-{tag}-object")),
+            layers: Vec::new(),
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let global_wins_2 = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity_iri(subject_iri(&global_wins_1)?),
+            p: property.clone(),
+            o: object_iri(object_result_iri(&global_wins_1)?),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let global_wins_rel = relationship_iri(&global_wins_1)?;
+    report.check(
+        "global membership wins over later named assertions",
+        relationship_iri(&global_wins_2)? == global_wins_rel
+            && global_wins_2.get("noop").and_then(Value::as_bool) == Some(true)
+            && relation_state(&graph, &global_wins_rel).await? == Some((Vec::new(), true, 0)),
+        &global_wins_2,
+    );
+
+    let merged_subject = subject_iri(&merged_a)?;
+    let merged_old = object_result_iri(&merged_a)?;
+    let replacement = tools::memory_replace(
+        &graph,
+        ReplaceArgs {
+            s: entity_iri(merged_subject.clone()),
+            p: property.clone(),
+            old: object_iri(merged_old.clone()),
+            new: object(format!("{merge_token}-new")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+            reason: Some("smoke scoped replacement".into()),
+        },
+    )
+    .await?;
+    let replacement_rel = relationship_iri(&replacement)?;
+    let replace_a = fact_relationships(&search(&graph, vec![layer_a.clone()], &merge_token).await?);
+    let replace_b = fact_relationships(&search(&graph, vec![layer_b.clone()], &merge_token).await?);
+    report.check(
+        "replace moves only selected memberships and preserves unrelated scope",
+        relation_state(&graph, &merged_rel).await? == Some((vec![layer_b.clone()], true, 0))
+            && relation_state(&graph, &replacement_rel).await?
+                == Some((vec![layer_a.clone()], true, 0))
+            && replace_a.contains(&replacement_rel)
+            && !replace_a.contains(&merged_rel)
+            && replace_b.contains(&merged_rel)
+            && !replace_b.contains(&replacement_rel),
+        format!(
+            "old={:?} new={:?} A={replace_a:?} B={replace_b:?}",
+            relation_state(&graph, &merged_rel).await?,
+            relation_state(&graph, &replacement_rel).await?
         ),
     );
 
-    // 10. retract one exact fact — soft; node and unrelated value remain
     let retracted = tools::memory_retract(
         &graph,
-        project,
         RetractArgs {
             target: RetractTargetArgs {
                 kind: "fact".into(),
-                s: entity_iri(subject_iri.clone()),
-                p: Some("worksOn".into()),
-                o: Some(object_iri(replacement_iri.clone())),
+                s: entity_iri(merged_subject),
+                p: Some(property.clone()),
+                o: Some(object_iri(merged_old)),
             },
-            layer: Some("project:graph-memory".into()),
-            reason: Some("smoke retract".into()),
+            layers: vec![layer_b.clone()],
+            reason: Some("smoke final scoped retract".into()),
         },
     )
-    .await;
-    let still = tools::memory_get(
-        &graph,
-        project,
-        GetArgs {
-            iri: subject_iri.clone(),
-            hops: Some(0),
-        },
-    )
-    .await;
-    let (cur_n4, cur_objs4) =
-        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
-            .await?;
-    let retract_ok = retracted
-        .as_ref()
-        .ok()
-        .and_then(|v| v.get("soft").and_then(|x| x.as_bool()))
-        .unwrap_or(false)
-        && still
-            .as_ref()
-            .ok()
-            .and_then(|v| v.get("found").and_then(|x| x.as_bool()))
-            .unwrap_or(false)
-        && cur_n4 == 1
-        && cur_objs4.iter().any(|o| o == &other_iri);
-    r.check(
-        10,
-        "exact fact retract is soft; node and unrelated value remain",
-        retract_ok,
-        &format!("retract={retracted:?} get={still:?} current={cur_n4} objs={cur_objs4:?}"),
-    );
-
-    // 11. layer project:other rejected
-    let rejected = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(subject_iri.clone()),
-            p: "worksOn".into(),
-            o: object_iri(project_iri.clone()),
-            layer: Some("project:other".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let reject_ok = match &rejected {
-        Err(e) => {
-            let msg = e.to_string();
-            msg.contains("not allowed") || msg.contains("layer")
-        }
-        Ok(_) => false,
-    };
-    r.check(
-        11,
-        "layer project:other is rejected",
-        reject_ok,
-        &format!("{rejected:?}"),
-    );
-
-    // --- v1.1: conflicts, CONTRADICTS, wakeup rank ---
-    // Unique names prevent repeated smoke runs from inheriting CONTRADICTS edges.
-    let v11_s = entity(format!("v11-subj-{tag}"), &["Element"]);
-    let desk_a = format!("v11-alpha-{tag}");
-    let desk_b = format!("v11-beta-{tag}");
-    let desk_c = format!("v11-gamma-{tag}");
-
-    let a = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: v11_s.clone(),
-            p: "worksOn".into(),
-            o: object(desk_a.clone(), &["Element"]),
-            layer: Some("global".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let a_iri = a
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("o")
-                .and_then(|o| o.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    let v11_iri = a
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("s")
-                .and_then(|s| s.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    r.check(
-        12,
-        "v1.1 assert subject worksOn A on global",
-        a.is_ok() && !a_iri.is_empty(),
-        &format!("{a:?}"),
-    );
-
-    let b = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: v11_s.clone(),
-            p: "worksOn".into(),
-            o: object(desk_b.clone(), &["Element"]),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let b_iri = b
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("o")
-                .and_then(|o| o.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    let conflicts = b
-        .as_ref()
-        .ok()
-        .and_then(|v| v.get("conflicts").and_then(|c| c.as_array()))
-        .cloned()
-        .unwrap_or_default();
-    let mentions_global_a = conflicts.iter().any(|c| {
-        let layer = c.get("layer").and_then(|x| x.as_str()).unwrap_or("");
-        let o = c
-            .get("o")
-            .and_then(|o| o.get("iri"))
-            .and_then(|x| x.as_str())
-            .unwrap_or("");
-        layer == "global" && (o == a_iri || o.contains("v11-alpha-"))
-    });
-    let contradicts_before = count_contradicts(&graph, &b_iri).await.unwrap_or(-1);
-    r.check(
-        13,
-        "v1.1 project worksOn B returns conflicts[] for global/A; no CONTRADICTS without flag",
-        b.is_ok() && mentions_global_a && contradicts_before == 0,
-        &format!("conflicts={conflicts:?} contradicts={contradicts_before} b={b:?}"),
-    );
-
-    let b2 = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(v11_iri.clone()),
-            p: "worksOn".into(),
-            o: object_iri(b_iri.clone()),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: true,
-        },
-    )
-    .await;
-    let contradicts_after = count_contradicts(&graph, &b_iri).await.unwrap_or(-1);
-    r.check(
-        14,
-        "v1.1 contradicts:true writes CONTRADICTS to conflicting o",
-        b2.is_ok() && contradicts_after == 1,
-        &format!("contradicts={contradicts_after} b2={b2:?}"),
-    );
-
-    let a2 = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(v11_iri.clone()),
-            p: "worksOn".into(),
-            o: object(desk_c.clone(), &["Element"]),
-            layer: Some("global".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let a2_iri = a2
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("o")
-                .and_then(|o| o.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    let b3 = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(v11_iri.clone()),
-            p: "worksOn".into(),
-            o: object_iri(b_iri.clone()),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: true,
-        },
-    )
-    .await;
-    let contradicts_multi = count_contradicts(&graph, &b_iri).await.unwrap_or(-1);
-    r.check(
-        15,
-        "v1.1 later fight adds another CONTRADICTS (does not supersede first)",
-        a2.is_ok() && b3.is_ok() && contradicts_multi == 2 && !a2_iri.is_empty(),
-        &format!("contradicts={contradicts_multi} a2={a2:?} b3={b3:?}"),
-    );
-
-    let knowledge = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity(format!("known-{tag}"), &["Knowledge"]),
-            p: "ABOUT".into(),
-            o: object_iri(subject_iri.clone()),
-            layer: Some("global".into()),
-            spike: Some("Knowledge".into()),
-            contradicts: false,
-        },
-    )
-    .await;
-    r.check(
-        16,
-        "v1.1 Knowledge ABOUT fixture subject",
-        knowledge.is_ok(),
-        &format!("{knowledge:?}"),
-    );
-
-    let wake = tools::memory_search(
-        &graph,
-        project,
-        SearchArgs {
-            text: Some(subject_name.clone()),
-            labels: None,
-            limit: Some(30),
-        },
-    )
-    .await;
-    let wake_ok = wake
-        .as_ref()
-        .ok()
-        .map(|v| {
-            let mode = v.get("mode").and_then(|m| m.as_str()) == Some("wakeup");
-            let facts = v
-                .get("facts")
-                .and_then(|n| n.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let spikes = v
-                .get("spike")
-                .and_then(|n| n.as_array())
-                .cloned()
-                .unwrap_or_default();
-            let has_fact = !facts.is_empty()
-                && facts.iter().any(|f| {
-                    f.get("s")
-                        .and_then(|s| s.get("iri"))
-                        .and_then(|x| x.as_str())
-                        == Some(subject_iri.as_str())
-                        || f.get("p")
-                            .and_then(|x| x.as_str())
-                            .unwrap_or("")
-                            .contains("worksOn")
-                        || f.to_string().contains(&subject_name)
-                });
-            let no_nodes_dir = v.get("nodes").is_none();
-            let first_spike = spikes
-                .first()
-                .and_then(|s| s.get("rank").and_then(|x| x.as_str()));
-            let knowledge_first = first_spike == Some("Knowledge");
-            let subject_fact_spike = facts.iter().find(|f| {
-                ["s", "o"].iter().any(|endpoint| {
-                    f.get(*endpoint)
-                        .and_then(|node| node.get("iri"))
-                        .and_then(|iri| iri.as_str())
-                        == Some(subject_iri.as_str())
-                })
-            });
-            let fact_ranked = subject_fact_spike
-                .and_then(|f| f.get("spike").and_then(|x| x.as_str()))
-                == Some("Knowledge");
-            mode && has_fact && no_nodes_dir && knowledge_first && fact_ranked
-        })
-        .unwrap_or(false);
-    r.check(
-        17,
-        "v1.1 memory_search fixture subject returns facts+ABOUT SPIKE; Knowledge ranks above Signal",
-        wake_ok,
-        &format!("{wake:?}"),
-    );
-
-    let lit = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(subject_iri.clone()),
-            p: "note".into(),
-            o: literal("v11-unique-literal-token"),
-            layer: Some("project:graph-memory".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let lit_search = tools::memory_search(
-        &graph,
-        project,
-        SearchArgs {
-            text: Some("v11-unique-literal-token".into()),
-            labels: None,
-            limit: Some(20),
-        },
-    )
-    .await;
-    let lit_ok = lit.is_ok()
-        && lit_search
-            .as_ref()
-            .ok()
-            .map(|v| {
-                v.get("mode").and_then(|m| m.as_str()) == Some("wakeup")
-                    && v.get("facts")
-                        .and_then(|n| n.as_array())
-                        .map(|arr| {
-                            arr.iter()
-                                .any(|f| f.to_string().contains("v11-unique-literal-token"))
-                        })
-                        .unwrap_or(false)
-            })
-            .unwrap_or(false);
-    r.check(
-        18,
-        "v1.1 memory_search finds literal/factText (not node directory)",
-        lit_ok,
-        &format!("assert={lit:?} search={lit_search:?}"),
-    );
-
-    // 19. retract without layer uses default_write_layer only
-    let retract_s = entity(format!("v11-retract-s-{tag}"), &["Element"]);
-    let g_assert = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: retract_s.clone(),
-            p: "desk".into(),
-            o: object(format!("v11-retract-g-{tag}"), &["Element"]),
-            layer: Some("global".into()),
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let p_assert = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: retract_s.clone(),
-            p: "desk".into(),
-            o: object(format!("v11-retract-p-{tag}"), &["Element"]),
-            layer: None,
-            spike: None,
-            contradicts: false,
-        },
-    )
-    .await;
-    let retract_s_iri = g_assert
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("s")
-                .and_then(|s| s.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    let retract_nolayer = tools::memory_retract(
-        &graph,
-        project,
-        RetractArgs {
-            target: RetractTargetArgs {
-                kind: "predicate".into(),
-                s: entity_iri(retract_s_iri.clone()),
-                p: Some("desk".into()),
-                o: None,
-            },
-            layer: None,
-            reason: Some("smoke retract no layer".into()),
-        },
-    )
-    .await;
-    let (g_left, _) =
-        tools::count_current_asserts(&graph, &retract_s_iri, "desk", "global").await?;
-    let (p_left, _) = tools::count_current_asserts(&graph, &retract_s_iri, "desk", project).await?;
-    let used_layer = retract_nolayer
-        .as_ref()
-        .ok()
-        .and_then(|v| v.get("layer").and_then(|x| x.as_str()))
-        .unwrap_or("");
-    r.check(
-        19,
-        "retract without layer uses default_write_layer only; other layers untouched",
-        g_assert.is_ok()
-            && p_assert.is_ok()
-            && retract_nolayer.is_ok()
-            && g_left == 1
-            && p_left == 0
-            && used_layer == project,
-        &format!(
-            "global_left={g_left} project_left={p_left} used_layer={used_layer} retract={retract_nolayer:?}"
+    .await?;
+    report.check(
+        "retract retires a fact when its last named membership is removed",
+        retracted.get("retracted").and_then(Value::as_u64) == Some(1)
+            && relation_state(&graph, &merged_rel).await?
+                == Some((vec![layer_b.clone()], false, 0)),
+        format!(
+            "response={retracted} state={:?}",
+            relation_state(&graph, &merged_rel).await?
         ),
     );
 
-    // 20. NULL-layer edges stay invisible (search + get + ABOUT spike)
-    let null_token = format!("v11-null-layer-token-{tag}");
-    let null_s = format!("mindreader:element/v11-null-s-{tag}");
-    let null_o = format!("mindreader:element/v11-null-o-{tag}");
-    let null_sp = format!("mindreader:signal/v11-null-spike-{tag}");
-    graph
-        .run(
-            neo4rs::query(
-                r#"
-                MERGE (s:Entity:Element {iri: $s})
-                ON CREATE SET s.name = $sname, s.createdAt = datetime(), s.searchText = $token
-                MERGE (o:Entity:Element {iri: $o})
-                ON CREATE SET o.name = $oname, o.createdAt = datetime()
-                CREATE (s)-[r:ASSERTS {
-                    propertyIri: 'mindreader:property/note',
-                    factText: $token,
-                    validFrom: datetime()
-                }]->(o)
-                "#,
-            )
-            .param("s", null_s.clone())
-            .param("sname", format!("v11-null-s-{tag}"))
-            .param("o", null_o.clone())
-            .param("oname", format!("v11-null-o-{tag}"))
-            .param("token", null_token.clone()),
-        )
-        .await?;
-    graph
-        .run(
-            neo4rs::query(
-                r#"
-                MERGE (sp:Entity:Signal {iri: $iri})
-                ON CREATE SET sp.name = $name, sp.createdAt = datetime()
-                WITH sp
-                MATCH (el:Entity {iri: $subject})
-                CREATE (sp)-[a:ABOUT {
-                    propertyIri: 'mindreader:property/ABOUT',
-                    factText: $ft,
-                    validFrom: datetime()
-                }]->(el)
-                "#,
-            )
-            .param("iri", null_sp.clone())
-            .param("name", format!("v11-null-spike-{tag}"))
-            .param("subject", subject_iri.clone())
-            .param("ft", format!("null spike about fixture subject {tag}")),
-        )
-        .await?;
-    let null_search = tools::memory_search(
+    let rank_token = format!("rank-{tag}");
+    let low = tools::memory_assert(
         &graph,
-        project,
-        SearchArgs {
-            text: Some(null_token.clone()),
-            labels: None,
-            limit: Some(20),
+        AssertArgs {
+            s: entity(format!("{rank_token}-low-subject")),
+            p: property.clone(),
+            o: object(format!("{rank_token}-low-object")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let high = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("{rank_token}-high-subject")),
+            p: property.clone(),
+            o: object(format!("{rank_token}-high-object")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let low_rel = relationship_iri(&low)?;
+    let high_rel = relationship_iri(&high)?;
+    let high_subject = subject_iri(&high)?;
+    let strengthened_node = tools::memory_feedback(
+        &graph,
+        FeedbackArgs {
+            layers: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "node".into(),
+                iri: high_subject,
+            },
+            mode: "strengthen".into(),
+        },
+    )
+    .await?;
+    let strengthened_rel = tools::memory_feedback(
+        &graph,
+        FeedbackArgs {
+            layers: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "relationship".into(),
+                iri: high_rel.clone(),
+            },
+            mode: "strengthen".into(),
+        },
+    )
+    .await?;
+    let weakened_rel = tools::memory_feedback(
+        &graph,
+        FeedbackArgs {
+            layers: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "relationship".into(),
+                iri: low_rel.clone(),
+            },
+            mode: "weaken".into(),
+        },
+    )
+    .await?;
+    let ranked = search(&graph, vec![layer_a.clone()], &rank_token).await?;
+    report.check(
+        "node and relationship feedback are signed and affect ranking within a tier",
+        strengthened_node.get("weight").and_then(Value::as_i64) == Some(1)
+            && strengthened_rel.get("weight").and_then(Value::as_i64) == Some(1)
+            && weakened_rel.get("weight").and_then(Value::as_i64) == Some(-1)
+            && fact_position(&ranked, &high_rel) == Some(0)
+            && fact_position(&ranked, &high_rel) < fact_position(&ranked, &low_rel),
+        format!(
+            "node={strengthened_node} high={strengthened_rel} low={weakened_rel} ranked={ranked}"
+        ),
+    );
+
+    let mut concurrent_feedback = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let graph = graph.clone();
+        let layer = layer_a.clone();
+        let relationship = high_rel.clone();
+        concurrent_feedback.spawn(async move {
+            tools::memory_feedback(
+                &graph,
+                FeedbackArgs {
+                    layers: vec![layer],
+                    target: TargetArgs {
+                        kind: "relationship".into(),
+                        iri: relationship,
+                    },
+                    mode: "strengthen".into(),
+                },
+            )
+            .await
+        });
+    }
+    let mut concurrent_successes = 0;
+    while let Some(result) = concurrent_feedback.join_next().await {
+        result.context("join concurrent feedback task")??;
+        concurrent_successes += 1;
+    }
+    report.check(
+        "concurrent feedback increments do not lose updates",
+        concurrent_successes == 8
+            && relation_state(&graph, &high_rel).await? == Some((vec![layer_a.clone()], true, 9)),
+        format!(
+            "successes={concurrent_successes} state={:?}",
+            relation_state(&graph, &high_rel).await?
+        ),
+    );
+
+    let closure_token = format!("closure-{tag}");
+    let closure = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("{closure_token}-subject")),
+            p: property,
+            o: object(format!("{closure_token}-object")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let closure_rel = relationship_iri(&closure)?;
+    let closure_subject = subject_iri(&closure)?;
+    let closure_object = object_result_iri(&closure)?;
+    let premature_relation_add = tools::memory_layers(
+        &graph,
+        LayersArgs {
+            layers: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "relationship".into(),
+                iri: closure_rel.clone(),
+            },
+            add: vec![layer_c.clone()],
+            remove: Vec::new(),
         },
     )
     .await;
-    let null_get = tools::memory_get(
+    let subject_add = tools::memory_layers(
         &graph,
-        project,
+        LayersArgs {
+            layers: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "node".into(),
+                iri: closure_subject.clone(),
+            },
+            add: vec![layer_c.clone()],
+            remove: Vec::new(),
+        },
+    )
+    .await?;
+    let object_add = tools::memory_layers(
+        &graph,
+        LayersArgs {
+            layers: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "node".into(),
+                iri: closure_object,
+            },
+            add: vec![layer_c.clone()],
+            remove: Vec::new(),
+        },
+    )
+    .await?;
+    let relation_add = tools::memory_layers(
+        &graph,
+        LayersArgs {
+            layers: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "relationship".into(),
+                iri: closure_rel.clone(),
+            },
+            add: vec![layer_c.clone()],
+            remove: Vec::new(),
+        },
+    )
+    .await?;
+    let invalid_endpoint_remove = tools::memory_layers(
+        &graph,
+        LayersArgs {
+            layers: vec![layer_a.clone(), layer_c.clone()],
+            target: TargetArgs {
+                kind: "node".into(),
+                iri: closure_subject,
+            },
+            add: Vec::new(),
+            remove: vec![layer_a.clone()],
+        },
+    )
+    .await;
+    report.check(
+        "memory_layers succeeds only when endpoint/relationship closure is preserved",
+        premature_relation_add.is_err()
+            && subject_add.get("noop").and_then(Value::as_bool) == Some(false)
+            && object_add.get("noop").and_then(Value::as_bool) == Some(false)
+            && relation_add.get("layers").and_then(Value::as_array).is_some_and(|values| values.len() == 2)
+            && relation_state(&graph, &closure_rel).await?
+                == Some((vec![layer_a, layer_c], true, 0))
+            && invalid_endpoint_remove.is_err(),
+        format!("premature={premature_relation_add:?} subject={subject_add} object={object_add} relation={relation_add} invalidRemove={invalid_endpoint_remove:?}"),
+    );
+
+    let exact = tools::memory_get(
+        &graph,
         GetArgs {
-            iri: subject_iri.clone(),
+            iri: subject_iri(&in_b)?,
+            layers: vec![layer_b],
             hops: Some(1),
         },
     )
-    .await;
-    let null_wake = tools::memory_search(
-        &graph,
-        project,
-        SearchArgs {
-            text: Some(subject_name.clone()),
-            labels: None,
-            limit: Some(30),
-        },
-    )
-    .await;
-    let search_hides = null_search
-        .as_ref()
-        .ok()
-        .map(|v| {
-            let facts = v
-                .get("facts")
-                .and_then(|n| n.as_array())
-                .cloned()
-                .unwrap_or_default();
-            facts.iter().all(|f| !f.to_string().contains(&null_token))
-        })
-        .unwrap_or(false);
-    let get_hides = null_get
-        .as_ref()
-        .ok()
-        .map(|v| !v.to_string().contains(&null_sp))
-        .unwrap_or(false);
-    let spike_hides = null_wake
-        .as_ref()
-        .ok()
-        .map(|v| {
-            let spikes = v
-                .get("spike")
-                .and_then(|n| n.as_array())
-                .cloned()
-                .unwrap_or_default();
-            spikes.iter().all(|s| !s.to_string().contains(&null_sp))
-        })
-        .unwrap_or(false);
-    r.check(
-        20,
-        "NULL-layer edges stay invisible (search facts, get hops, ABOUT spike)",
-        search_hides && get_hides && spike_hides,
-        &format!(
-            "search_hides={search_hides} get_hides={get_hides} spike_hides={spike_hides} search={null_search:?}"
-        ),
-    );
-
-    // 21. exact replacement preserves unrelated current values
-    let multi_s = format!("mindreader:element/v11-multi-s-{tag}");
-    let multi_a = format!("mindreader:element/v11-multi-a-{tag}");
-    let multi_b = format!("mindreader:element/v11-multi-b-{tag}");
-    graph
-        .run(
-            neo4rs::query(
-                r#"
-                MERGE (s:Entity:Element {iri: $s}) ON CREATE SET s.name = $sname, s.createdAt = datetime()
-                MERGE (a:Entity:Element {iri: $a}) ON CREATE SET a.name = $aname, a.createdAt = datetime()
-                MERGE (b:Entity:Element {iri: $b}) ON CREATE SET b.name = $bname, b.createdAt = datetime()
-                CREATE (s)-[:ASSERTS {
-                    propertyIri: 'mindreader:property/worksOn',
-                    layer: $layer,
-                    validFrom: datetime(),
-                    factText: 'multi a'
-                }]->(a)
-                CREATE (s)-[:ASSERTS {
-                    propertyIri: 'mindreader:property/worksOn',
-                    layer: $layer,
-                    validFrom: datetime(),
-                    factText: 'multi b'
-                }]->(b)
-                "#,
-            )
-            .param("s", multi_s.clone())
-            .param("sname", format!("v11-multi-s-{tag}"))
-            .param("a", multi_a.clone())
-            .param("aname", format!("v11-multi-a-{tag}"))
-            .param("b", multi_b.clone())
-            .param("bname", format!("v11-multi-b-{tag}"))
-            .param("layer", project.to_string()),
-        )
-        .await?;
-    let (before_n, before_objs) =
-        tools::count_current_asserts(&graph, &multi_s, "worksOn", project).await?;
-    let multi_c = tools::memory_replace(
-        &graph,
-        project,
-        ReplaceArgs {
-            s: entity_iri(multi_s.clone()),
-            p: "worksOn".into(),
-            old: object_iri(multi_a.clone()),
-            new: object(format!("v11-multi-c-{tag}"), &["Element"]),
-            layer: Some(project.to_string()),
-            spike: None,
-            contradicts: false,
-            reason: Some("smoke preserve unrelated current fact".into()),
-        },
-    )
-    .await;
-    let c_iri = multi_c
-        .as_ref()
-        .ok()
-        .and_then(|v| {
-            v.get("new")
-                .and_then(|o| o.get("iri"))
-                .and_then(|x| x.as_str())
-        })
-        .unwrap_or("")
-        .to_string();
-    let (after_n, after_objs) =
-        tools::count_current_asserts(&graph, &multi_s, "worksOn", project).await?;
-    let hist_multi = tools::count_historical_asserts(&graph, &multi_s, "worksOn", project).await?;
-    let supersedes_multi = count_supersedes(&graph, &c_iri, &multi_a, "worksOn", project).await?;
-    r.check(
-        21,
-        "memory_replace closes one exact fact and preserves unrelated current values",
-        before_n == 2
-            && multi_c.is_ok()
-            && after_n == 2
-            && hist_multi >= 1
-            && supersedes_multi == 1
-            && after_objs.iter().any(|o| o == &c_iri)
-            && after_objs.iter().any(|o| o == &multi_b)
-            && !after_objs.iter().any(|o| o == &multi_a),
-        &format!(
-            "before={before_n} {before_objs:?} after={after_n} {after_objs:?} hist={hist_multi} supersedes={supersedes_multi} c={multi_c:?}"
-        ),
-    );
-
-    let race_s1 = format!("mindreader:element/race-one-{tag}");
-    let race_s2 = format!("mindreader:element/race-two-{tag}");
-    let race_old = format!("mindreader:element/race-old-{tag}");
-    let race_new = format!("mindreader:element/race-new-{tag}");
-    for subject in [&race_s1, &race_s2] {
-        tools::memory_assert(
-            &graph,
-            project,
-            AssertArgs {
-                s: entity_iri(subject.clone()),
-                p: "worksOn".into(),
-                o: object_iri(race_old.clone()),
-                layer: Some("global".into()),
-                spike: None,
-                contradicts: false,
-            },
-        )
-        .await?;
-    }
-    let race_one = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(race_s1),
-            p: "worksOn".into(),
-            o: object_iri(race_new.clone()),
-            layer: Some(project.into()),
-            spike: None,
-            contradicts: true,
-        },
-    );
-    let race_two = tools::memory_assert(
-        &graph,
-        project,
-        AssertArgs {
-            s: entity_iri(race_s2),
-            p: "worksOn".into(),
-            o: object_iri(race_new.clone()),
-            layer: Some(project.into()),
-            spike: None,
-            contradicts: true,
-        },
-    );
-    let (race_one, race_two) = tokio::join!(race_one, race_two);
-    let contradiction_count =
-        tools::count_current_contradicts(&graph, &race_new, &race_old).await?;
-    r.check(
-        22,
-        "concurrent derived contradiction writes remain exact-pair idempotent",
-        race_one.is_ok() && race_two.is_ok() && contradiction_count == 1,
-        &format!(
-            "first={race_one:?} second={race_two:?} activeContradictions={contradiction_count}"
-        ),
-    );
-
-    Ok(r.failed)
-}
-
-async fn count_contradicts(graph: &neo4rs::Graph, from_iri: &str) -> Result<i64> {
-    let row = mindreader::graph::fetch_one(
-        graph,
-        neo4rs::query(
-            r#"
-            MATCH (n:Entity {iri: $iri})-[r:CONTRADICTS]->(o)
-            WHERE r.validTo IS NULL
-            RETURN count(r) AS n
-            "#,
-        )
-        .param("iri", from_iri.to_string()),
-    )
     .await?;
-    Ok(row.and_then(|r| r.get::<i64>("n").ok()).unwrap_or(0))
-}
+    report.check(
+        "stable relationship IRI round-trips through scoped retrieval",
+        exact
+            .get("neighbors")
+            .and_then(Value::as_array)
+            .is_some_and(|neighbors| {
+                neighbors.iter().any(|neighbor| {
+                    neighbor.pointer("/edge/iri").and_then(Value::as_str) == Some(&b_rel)
+                })
+            }),
+        &exact,
+    );
 
-async fn count_supersedes(
-    graph: &neo4rs::Graph,
-    from_iri: &str,
-    to_iri: &str,
-    property: &str,
-    layer: &str,
-) -> Result<i64> {
-    let row = mindreader::graph::fetch_one(
-        graph,
-        neo4rs::query(
-            r#"
-            MATCH (new:Entity {iri: $new})-[r:SUPERSEDES]->(old:Entity {iri: $old})
-            WHERE r.validTo IS NULL AND r.propertyIri = $property AND r.layer = $layer
-            RETURN count(r) AS n
-            "#,
-        )
-        .param("new", from_iri.to_string())
-        .param("old", to_iri.to_string())
-        .param("property", mindreader::iri::property_iri(property))
-        .param("layer", layer.to_string()),
-    )
-    .await?;
-    Ok(row.and_then(|r| r.get::<i64>("n").ok()).unwrap_or(0))
-}
-
-fn load() {
-    mindreader::config::load_env();
+    Ok(report.failed)
 }

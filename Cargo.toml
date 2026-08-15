@@ -3,6 +3,11 @@ name = "mindreader"
 version = "0.1.0"
 edition = "2021"
 description = "Neo4j RDFS schema-as-data memory MCP server"
+homepage = "https://github.com/bnomei/mindreader"
+repository = "https://github.com/bnomei/mindreader"
+license = "MIT"
+readme = "README.md"
+rust-version = "1.89"
 publish = false
 
 [lib]
