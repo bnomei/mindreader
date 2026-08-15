@@ -1,5 +1,7 @@
 use crate::config::Config;
 use crate::graph;
+use crate::merge::MergeArgs;
+use crate::semantic::SemanticSearchArgs;
 use crate::service::MemoryService;
 use crate::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs, SchemaArgs,
@@ -66,6 +68,30 @@ fn schema_memory_search() -> Arc<rmcp::model::JsonObject> {
             "layers": layers_schema()
         },
         "required": ["layers"]
+    }))
+}
+
+fn schema_memory_semantic_search() -> Arc<rmcp::model::JsonObject> {
+    object_schema(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "text": { "type": "string", "minLength": 1 },
+            "layers": layers_schema(),
+            "labels": { "type": "array", "items": { "type": "string" } },
+            "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+        },
+        "required": ["text", "layers"]
+    }))
+}
+
+fn schema_memory_merge() -> Arc<rmcp::model::JsonObject> {
+    object_schema(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "source": { "type": "string", "minLength": 1 },
+            "target": { "type": "string", "minLength": 1 }
+        },
+        "required": ["source", "target"]
     }))
 }
 
@@ -245,7 +271,6 @@ impl Mindreader {
     /// Build the server without talking to Neo4j so MCP initialize/list_tools
     /// can run immediately.
     pub fn from_env() -> anyhow::Result<Self> {
-        crate::config::load_env();
         Ok(Self::from_config(Config::from_env()?))
     }
 
@@ -260,8 +285,9 @@ impl Mindreader {
         self.service
             .get_or_try_init(|| async {
                 let g = graph::connect(&self.cfg).await?;
-                graph::bootstrap(&g).await?;
-                Ok::<_, anyhow::Error>(MemoryService::new(g))
+                let embedding_space = self.cfg.embedding.as_ref().map(|value| value.space());
+                graph::bootstrap(&g, embedding_space.as_ref()).await?;
+                MemoryService::new(g, &self.cfg)
             })
             .await?;
         Ok(())
@@ -316,6 +342,36 @@ impl Mindreader {
     ) -> Result<CallToolResult, McpError> {
         let service = self.service().await?;
         service.search(args).await.map_err(map_err).and_then(ok)
+    }
+
+    #[tool(
+        name = "memory_semantic_search",
+        description = "Embed a query, combine current direct matches with nearby remembered result bundles, and return current visible facts with a 1-based rank. The requested @layers and labels filter direct and recalled facts identically.",
+        input_schema = schema_memory_semantic_search()
+    )]
+    async fn memory_semantic_search(
+        &self,
+        Parameters(args): Parameters<SemanticSearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let service = self.service().await?;
+        service
+            .semantic_search(args)
+            .await
+            .map_err(map_err)
+            .and_then(ok)
+    }
+
+    #[tool(
+        name = "memory_merge",
+        description = "Permanently merge source into target across all memberships and history. The target IRI and name survive. Use advisory mergeSuggestions for direction, but review them first and reverse them when appropriate.",
+        input_schema = schema_memory_merge()
+    )]
+    async fn memory_merge(
+        &self,
+        Parameters(args): Parameters<MergeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let service = self.service().await?;
+        service.merge(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
@@ -441,7 +497,7 @@ impl ServerHandler for Mindreader {
                 website_url: None,
             },
             instructions: Some(
-                "Mindreader: RDFS schema-as-data memory over Neo4j. Ten tools provide scoped retrieval, fact writes, explicit feedback, layer auditing, and global schema. @layers uses [] for global-only and lowercase kebab-case colon namespaces for named OR-union visibility. No raw Cypher."
+                "Mindreader: RDFS schema-as-data memory over Neo4j. Twelve tools provide scoped direct and semantic retrieval, fact writes, advisory entity deduplication, explicit merging, feedback, layer auditing, and global schema. @layers uses [] for global-only and lowercase kebab-case colon namespaces for named OR-union visibility. No raw Cypher."
                     .into(),
             ),
         }
@@ -470,17 +526,19 @@ mod tests {
     use serde_json::Value;
 
     #[test]
-    fn registers_ten_tools() {
+    fn registers_twelve_tools() {
         let names = Mindreader::registered_tool_names();
         let expected = [
             "memory_assert",
             "memory_feedback",
             "memory_get",
             "memory_layers",
+            "memory_merge",
             "memory_replace",
             "memory_retract",
             "memory_schema",
             "memory_search",
+            "memory_semantic_search",
             "memory_stats",
             "memory_traverse",
         ];
@@ -489,7 +547,7 @@ mod tests {
         for name in expected {
             assert!(router.has_route(name), "missing route {name}");
         }
-        assert_eq!(router.map.len(), 10);
+        assert_eq!(router.map.len(), 12);
     }
 
     #[test]
@@ -592,7 +650,7 @@ mod tests {
         for tool in router.list_all() {
             let schema = tool.schema_as_json_value();
             let required = schema["required"].as_array().cloned().unwrap_or_default();
-            if tool.name == "memory_schema" {
+            if tool.name == "memory_schema" || tool.name == "memory_merge" {
                 assert!(!required.iter().any(|value| value == "layers"));
             } else {
                 assert!(

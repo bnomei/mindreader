@@ -4,9 +4,9 @@
 [![npm](https://img.shields.io/npm/v/@bnomei/mindreader)](https://www.npmjs.com/package/@bnomei/mindreader)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Mindreader is a deterministic, privacy-first [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It stores explicit graph triples (`subject -predicate-> object`) and serves ten tools over stdio for scoped retrieval, traversal, feedback, layer auditing, schema management, and durable writes.
+Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It stores explicit graph triples (`subject -predicate-> object`) and serves twelve tools over stdio for scoped retrieval, semantic recall, traversal, feedback, layer auditing, entity merging, schema management, and durable writes.
 
-Mindreader does not extract facts with a hidden language model, require embeddings, expose raw Cypher, or destructively overwrite history. Every state-changing write records an `Episode`; explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`.
+Mindreader does not extract facts with a hidden language model or expose raw Cypher. Ordinary memory writes preserve history and record an `Episode`; explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`. Semantic search is optional and sends its query text to the selected OpenAI or xAI embedding API.
 
 ## What mindreader provides
 
@@ -14,8 +14,9 @@ Mindreader does not extract facts with a hidden language model, require embeddin
 - Deterministic IRI minting for entities, schema, literals, and provenance episodes.
 - Request-scoped visibility across one or many named layers, with global memory available in every scope.
 - Wakeup-oriented retrieval that returns current facts and ranked `Signal`, `Pattern`, `Insight`, and `Knowledge` context.
+- Semantic recall that blends direct results with nearby, expiring result bundles stored in Neo4j.
 - Explicit strengthen/weaken feedback, shared signed weights, and auditable membership edits.
-- Idempotent assertions, transactional supersession, explicit contradiction links, and soft retraction.
+- Idempotent assertions, advisory duplicate suggestions, explicit node merging, transactional supersession, contradiction links, and soft retraction.
 - A stdio MCP server that completes the MCP handshake before Neo4j is ready and connects to the database lazily.
 
 ## Install a release
@@ -51,7 +52,7 @@ This path runs Neo4j in Docker, verifies the graph behavior, and builds a local 
 
 ### Prerequisites
 
-- Docker with Docker Compose
+- Docker with Docker Compose. Neo4j must provide matching APOC Core and APOC Extended plugins; the included Compose service installs both.
 - Rust 1.89 or newer with Cargo
 
 ### 1. Configure the server
@@ -61,6 +62,7 @@ cp .env.example .env
 ```
 
 Set a private `NEO4J_PASSWORD` in `.env`. The example password is intended only for local development.
+This repository-level file supplies Docker Compose. A native Mindreader process instead uses its OS configuration directory, described in [Configuration reference](#configuration-reference).
 
 ### 2. Start Neo4j
 
@@ -74,8 +76,10 @@ Mindreader does not migrate older graph models. For an existing local developmen
 ### 3. Verify the memory behavior
 
 ```bash
-cargo run --bin mindreader-smoke
+NEO4J_PASSWORD='<same-password-as-repository-.env>' cargo run --bin mindreader-smoke
 ```
+
+The smoke process reads secrets from the native Mindreader `.env`, or from its process environment as shown above.
 
 The smoke test creates test graph data and exercises schema creation, dynamic multi-layer visibility, membership merging, scoped replacement and retraction, signed feedback ranking, concurrent feedback, membership auditing, endpoint closure, and stable relationship retrieval. A successful run ends with:
 
@@ -109,16 +113,15 @@ Use absolute paths because desktop MCP clients do not necessarily inherit your s
     "mindreader": {
       "command": "/absolute/path/to/mindreader/target/release/mindreader",
       "env": {
-        "NEO4J_URI": "bolt://127.0.0.1:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "<NEO4J_PASSWORD>"
+        "NEO4J_PASSWORD": "<NEO4J_PASSWORD>",
+        "OPENAI_API_KEY": "<OPTIONAL_OPENAI_API_KEY>"
       }
     }
   }
 }
 ```
 
-Restart the MCP client after changing its configuration. A successful connection exposes the ten tools listed in [MCP tool reference](#mcp-tool-reference).
+Configure the Neo4j URI, username, provider models, and semantic-search policy in `config.toml`, not in MCP environment variables. Restart the MCP client after changing its configuration. A successful connection exposes the twelve tools listed in [MCP tool reference](#mcp-tool-reference).
 
 ### npm launcher
 
@@ -131,9 +134,8 @@ Pin the package version in MCP configuration so the client always starts the sam
       "command": "npx",
       "args": ["-y", "@bnomei/mindreader@0.1.0"],
       "env": {
-        "NEO4J_URI": "bolt://127.0.0.1:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "<NEO4J_PASSWORD>"
+        "NEO4J_PASSWORD": "<NEO4J_PASSWORD>",
+        "XAI_API_KEY": "<OPTIONAL_XAI_API_KEY>"
       }
     }
   }
@@ -170,13 +172,14 @@ Run `docker compose up -d neo4j` before the client launches the Compose-backed s
 
 Start each session by recovering relevant context, then write only durable facts:
 
-1. Choose the request's `layers` visibility union, then call `memory_search` with the task, topic, or person when you do not have an IRI.
+1. Choose the request's `layers` visibility union, then call `memory_search` for exact names or `memory_semantic_search` for conceptual recall when you do not have an IRI.
 2. Call `memory_get` for a returned IRI when you need the exact node or its immediate neighbors.
 3. Call `memory_traverse` when you need typed paths beyond one hop.
 4. Call `memory_schema` only when the required Class or Property does not exist.
 5. Call `memory_assert` once per durable, future-relevant triple.
-6. Search again to verify an important write.
-7. After using a retrieved node or relationship, call `memory_feedback` with `strengthen` if it helped or `weaken` if it did not.
+6. Review any `mergeSuggestions`. They are fuzzy, advisory candidates rather than proof that two nodes are identical. Call `memory_merge` only after deciding the identities truly match.
+7. Search again to verify an important write.
+8. After using a retrieved node or relationship, call `memory_feedback` with `strengthen` if it helped or `weaken` if it did not.
 
 Do not store task chatter, acknowledgements, markdown dumps, or transient status as memory. The repository includes a reusable decision guide at [`skills/writing-to-mindreader/SKILL.md`](skills/writing-to-mindreader/SKILL.md).
 
@@ -229,11 +232,12 @@ To audit its memberships independently of the fact value, use `memory_layers` wi
 
 ## MCP tool reference
 
-All tools return structured JSON. Every tool except `memory_schema` requires a `layers` array. In the table, `@layers` is short for that request field.
+All tools return structured JSON. Every scoped tool requires a `layers` array; the global `memory_schema` and permanent `memory_merge` operations do not. In the table, `@layers` is short for that request field.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
 | `memory_search` | `layers` | `text`, `labels`, `limit` (`20`, clamped to `1..100`) | Find current visible facts and ranked `ABOUT` context. The result limit is applied only after Spike, weight, relevance, and deterministic tie-break ranking. |
+| `memory_semantic_search` | non-empty `text`, `layers` | `labels`, `limit` (`20`, clamped to `1..100`) | Embed the query, blend direct matches with nearby remembered result bundles, and return current visible facts with a 1-based `rank`. |
 | `memory_get` | `iri`, `layers` | `hops` (`0`; only `1` includes neighbors) | Fetch a visible node and, optionally, its current visible one-hop relationships. |
 | `memory_traverse` | `from`, `layers` | `rels` (all fixed relationships), `depth` (`1`, clamped to `1..3`), `limit` (`50`, clamped to `1..200`) | Walk current visible typed relationships in either direction. |
 | `memory_stats` | `layers` | None | Report graph-model readiness, visible node/edge counts, database-wide episode count, and per-membership active edge totals. |
@@ -243,6 +247,9 @@ All tools return structured JSON. Every tool except `memory_schema` requires a `
 | `memory_feedback` | `layers`, tagged `target`, `mode` | None | Apply exactly `+1` (`strengthen`) or `-1` (`weaken`) to a visible node or current relationship's shared weight. |
 | `memory_layers` | `layers`, tagged `target` | `add`, `remove` (at least one entry across them) | Audit and atomically edit one node or current relationship's memberships. |
 | `memory_schema` | `kind`, plus `name` or `iri` | `subClassOf`, `subPropertyOf`, `domain`, `range` | Declare a Class or Property and its structural links as global records. |
+| `memory_merge` | `source`, `target` IRIs | None | Permanently merge two user-visible non-literal entities across every membership and historical relationship; the target IRI and name survive. |
+
+`memory_assert`, `memory_replace`, and `memory_schema` return `mergeSuggestions` when they create a user-visible entity with a fuzzy same-kind name match. Each suggestion includes the two names, its similarity, and a directly callable `merge: {source, target}` payload. The shorter name is recommended as the target; ties keep the pre-existing candidate. This direction is only a recommendation: inspect identity carefully and reverse or ignore it when appropriate. Names such as `007` and `007s` can be similar while still naming different entities.
 
 ### Assertion values
 
@@ -317,15 +324,25 @@ Retrieval returns stable IRIs for nodes and relationships. Pass one back to `mem
 
 Retrieval never changes weight automatically, feedback can arrive in a later turn, and there is no time decay. Search first orders facts by Spike category (`Knowledge > Insight > Pattern > Signal`), then by the combined subject + relationship + object weight within a category, then by text relevance. A relationship feedback target must still be current, and every target must remain visible in `@layers`.
 
+### Semantic recall
+
+`memory_semantic_search` embeds the query with one external provider, runs the ordinary direct search, retrieves nearby semantic activations from Neo4j's cosine vector index, resolves their relationship IRIs against the current graph and requested scope, and combines the rankings with weighted reciprocal-rank fusion. Direct matches have weight `2.0` by default; recalled bundles are weighted by vector similarity. Recalled facts must still be current, match `labels`, and satisfy relationship-and-endpoint visibility in `@layers`.
+
+An activation is an internal `SemanticActivation:TTL` node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. Similar searches with sufficiently overlapping results converge into one activation and refresh its TTL; other searches create a new activation. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
+
+The embedding provider, model, and dimensions define one vector space for the database. If that selection changes, Mindreader discards only the ephemeral activations and recreates their vector index; durable graph memory remains intact. Semantic search requires an embedding key, but all other tools remain usable without one.
+
 ### Provenance and history
 
-Each state-changing mutation creates one `Episode` with the tool name and timestamp; no-op mutations create none. Relationships carry the episode identifier. Retraction sets `validTo` and optionally records a reason; it does not delete graph nodes. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be asserted, replaced, or retracted directly.
+Each state-changing memory mutation creates one `Episode` with the tool name and timestamp; no-op mutations create none. Internal semantic-activation maintenance is excluded. Relationships carry the episode identifier. Retraction sets `validTo` and optionally records a reason; it does not delete graph nodes. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be asserted, replaced, or retracted directly.
 
 Ordinary assertions are set-valued: the same `(subject, property, object)` relationship is idempotent apart from membership merges, while a different object becomes another current value. `memory_replace` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction.
 
 Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because their outcome may be ambiguous.
 
 `CONTRADICTS` is multi-valued. Setting `contradicts: true` on an assertion records explicit links to conflicting visible current objects.
+
+`memory_merge` is the intentional destructive exception to soft history: it removes the source node after moving its memberships and current and historical relationships onto the target. It records exactly one merge `Episode`, preserves the target IRI and name, combines memberships and weights, marks moved relationships with merge provenance, and soft-closes merge-created self-relations and duplicate facts. It creates no alias. Review the direction before calling it.
 
 ### Deterministic IRIs
 
@@ -344,19 +361,56 @@ Slug normalization keeps ASCII letters, numbers, `.`, `_`, and `-`; replaces oth
 
 ## Security and trust boundary
 
-Mindreader is privacy-first in the sense that it is self-hosted and sends no memory to an extraction or embedding service. It does not add an application authentication layer in front of MCP or Neo4j, and layers are a relationship filter rather than a security boundary. Anyone who can start or control the MCP process can use its configured Neo4j credential. Secure the client configuration, `.env`, host process, network path, and Neo4j deployment accordingly.
+Mindreader does not add an application authentication layer in front of MCP or Neo4j, and layers are a relationship filter rather than a security boundary. Anyone who can start or control the MCP process can use its configured Neo4j credential and embedding provider key. Ordinary graph operations remain local, but every `memory_semantic_search` sends its query text to OpenAI or xAI for embedding. It does not send the stored result bundle. Secure the client configuration, native `.env`, host process, network path, Neo4j deployment, and provider accounts accordingly.
 
 ## Configuration reference
 
-Mindreader checks `/workspace/mindreader/.env` and then `.env`, loading values into the process environment. Variables already present in the process environment take precedence over file values.
+On first MCP startup, Mindreader creates `config.toml` and `.env` without overwriting existing files in the OS-native configuration directory:
 
-| Variable | Required | Default | Description |
-| --- | --- | --- | --- |
-| `NEO4J_PASSWORD` | Yes | None | Neo4j credential. Keep it out of version control and MCP client logs. |
-| `NEO4J_URI` | No | `bolt://127.0.0.1:7687` | Bolt or Neo4j endpoint. Compose overrides it with `bolt://neo4j:7687`. |
-| `NEO4J_USER` | No | `neo4j` | Neo4j username. |
+- Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/mindreader`
+- macOS: `~/Library/Application Support/mindreader`
+- Windows: `%APPDATA%\mindreader`
 
-At first database use, Mindreader marks model version 3, creates required uniqueness constraints and full-text indexes, seeds base schema entities, waits for indexes, and verifies their exact online definitions. Version 3 requires a fresh database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
+The directory is user-only on Unix and the generated `.env` is mode `0600`. Put non-secret settings in `config.toml`:
+
+```toml
+[neo4j]
+uri = "bolt://127.0.0.1:7687"
+user = "neo4j"
+
+[embeddings.openai]
+model = "text-embedding-3-small"
+dimensions = 1536
+
+[embeddings.xai]
+model = ""
+dimensions = 1536
+
+[semantic]
+ttl_days = 30
+neighbor_limit = 10
+recall_similarity_threshold = 0.70
+convergence_similarity_threshold = 0.90
+convergence_result_overlap_threshold = 0.60
+rrf_k = 60.0
+direct_weight = 2.0
+```
+
+The TOML parser rejects unknown fields. Dimensions must be `1..4096`; semantic similarity thresholds must be finite values from `0` through `1`; TTL, neighbor limit (`1..100`), `rrf_k`, and `direct_weight` must be positive.
+
+The colocated `.env` contains only secrets:
+
+```dotenv
+NEO4J_PASSWORD=
+OPENAI_API_KEY=
+XAI_API_KEY=
+```
+
+Non-empty process environment secrets take precedence over that file. `NEO4J_PASSWORD` is required for database-backed calls. If `OPENAI_API_KEY` is set, Mindreader uses the configured OpenAI model. Otherwise, if `XAI_API_KEY` is set, it uses the configured xAI model. OpenAI therefore wins when both keys exist. The selected provider's model must be non-empty and its configured dimension must match the returned vectors. Non-secret `NEO4J_URI`, `NEO4J_USER`, model, dimension, and semantic settings are not read from environment variables.
+
+At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 4, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
+
+Version 4 requires a fresh database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
 
 ## Run entirely with Docker
 
@@ -400,9 +454,12 @@ The smoke test writes persistent fixtures to the configured Neo4j database and d
 | [`src/server.rs`](src/server.rs) | MCP tool registration, advertised input schemas, protocol negotiation, and lazy database access. |
 | [`src/service.rs`](src/service.rs) | Typed application boundary used by transport adapters. |
 | [`src/domain.rs`](src/domain.rs) | Validated layer IDs and tagged entity, literal, target, replacement, and retraction concepts. |
-| [`src/tools.rs`](src/tools.rs) | Tool arguments, scoped graph behavior, feedback, membership auditing, supersession, contradiction, and retraction. |
-| [`src/graph.rs`](src/graph.rs) | Neo4j connection/bootstrap, graph serialization, safe identifiers, IRI-backed merges, and provenance helpers. |
-| [`src/config.rs`](src/config.rs) | Environment loading and defaults. |
+| [`src/tools.rs`](src/tools.rs) | Tool arguments, scoped graph behavior, advisory merge suggestions, feedback, membership auditing, supersession, contradiction, and retraction. |
+| [`src/merge.rs`](src/merge.rs) | Permanent entity merging and APOC-backed fuzzy suggestions. |
+| [`src/semantic.rs`](src/semantic.rs) | Direct-plus-vector semantic ranking, activation convergence, and TTL refresh. |
+| [`src/embeddings.rs`](src/embeddings.rs) | Native OpenAI and xAI embedding clients and vector validation. |
+| [`src/graph.rs`](src/graph.rs) | Neo4j connection/bootstrap, graph serialization, safe identifiers, vector-index setup, and provenance helpers. |
+| [`src/config.rs`](src/config.rs) | Native TOML and secret-file initialization, validation, provider selection, and defaults. |
 | [`src/layers.rs`](src/layers.rs) | Layer validation and visibility-union policy. |
 | [`src/iri.rs`](src/iri.rs) | IRI detection, slugging, minting, and kind/label mappings. |
 | [`src/bin/mindreader-smoke.rs`](src/bin/mindreader-smoke.rs) | Live end-to-end graph behavior checks. |
@@ -413,7 +470,15 @@ The smoke test writes persistent fixtures to the configured Neo4j database and d
 
 ### `NEO4J_PASSWORD is not set`
 
-Create `.env` from `.env.example`, set `NEO4J_PASSWORD`, and restart the server process or MCP client.
+Set `NEO4J_PASSWORD` in the `.env` beside the generated `config.toml`, or in the MCP process environment, then restart the server process or client. The repository `.env.example` is for Docker Compose rather than native config discovery.
+
+### Semantic search reports that no provider is configured
+
+Set `OPENAI_API_KEY` or `XAI_API_KEY` in the native `.env` or process environment. If using xAI, also set a non-empty `[embeddings.xai].model` and the matching dimensions in `config.toml`. Provider failure does not fall through to the other provider because their vector spaces are not interchangeable.
+
+### A database call reports a missing APOC function or procedure
+
+Install APOC Core and APOC Extended versions matching Neo4j, enable APOC TTL, and allow the text, merge, and TTL calls shown in `docker-compose.yml`. Recreate a development database after changing an incompatible graph model.
 
 ### Neo4j connection failures
 

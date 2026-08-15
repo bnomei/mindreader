@@ -14,9 +14,10 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /app/target/release/mindreader /usr/local/bin/mindreader
+RUN mkdir -p /config/mindreader
+COPY packaging/mindreader.docker.toml /config/mindreader/config.toml
 
-ENV NEO4J_URI=bolt://neo4j:7687
-ENV NEO4J_USER=neo4j
+ENV XDG_CONFIG_HOME=/config
 
 LABEL org.opencontainers.image.title="Mindreader" \
       org.opencontainers.image.description="Deterministic, privacy-first Neo4j memory MCP server" \

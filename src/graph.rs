@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::config::{Config, EmbeddingSpace};
 use crate::domain::literal_iri;
 use crate::iri::{
     default_lower_for_kind, kind_for_label, kind_from_iri, label_for_kind, mint_iri, name_from_iri,
@@ -58,7 +58,9 @@ pub const WAKEUP_RELS: &[&str] = &[
 const LABEL_OK: &str = "label";
 
 pub const MODEL_MARKER_KEY: &str = "model";
-pub const MODEL_VERSION: i64 = 3;
+pub const MODEL_VERSION: i64 = 4;
+pub const SEMANTIC_INDEX: &str = "semantic_activation_embeddings";
+const EMBEDDING_MARKER_KEY: &str = "embedding";
 
 const RESET_REQUIRED: &str = "recreate the Neo4j database or volume before starting Mindreader";
 const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] =
@@ -66,6 +68,7 @@ const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] =
 const WAKEUP_NODE_PROPERTIES: &[&str] = &["name", "iri", "searchText", "value"];
 
 pub async fn connect(cfg: &Config) -> Result<Graph> {
+    let password = cfg.neo4j_password()?;
     let stripped = cfg
         .uri
         .trim_start_matches("bolt://")
@@ -81,7 +84,7 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
     let mut errors = Vec::new();
     for attempt in 1..=3 {
         for endpoint in &endpoints {
-            match Graph::new(endpoint.as_str(), cfg.user.as_str(), cfg.password.as_str()).await {
+            match Graph::new(endpoint.as_str(), cfg.user.as_str(), password).await {
                 Ok(g) => {
                     if attempt > 1 {
                         eprintln!(
@@ -112,8 +115,9 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
     ))
 }
 
-pub async fn bootstrap(graph: &Graph) -> Result<()> {
+pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Result<()> {
     ensure_model_marker(graph).await?;
+    verify_required_apoc(graph).await?;
 
     graph
         .run(query(
@@ -140,6 +144,10 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
         ))
         .await
         .context("create required wakeup_facts full-text index")?;
+
+    if let Some(embedding) = embedding {
+        ensure_semantic_index(graph, embedding).await?;
+    }
 
     graph
         .run(query(
@@ -189,7 +197,163 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
         .context("wait for required Neo4j indexes to become online")?;
     verify_required_constraints(graph).await?;
     verify_required_fulltext_indexes(graph).await?;
+    if embedding.is_some() {
+        verify_semantic_index(graph).await?;
+    }
 
+    Ok(())
+}
+
+async fn verify_required_apoc(graph: &Graph) -> Result<()> {
+    let functions = fetch_all(
+        graph,
+        query(
+            "SHOW FUNCTIONS YIELD name WHERE name IN [\
+             'apoc.text.fuzzyMatch', 'apoc.text.levenshteinSimilarity'] \
+             RETURN collect(name) AS names",
+        ),
+    )
+    .await
+    .context("inspect required APOC functions")?
+    .into_iter()
+    .next()
+    .and_then(|row| row.get::<Vec<String>>("names").ok())
+    .unwrap_or_default();
+    for name in ["apoc.text.fuzzyMatch", "apoc.text.levenshteinSimilarity"] {
+        if !functions.iter().any(|actual| actual == name) {
+            return Err(anyhow!(
+                "required APOC function {name} is unavailable; install matching APOC Core"
+            ));
+        }
+    }
+
+    let procedures = fetch_all(
+        graph,
+        query(
+            "SHOW PROCEDURES YIELD name WHERE name IN [\
+             'apoc.config.list', 'apoc.refactor.mergeNodes', 'apoc.ttl.expireIn'] \
+             RETURN collect(name) AS names",
+        ),
+    )
+    .await
+    .context("inspect required APOC procedures")?
+    .into_iter()
+    .next()
+    .and_then(|row| row.get::<Vec<String>>("names").ok())
+    .unwrap_or_default();
+    for name in [
+        "apoc.config.list",
+        "apoc.refactor.mergeNodes",
+        "apoc.ttl.expireIn",
+    ] {
+        if !procedures.iter().any(|actual| actual == name) {
+            return Err(anyhow!(
+                "required APOC procedure {name} is unavailable; install matching APOC Core and APOC Extended"
+            ));
+        }
+    }
+    let ttl_enabled = fetch_one(
+        graph,
+        query(
+            "CALL apoc.config.list() YIELD key, value \
+             WHERE key = 'apoc.ttl.enabled' \
+             RETURN toString(value) AS value",
+        ),
+    )
+    .await
+    .context("read APOC TTL configuration")?
+    .and_then(|row| row.get::<String>("value").ok())
+    .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    if !ttl_enabled {
+        return Err(anyhow!(
+            "APOC TTL is disabled; set apoc.ttl.enabled=true before starting Mindreader"
+        ));
+    }
+    Ok(())
+}
+
+async fn ensure_semantic_index(graph: &Graph, embedding: &EmbeddingSpace) -> Result<()> {
+    if !(1..=4096).contains(&embedding.dimensions) {
+        return Err(anyhow!("embedding dimensions must be between 1 and 4096"));
+    }
+    let marker = fetch_one(
+        graph,
+        query(
+            "MATCH (m:MindreaderMeta {key: $key}) \
+             RETURN m.provider AS provider, m.model AS model, m.dimensions AS dimensions",
+        )
+        .param("key", EMBEDDING_MARKER_KEY),
+    )
+    .await
+    .context("read embedding-space marker")?;
+    let matches = marker.as_ref().is_some_and(|row| {
+        row.get::<String>("provider").ok().as_deref() == Some(embedding.provider.as_str())
+            && row.get::<String>("model").ok().as_deref() == Some(embedding.model.as_str())
+            && row.get::<i64>("dimensions").ok() == Some(embedding.dimensions as i64)
+    });
+    if !matches {
+        graph
+            .run(query(&format!("DROP INDEX {SEMANTIC_INDEX} IF EXISTS")))
+            .await
+            .context("drop incompatible semantic activation index")?;
+        graph
+            .run(query("MATCH (a:SemanticActivation) DETACH DELETE a"))
+            .await
+            .context("discard activations from an incompatible embedding space")?;
+        graph
+            .run(
+                query(
+                    "MERGE (m:MindreaderMeta {key: $key}) \
+                     SET m.provider = $provider, m.model = $model, m.dimensions = $dimensions",
+                )
+                .param("key", EMBEDDING_MARKER_KEY)
+                .param("provider", embedding.provider.clone())
+                .param("model", embedding.model.clone())
+                .param("dimensions", embedding.dimensions as i64),
+            )
+            .await
+            .context("record active embedding space")?;
+    }
+    let create = format!(
+        "CREATE VECTOR INDEX {SEMANTIC_INDEX} IF NOT EXISTS \
+         FOR (a:SemanticActivation) ON (a.embedding) \
+         OPTIONS {{indexConfig: {{`vector.dimensions`: {}, \
+         `vector.similarity_function`: 'cosine'}}}}",
+        embedding.dimensions
+    );
+    graph
+        .run(query(&create))
+        .await
+        .context("create semantic activation vector index")?;
+    Ok(())
+}
+
+async fn verify_semantic_index(graph: &Graph) -> Result<()> {
+    let row = fetch_one(
+        graph,
+        query(
+            "SHOW VECTOR INDEXES YIELD name, state, entityType, labelsOrTypes, properties \
+             WHERE name = $name \
+             RETURN state, entityType, labelsOrTypes, properties",
+        )
+        .param("name", SEMANTIC_INDEX),
+    )
+    .await
+    .context("inspect semantic activation vector index")?
+    .ok_or_else(|| anyhow!("required vector index {SEMANTIC_INDEX} is missing"))?;
+    let state = row.get::<String>("state")?;
+    let entity_type = row.get::<String>("entityType")?;
+    let labels = row.get::<Vec<String>>("labelsOrTypes")?;
+    let properties = row.get::<Vec<String>>("properties")?;
+    if state != "ONLINE"
+        || entity_type != "NODE"
+        || !same_string_members(&labels, &["SemanticActivation"])
+        || !same_string_members(&properties, &["embedding"])
+    {
+        return Err(anyhow!(
+            "required vector index {SEMANTIC_INDEX} is incompatible or not online"
+        ));
+    }
     Ok(())
 }
 
@@ -1024,12 +1188,12 @@ mod tests {
     };
 
     #[test]
-    fn model_v3_requires_recreating_older_databases() {
-        assert_eq!(MODEL_VERSION, 3);
-        assert!(validate_model_version(3).is_ok());
+    fn model_v4_requires_recreating_older_databases() {
+        assert_eq!(MODEL_VERSION, 4);
+        assert!(validate_model_version(4).is_ok());
         assert_eq!(
-            validate_model_version(2).unwrap_err().to_string(),
-            "Mindreader database model version 2 is incompatible with required version 3; recreate the Neo4j database or volume before starting Mindreader"
+            validate_model_version(3).unwrap_err().to_string(),
+            "Mindreader database model version 3 is incompatible with required version 4; recreate the Neo4j database or volume before starting Mindreader"
         );
     }
 

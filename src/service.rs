@@ -3,6 +3,9 @@
 //! Transport adapters depend on this service instead of coordinating graph
 //! transactions or project-layer policy themselves.
 
+use crate::config::Config;
+use crate::merge::{self, MergeArgs};
+use crate::semantic::{self, SemanticRuntime, SemanticSearchArgs};
 use crate::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs, SchemaArgs,
     SearchArgs, StatsArgs, TraverseArgs,
@@ -10,15 +13,22 @@ use crate::tools::{
 use anyhow::Result;
 use neo4rs::Graph;
 use serde_json::Value;
+use std::path::PathBuf;
 
 #[derive(Clone)]
 pub struct MemoryService {
     graph: Graph,
+    semantic: Option<SemanticRuntime>,
+    secrets_path: PathBuf,
 }
 
 impl MemoryService {
-    pub fn new(graph: Graph) -> Self {
-        Self { graph }
+    pub fn new(graph: Graph, config: &Config) -> Result<Self> {
+        Ok(Self {
+            graph,
+            semantic: SemanticRuntime::from_config(config)?,
+            secrets_path: config.secrets_path(),
+        })
     }
 
     pub fn graph(&self) -> &Graph {
@@ -31,6 +41,20 @@ impl MemoryService {
 
     pub async fn search(&self, args: SearchArgs) -> Result<Value> {
         tools::memory_search(&self.graph, args).await
+    }
+
+    pub async fn semantic_search(&self, args: SemanticSearchArgs) -> Result<Value> {
+        semantic::memory_semantic_search(
+            &self.graph,
+            self.semantic.as_ref(),
+            self.secrets_path.clone(),
+            args,
+        )
+        .await
+    }
+
+    pub async fn merge(&self, args: MergeArgs) -> Result<Value> {
+        merge::memory_merge(&self.graph, args).await
     }
 
     pub async fn traverse(&self, args: TraverseArgs) -> Result<Value> {

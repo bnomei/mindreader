@@ -1,7 +1,11 @@
 use anyhow::{anyhow, Context, Result};
-use mindreader::config::Config;
+use async_trait::async_trait;
+use mindreader::config::{Config, EmbeddingSpace, SemanticConfig};
 use mindreader::domain::{EntityInput, ObjectInput};
+use mindreader::embeddings::{normalize_vector, EmbeddingProvider};
 use mindreader::graph::{self, fetch_one};
+use mindreader::merge::{memory_merge, MergeArgs};
+use mindreader::semantic::{memory_semantic_search, SemanticRuntime, SemanticSearchArgs};
 use mindreader::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs,
     RetractTargetArgs, SchemaArgs, SearchArgs, StatsArgs, TargetArgs,
@@ -10,11 +14,42 @@ use mindreader::Mindreader;
 use neo4rs::query;
 use serde_json::Value;
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 struct Report {
     next: u32,
     failed: u32,
+}
+
+struct SmokeEmbedding;
+
+#[async_trait]
+impl EmbeddingProvider for SmokeEmbedding {
+    async fn embed(&self, text: &str) -> Result<Vec<f64>> {
+        let bytes = text.as_bytes();
+        normalize_vector(
+            vec![
+                1.0,
+                bytes.len() as f64 + 1.0,
+                bytes.iter().map(|byte| *byte as f64).sum::<f64>() + 1.0,
+            ],
+            3,
+            "smoke",
+        )
+    }
+
+    fn provider(&self) -> &'static str {
+        "smoke"
+    }
+
+    fn model(&self) -> &str {
+        "deterministic"
+    }
+
+    fn dimensions(&self) -> usize {
+        3
+    }
 }
 
 impl Report {
@@ -181,7 +216,6 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<u32> {
-    mindreader::config::load_env();
     let cfg = Config::from_env()?;
     println!("mindreader-smoke: uri={}", cfg.uri);
     println!(
@@ -192,15 +226,22 @@ async fn run() -> Result<u32> {
     let mut report = Report::new();
     let tool_names = Mindreader::registered_tool_names();
     report.check(
-        "MCP registers the ten-tool contract",
-        tool_names.len() == 10
+        "MCP registers the twelve-tool contract",
+        tool_names.len() == 12
             && tool_names.contains(&"memory_feedback".into())
-            && tool_names.contains(&"memory_layers".into()),
+            && tool_names.contains(&"memory_layers".into())
+            && tool_names.contains(&"memory_merge".into())
+            && tool_names.contains(&"memory_semantic_search".into()),
         format!("tools={tool_names:?}"),
     );
 
     let graph = graph::connect(&cfg).await?;
-    graph::bootstrap(&graph).await?;
+    let embedding_space = EmbeddingSpace {
+        provider: "smoke".into(),
+        model: "deterministic".into(),
+        dimensions: 3,
+    };
+    graph::bootstrap(&graph, Some(&embedding_space)).await?;
     let stats = tools::memory_stats(&graph, StatsArgs { layers: Vec::new() }).await?;
     report.check(
         "bootstrap is ready in global-only scope",
@@ -643,7 +684,7 @@ async fn run() -> Result<u32> {
             && object_add.get("noop").and_then(Value::as_bool) == Some(false)
             && relation_add.get("layers").and_then(Value::as_array).is_some_and(|values| values.len() == 2)
             && relation_state(&graph, &closure_rel).await?
-                == Some((vec![layer_a, layer_c], true, 0))
+                == Some((vec![layer_a.clone(), layer_c], true, 0))
             && invalid_endpoint_remove.is_err(),
         format!("premature={premature_relation_add:?} subject={subject_add} object={object_add} relation={relation_add} invalidRemove={invalid_endpoint_remove:?}"),
     );
@@ -668,6 +709,116 @@ async fn run() -> Result<u32> {
                 })
             }),
         &exact,
+    );
+
+    let merge_short = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("merge-{tag}")),
+            p: "mindreader:property/merge-smoke".into(),
+            o: object(format!("merge-object-{tag}")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let merge_long = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("merge-{tag}s")),
+            p: "mindreader:property/merge-smoke".into(),
+            o: object(format!("merge-object-{tag}")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let short_iri = subject_iri(&merge_short)?;
+    let long_iri = subject_iri(&merge_long)?;
+    let suggested = merge_long
+        .get("mergeSuggestions")
+        .and_then(Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|item| {
+                item.pointer("/merge/source").and_then(Value::as_str) == Some(long_iri.as_str())
+                    && item.pointer("/merge/target").and_then(Value::as_str)
+                        == Some(short_iri.as_str())
+            })
+        });
+    let survivor = memory_merge(
+        &graph,
+        MergeArgs {
+            source: long_iri.clone(),
+            target: short_iri.clone(),
+        },
+    )
+    .await?;
+    let removed = tools::memory_get(
+        &graph,
+        GetArgs {
+            iri: long_iri,
+            layers: vec![layer_a.clone()],
+            hops: Some(0),
+        },
+    )
+    .await?;
+    report.check(
+        "merge suggestions prefer the shorter name and memory_merge keeps only the target",
+        suggested
+            && survivor.get("iri").and_then(Value::as_str) == Some(short_iri.as_str())
+            && removed.get("found").and_then(Value::as_bool) == Some(false),
+        format!(
+            "suggestions={} survivor={survivor} removed={removed}",
+            merge_long["mergeSuggestions"]
+        ),
+    );
+
+    let semantic_runtime =
+        SemanticRuntime::new(Arc::new(SmokeEmbedding), SemanticConfig::default());
+    let semantic_args = SemanticSearchArgs {
+        text: format!("merge-{tag}"),
+        layers: vec![layer_a],
+        labels: None,
+        limit: Some(20),
+    };
+    let semantic_first = memory_semantic_search(
+        &graph,
+        Some(&semantic_runtime),
+        cfg.secrets_path(),
+        semantic_args.clone(),
+    )
+    .await?;
+    let semantic_second = memory_semantic_search(
+        &graph,
+        Some(&semantic_runtime),
+        cfg.secrets_path(),
+        semantic_args,
+    )
+    .await?;
+    let activation = fetch_one(
+        &graph,
+        query(
+            "MATCH (a:SemanticActivation:TTL) \
+             RETURN count(a) AS count, max(a.ttl) > timestamp() AS live",
+        ),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("semantic activation aggregate returned no row"))?;
+    report.check(
+        "semantic search ranks facts and stores a live reusable activation",
+        semantic_first
+            .pointer("/facts/0/rank")
+            .and_then(Value::as_u64)
+            == Some(1)
+            && semantic_second
+                .pointer("/facts/0/rank")
+                .and_then(Value::as_u64)
+                == Some(1)
+            && activation.get::<i64>("count").unwrap_or(0) == 1
+            && activation.get::<bool>("live").unwrap_or(false),
+        format!("first={semantic_first} second={semantic_second}"),
     );
 
     Ok(report.failed)

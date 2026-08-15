@@ -10,6 +10,7 @@ use crate::graph::{
 };
 use crate::iri::{class_iri, name_from_iri, property_iri};
 use crate::layers::validate_layer_ids;
+use crate::merge::merge_suggestions_in_txn;
 use anyhow::{anyhow, Result};
 use neo4rs::{query, Error as Neo4jDriverError, Graph, Neo4jErrorKind, Node, Path, Relation, Txn};
 use schemars::JsonSchema;
@@ -1276,6 +1277,17 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         }
         let subject_json = refreshed_node_json_txn(&mut txn, &subject.iri).await?;
         let object_json = refreshed_node_json_txn(&mut txn, &object.iri).await?;
+        let mut created_iris = Vec::new();
+        if subject.created {
+            created_iris.push(subject.iri.clone());
+        }
+        if object.created && !object_is_literal {
+            created_iris.push(object.iri.clone());
+        }
+        if property_created {
+            created_iris.push(prop_iri.clone());
+        }
+        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris).await?;
         Ok::<_, anyhow::Error>((
             changed,
             episode,
@@ -1285,6 +1297,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
             property,
             conflicts,
             relationship_iri,
+            merge_suggestions,
         ))
     }
     .await;
@@ -1297,6 +1310,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         property,
         conflicts,
         relationship_iri,
+        merge_suggestions,
     ) = match write {
         Ok(value) => {
             if value.0 {
@@ -1325,6 +1339,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         "property": property,
         "spike": spike,
         "conflicts": conflicts,
+        "mergeSuggestions": merge_suggestions,
     }))
 }
 
@@ -1470,7 +1485,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
             &spike.clone().into_iter().collect::<Vec<_>>(),
         )
         .await?;
-        let (new_object, _) = merge_object_in_txn(&mut txn, new_value).await?;
+        let (new_object, new_object_is_literal) = merge_object_in_txn(&mut txn, new_value).await?;
         let (_, property_created, property) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
         let episode =
             create_episode_in_txn(&mut txn, "memory_replace", args.reason.as_deref()).await?;
@@ -1529,6 +1544,17 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
         }
         let subject_json = refreshed_node_json_txn(&mut txn, &subject.iri).await?;
         let new_json = refreshed_node_json_txn(&mut txn, &new_object.iri).await?;
+        let mut created_iris = Vec::new();
+        if subject.created {
+            created_iris.push(subject.iri.clone());
+        }
+        if new_object.created && !new_object_is_literal {
+            created_iris.push(new_object.iri.clone());
+        }
+        if property_created {
+            created_iris.push(prop_iri.clone());
+        }
+        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris).await?;
         Ok::<_, anyhow::Error>((
             episode,
             subject_json,
@@ -1537,22 +1563,31 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
             property_created,
             property,
             conflicts,
+            merge_suggestions,
         ))
     }
     .await;
-    let (episode, subject, new, relationship_iri, property_created, property, conflicts) =
-        match result {
-            Ok(value) => {
-                txn.commit().await.map_err(|error| {
-                    anyhow!("commit memory_replace transaction failed: {error}")
-                })?;
-                value
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                return Err(error);
-            }
-        };
+    let (
+        episode,
+        subject,
+        new,
+        relationship_iri,
+        property_created,
+        property,
+        conflicts,
+        merge_suggestions,
+    ) = match result {
+        Ok(value) => {
+            txn.commit()
+                .await
+                .map_err(|error| anyhow!("commit memory_replace transaction failed: {error}"))?;
+            value
+        }
+        Err(error) => {
+            let _ = txn.rollback().await;
+            return Err(error);
+        }
+    };
     Ok(json!({
         "noop": false,
         "s": subject,
@@ -1566,6 +1601,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
         "property": property,
         "spike": spike,
         "conflicts": conflicts,
+        "mergeSuggestions": merge_suggestions,
     }))
 }
 
@@ -1928,9 +1964,9 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
                 graph,
                 query(
                     "MATCH (s:Entity)-[target]->() \
-                     WHERE target.iri = $iri AND target.validTo IS NULL \
-                     RETURN s.iri AS subject, \
-                       coalesce(target.propertyIri, 'mindreader:property/' + type(target)) AS property",
+                 WHERE target.iri = $iri AND target.validTo IS NULL \
+                 RETURN s.iri AS subject, \
+                   coalesce(target.propertyIri, 'mindreader:property/' + type(target)) AS property",
                 )
                 .param("iri", args.target.iri.clone()),
             )
@@ -2309,6 +2345,10 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
         .unwrap_or(false);
         let node = merge_node_in_txn(&mut txn, &subject_spec, &kind, &[]).await?;
         let mut resolved = Vec::new();
+        let mut created_iris = Vec::new();
+        if node.created {
+            created_iris.push(node.iri.clone());
+        }
         let mut changed = !existing_ready || node.created;
         changed |= apply_node_memberships_txn(&mut txn, &node, &[]).await?;
         for (rel, property, target_spec, target_kind) in definitions {
@@ -2329,10 +2369,18 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
                 .first()
                 .is_none_or(|current| !current.layers.is_empty());
             changed |= target.created || target_globalized || relationship_needs_global;
+            if target.created {
+                created_iris.push(target.iri.clone());
+            }
             resolved.push((rel, property, target));
         }
         if !changed {
-            return Ok::<_, anyhow::Error>((None, node_json_from_merged(&node), Vec::new()));
+            return Ok::<_, anyhow::Error>((
+                None,
+                node_json_from_merged(&node),
+                Vec::new(),
+                Vec::new(),
+            ));
         }
         let episode = create_episode_in_txn(&mut txn, "memory_schema", None).await?;
         txn.run(
@@ -2359,10 +2407,11 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
             links.push(json!({ "rel": rel, "to": target.iri, "iri": relationship_iri }));
         }
         let refreshed = refreshed_node_json_txn(&mut txn, &node.iri).await?;
-        Ok::<_, anyhow::Error>((Some(episode), refreshed, links))
+        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris).await?;
+        Ok::<_, anyhow::Error>((Some(episode), refreshed, links, merge_suggestions))
     }
     .await;
-    let (episode, node, links) = match write {
+    let (episode, node, links, merge_suggestions) = match write {
         Ok(value) => {
             if value.0.is_some() {
                 txn.commit()
@@ -2384,6 +2433,7 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
         "links": links,
         "noop": episode.is_none(),
         "episode": episode.map(|episode| json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool })).unwrap_or(Value::Null),
+        "mergeSuggestions": merge_suggestions,
     }))
 }
 

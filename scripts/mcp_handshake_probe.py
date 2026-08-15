@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -121,30 +122,33 @@ def main() -> int:
     env = load_env(args.env_file)
     env.setdefault("NEO4J_PASSWORD", "mindreader-handshake-probe")
     print(f"BIN={binary}")
-    print(f"NEO4J_URI={env.get('NEO4J_URI')}")
-    print(f"NEO4J_USER={env.get('NEO4J_USER')}")
     print(f"NEO4J_PASSWORD_SET={'yes' if env.get('NEO4J_PASSWORD') else 'no'}")
+    with tempfile.TemporaryDirectory(prefix="mindreader-handshake-") as config_home:
+        env["XDG_CONFIG_HOME"] = config_home
+        env["APPDATA"] = config_home
+        env["HOME"] = config_home
+        print(f"CONFIG_HOME={config_home}")
 
-    succeeded = True
-    for proto in PROTOCOLS:
-        print("=" * 72)
-        print(f"PROTOCOL {proto}")
-        init, tools, stderr, elapsed = handshake(binary, proto, env, args.timeout)
-        print(f"elapsed_s={elapsed:.3f}")
-        print("--- initialize ---")
-        print(json.dumps(init, indent=2) if init is not None else "TIMEOUT/NONE")
-        print("--- tools/list ---")
-        print(json.dumps(tools, indent=2) if tools is not None else "TIMEOUT/NONE")
-        print("--- stderr ---")
-        print(stderr)
-        names = []
-        if tools and isinstance(tools.get("result"), dict):
-            names = [t.get("name") for t in tools["result"].get("tools") or []]
-        print("--- tool names ---")
-        print(names)
-        if init is None or len(names) != 10:
-            succeeded = False
-    return 0 if succeeded else 1
+        succeeded = True
+        for proto in PROTOCOLS:
+            print("=" * 72)
+            print(f"PROTOCOL {proto}")
+            init, tools, stderr, elapsed = handshake(binary, proto, env, args.timeout)
+            print(f"elapsed_s={elapsed:.3f}")
+            print("--- initialize ---")
+            print(json.dumps(init, indent=2) if init is not None else "TIMEOUT/NONE")
+            print("--- tools/list ---")
+            print(json.dumps(tools, indent=2) if tools is not None else "TIMEOUT/NONE")
+            print("--- stderr ---")
+            print(stderr)
+            names = []
+            if tools and isinstance(tools.get("result"), dict):
+                names = [t.get("name") for t in tools["result"].get("tools") or []]
+            print("--- tool names ---")
+            print(names)
+            if init is None or len(names) != 12:
+                succeeded = False
+        return 0 if succeeded else 1
 
 
 if __name__ == "__main__":

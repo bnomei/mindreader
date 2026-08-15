@@ -1,0 +1,20 @@
+[neo4j]
+uri = "bolt://neo4j:7687"
+user = "neo4j"
+
+[embeddings.openai]
+model = "text-embedding-3-small"
+dimensions = 1536
+
+[embeddings.xai]
+model = ""
+dimensions = 1536
+
+[semantic]
+ttl_days = 30
+neighbor_limit = 10
+recall_similarity_threshold = 0.70
+convergence_similarity_threshold = 0.90
+convergence_result_overlap_threshold = 0.60
+rrf_k = 60.0
+direct_weight = 2.0

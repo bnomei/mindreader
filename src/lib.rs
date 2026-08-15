@@ -5,9 +5,12 @@
 
 pub mod config;
 pub mod domain;
+pub mod embeddings;
 pub mod graph;
 pub mod iri;
 pub mod layers;
+pub mod merge;
+pub mod semantic;
 pub mod server;
 pub mod service;
 pub mod tools;
