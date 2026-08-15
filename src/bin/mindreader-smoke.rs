@@ -74,8 +74,8 @@ async fn run() -> Result<u32> {
         "registered tools: {}",
         Mindreader::registered_tool_names().join(", ")
     );
-    if Mindreader::registered_tool_names().len() != 6 {
-        return Err(anyhow!("expected 6 registered tools"));
+    if Mindreader::registered_tool_names().len() != 7 {
+        return Err(anyhow!("expected 7 registered tools"));
     }
 
     let graph = graph::connect(&cfg).await?;

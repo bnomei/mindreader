@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::graph;
 use crate::tools::{
-    self, AssertArgs, GetArgs, RetractArgs, SchemaArgs, SearchArgs, TraverseArgs,
+    self, AssertArgs, GetArgs, RetractArgs, SchemaArgs, SearchArgs, StatsArgs, TraverseArgs,
 };
 use neo4rs::Graph;
 use rmcp::{
@@ -52,6 +52,13 @@ fn schema_memory_traverse() -> Arc<rmcp::model::JsonObject> {
             "limit": { "type": "integer" }
         },
         "required": ["from"]
+    }))
+}
+
+fn schema_memory_stats() -> Arc<rmcp::model::JsonObject> {
+    object_schema(serde_json::json!({
+        "type": "object",
+        "properties": {}
     }))
 }
 
@@ -219,6 +226,22 @@ impl Mindreader {
     }
 
     #[tool(
+        name = "memory_stats",
+        description = "Operational counters for nodes, active/historical edges, episodes, and per-layer active edge totals visible to this project.",
+        input_schema = schema_memory_stats()
+    )]
+    async fn memory_stats(
+        &self,
+        Parameters(args): Parameters<StatsArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let graph = self.graph().await?;
+        tools::memory_stats(graph, &self.project, args)
+            .await
+            .map_err(map_err)
+            .and_then(ok)
+    }
+
+    #[tool(
         name = "memory_assert",
         description = "Use to write or update one fact as a triple (s, p, o). Same current triple is a no-op; a new o supersedes with history. Optional spike labels this as Signal, Pattern, Insight, or Knowledge ABOUT an Element. Optional contradicts=true records a fight with another visible layer's current (s,p). Encode a triple — do not dump prose or markdown. Search or schema-read first if you are unsure the property already exists.",
         input_schema = schema_memory_assert()
@@ -281,7 +304,7 @@ impl ServerHandler for Mindreader {
                 website_url: None,
             },
             instructions: Some(
-                "Mindreader: RDFS schema-as-data memory over Neo4j. Tools: memory_get, memory_search, memory_traverse, memory_assert, memory_retract, memory_schema. project_id is env-only (MINDREADER_PROJECT). No raw Cypher."
+                "Mindreader: RDFS schema-as-data memory over Neo4j. Tools: memory_get, memory_search, memory_traverse, memory_stats, memory_assert, memory_retract, memory_schema. project_id is env-only (MINDREADER_PROJECT). No raw Cypher."
                     .into(),
             ),
         }
@@ -309,7 +332,7 @@ mod tests {
     use super::Mindreader;
 
     #[test]
-    fn registers_six_tools() {
+    fn registers_seven_tools() {
         let names = Mindreader::registered_tool_names();
         let expected = [
             "memory_assert",
@@ -317,6 +340,7 @@ mod tests {
             "memory_retract",
             "memory_schema",
             "memory_search",
+            "memory_stats",
             "memory_traverse",
         ];
         assert_eq!(names, expected);
@@ -324,7 +348,7 @@ mod tests {
         for name in expected {
             assert!(router.has_route(name), "missing route {name}");
         }
-        assert_eq!(router.map.len(), 6);
+        assert_eq!(router.map.len(), 7);
     }
 
     #[test]

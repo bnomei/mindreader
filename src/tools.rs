@@ -40,6 +40,9 @@ pub struct SearchArgs {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct StatsArgs {}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TraverseArgs {
     pub from: String,
@@ -260,6 +263,82 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
             "spike": [],
             "layers": layers,
         }));
+    }
+
+    pub async fn memory_stats(graph: &Graph, project: &str, _args: StatsArgs) -> Result<Value> {
+        let layers = visible_layers(project);
+        let row = fetch_one(
+            graph,
+            query(
+                r#"
+                MATCH (n:Entity)
+                WITH count(n) AS nodes
+                CALL {
+                  WITH $layers AS layers
+                  MATCH ()-[r]->()
+                  WHERE r.validTo IS NULL AND r.layer IN layers
+                  RETURN count(r) AS activeEdges
+                }
+                CALL {
+                  WITH $layers AS layers
+                  MATCH ()-[r]->()
+                  WHERE r.validTo IS NOT NULL AND r.layer IN layers
+                  RETURN count(r) AS historicalEdges
+                }
+                CALL {
+                  MATCH (e:Entity:Episode)
+                  RETURN count(e) AS episodes
+                }
+                RETURN nodes, activeEdges, historicalEdges, episodes
+                "#,
+            )
+            .param("layers", layers.clone()),
+        )
+        .await?;
+        let (nodes, active_edges, historical_edges, episodes) = match row {
+            Some(r) => (
+                r.get::<i64>("nodes").unwrap_or(0),
+                r.get::<i64>("activeEdges").unwrap_or(0),
+                r.get::<i64>("historicalEdges").unwrap_or(0),
+                r.get::<i64>("episodes").unwrap_or(0),
+            ),
+            None => (0, 0, 0, 0),
+        };
+
+        let layer_rows = fetch_all(
+            graph,
+            query(
+                r#"
+                MATCH ()-[r]->()
+                WHERE r.validTo IS NULL AND r.layer IN $layers
+                RETURN r.layer AS layer, count(r) AS count
+                ORDER BY count DESC, layer ASC
+                "#,
+            )
+            .param("layers", layers.clone()),
+        )
+        .await?;
+        let by_layer = layer_rows
+            .into_iter()
+            .map(|r| {
+                json!({
+                    "layer": r.get::<String>("layer").unwrap_or_default(),
+                    "count": r.get::<i64>("count").unwrap_or(0),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "project": project,
+            "layers": layers,
+            "counts": {
+                "nodes": nodes,
+                "activeEdges": active_edges,
+                "historicalEdges": historical_edges,
+                "episodes": episodes
+            },
+            "activeEdgesByLayer": by_layer
+        }))
     }
 
     let mut node_scores: HashMap<String, f64> = HashMap::new();
