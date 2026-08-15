@@ -56,45 +56,17 @@ fn schema_memory_traverse() -> Arc<rmcp::model::JsonObject> {
 }
 
 fn schema_memory_assert() -> Arc<rmcp::model::JsonObject> {
+    // Host wrappers drop the whole server if any inputSchema uses anyOf.
+    // Runtime still accepts objects via serde Value; advertised schema is strings.
     object_schema(serde_json::json!({
         "type": "object",
         "properties": {
-            "s": {
-                "description": "subject: IRI string, name, or {iri,name,labels}",
-                "anyOf": [
-                    { "type": "string" },
-                    {
-                        "type": "object",
-                        "properties": {
-                            "iri": { "type": "string" },
-                            "name": { "type": "string" },
-                            "labels": { "type": "array", "items": { "type": "string" } }
-                        }
-                    }
-                ]
-            },
+            "s": { "type": "string", "description": "subject IRI or name" },
             "p": { "type": "string" },
-            "o": {
-                "description": "object: IRI string, name, {iri,name,labels}, or literal",
-                "anyOf": [
-                    { "type": "string" },
-                    { "type": "number" },
-                    { "type": "boolean" },
-                    {
-                        "type": "object",
-                        "properties": {
-                            "iri": { "type": "string" },
-                            "name": { "type": "string" },
-                            "labels": { "type": "array", "items": { "type": "string" } },
-                            "value": { "type": "string" },
-                            "datatype": { "type": "string" }
-                        }
-                    }
-                ]
-            },
+            "o": { "type": "string", "description": "object IRI, name, or literal" },
             "layer": { "type": "string" },
             "spike": { "type": "string" },
-            "contradicts": { "type": "boolean", "description": "if true, write CONTRADICTS to conflicting objects on other visible layers" }
+            "contradicts": { "type": "boolean" }
         },
         "required": ["s", "p", "o"]
     }))
@@ -107,7 +79,7 @@ fn schema_memory_retract() -> Arc<rmcp::model::JsonObject> {
             "iri": { "type": "string" },
             "s": { "type": "string" },
             "p": { "type": "string" },
-            "o": { "description": "object value", "type": "object" },
+            "o": { "type": "string", "description": "object IRI, name, or literal" },
             "layer": { "type": "string" },
             "reason": { "type": "string" }
         }
@@ -200,7 +172,7 @@ fn map_err(e: anyhow::Error) -> McpError {
 impl Mindreader {
     #[tool(
         name = "memory_get",
-        description = "Get a memory node by IRI. hops=0 returns the node; hops=1 includes current visible neighbors.",
+        description = "Use when you already have an IRI and need that node. hops=0 is the node; hops=1 adds current visible neighbors. Do not use this to discover unknown things — that is memory_search. Do not use hops to walk the graph — that is memory_traverse.",
         input_schema = schema_memory_get()
     )]
     async fn memory_get(
@@ -216,7 +188,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_search",
-        description = "Wake-up search: current layer-visible facts (s,p,o) plus ABOUT SPIKE. Not a node directory.",
+        description = "Use this first when you do not already have an IRI and need what we currently know about a person, thing, or topic. Returns current layer-visible facts (s,p,o) plus ABOUT SPIKE, ranked Knowledge > Insight > Pattern > Signal. Not a node directory and not a dump of the graph. Skip this if you already have the IRI — use memory_get.",
         input_schema = schema_memory_search()
     )]
     async fn memory_search(
@@ -232,7 +204,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_traverse",
-        description = "Traverse from a node along fixed relationship types. depth is hard-capped at 3.",
+        description = "Use after search or get, when you have a starting IRI and need to walk typed edges (ABOUT, ASSERTS, DERIVED_FROM, CONTRADICTS, SUPERSEDES, INSTANCE_OF, and the other fixed rels). Depth is hard-capped at 3. Not for keyword lookup and not for writing.",
         input_schema = schema_memory_traverse()
     )]
     async fn memory_traverse(
@@ -248,7 +220,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_assert",
-        description = "Assert (s, p, o) on a writable layer. Idempotent; different o supersedes. Returns conflicts[] across visible layers. Optional spike and contradicts.",
+        description = "Use to write or update one fact as a triple (s, p, o). Same current triple is a no-op; a new o supersedes with history. Optional spike labels this as Signal, Pattern, Insight, or Knowledge ABOUT an Element. Optional contradicts=true records a fight with another visible layer's current (s,p). Encode a triple — do not dump prose or markdown. Search or schema-read first if you are unsure the property already exists.",
         input_schema = schema_memory_assert()
     )]
     async fn memory_assert(
@@ -264,7 +236,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_retract",
-        description = "Soft-retract a current fact by iri or by (s, p, o, layer). Never hard-deletes nodes.",
+        description = "Use to withdraw a current fact you no longer stand behind. Soft-retract only (validTo); nodes are never hard-deleted. Call with iri or with (s,p,o). Omit layer to use this project's write layer. To correct a value, prefer memory_assert (it supersedes). Do not retract schema (Class/Property) unless you explicitly mean to.",
         input_schema = schema_memory_retract()
     )]
     async fn memory_retract(
@@ -280,7 +252,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_schema",
-        description = "Declare a Class or Property (RDFS schema-as-data). Optional subClassOf, subPropertyOf, domain, range.",
+        description = "Use before asserting a new kind of thing or relation that is not already in the graph. Declares a Class or Property as RDFS schema-as-data (writes global). Optional subClassOf, subPropertyOf, domain, range. Do not mint a one-off property if search already shows a similar one.",
         input_schema = schema_memory_schema()
     )]
     async fn memory_schema(
@@ -300,7 +272,7 @@ impl ServerHandler for Mindreader {
     fn get_info(&self) -> ServerInfo {
         ServerInfo {
             protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            capabilities: ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build(),
             server_info: Implementation {
                 name: "mindreader".into(),
                 title: None,
