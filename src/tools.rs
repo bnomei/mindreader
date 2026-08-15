@@ -1,16 +1,27 @@
 use crate::config::GLOBAL_LAYER;
 use crate::graph::{
-    create_episode, ensure_property, fetch_all, fetch_one, get_node, merge_literal, merge_node,
-    node_json, path_to_json, rel_json, safe_rel, structural_rel_for, Episode, FIXED_RELS, NodeSpec,
+    create_episode, create_episode_in_txn, endpoint_json, ensure_property, fact_text, fetch_all,
+    fetch_one, get_node, merge_literal, merge_node, node_json, path_to_json, rel_json, safe_rel,
+    spike_label, spike_rank, structural_rel_for, touch_search_text, Episode, FIXED_RELS, NodeSpec,
     SPIKE,
 };
 use crate::iri::{class_iri, is_iri, name_from_iri, property_iri};
 use crate::layers::{assert_writable_layer, default_write_layer, visible_layers, LayerError};
 use anyhow::{anyhow, Result};
-use neo4rs::{query, Graph, Node, Path, Relation};
+use neo4rs::{query, Graph, Node, Path, Relation, Txn};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+
+const SCHEMA_STRUCTURAL_RELS: &[&str] = &[
+    "INSTANCE_OF",
+    "SUBCLASS_OF",
+    "SUBPROPERTY_OF",
+    "DOMAIN",
+    "RANGE",
+];
+
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetArgs {
@@ -49,6 +60,8 @@ pub struct AssertArgs {
     pub layer: Option<String>,
     #[serde(default)]
     pub spike: Option<String>,
+    #[serde(default)]
+    pub contradicts: bool,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -186,7 +199,7 @@ pub async fn memory_get(graph: &Graph, project: &str, args: GetArgs) -> Result<V
             OPTIONAL MATCH (n)-[r]-(m:Entity)
             WHERE r IS NULL OR (
               r.validTo IS NULL
-              AND (r.layer IS NULL OR r.layer IN $layers)
+              AND (r.layer IN $layers)
             )
             RETURN n, r, m, CASE WHEN r IS NULL THEN false ELSE startNode(r) = n END AS outgoing
             "#,
@@ -231,81 +244,314 @@ pub async fn memory_get(graph: &Graph, project: &str, args: GetArgs) -> Result<V
     }))
 }
 
-pub async fn memory_search(graph: &Graph, _project: &str, args: SearchArgs) -> Result<Value> {
+pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Result<Value> {
+    let layers = visible_layers(project);
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as i64;
     let labels = args.labels.unwrap_or_default();
     let text = args.text.unwrap_or_default();
     let trimmed = text.trim().to_string();
+    let needle = trimmed.to_ascii_lowercase();
+
+    if trimmed.is_empty() && labels.is_empty() {
+        return Ok(json!({
+            "query": Value::Null,
+            "mode": "wakeup",
+            "facts": [],
+            "spike": [],
+            "layers": layers,
+        }));
+    }
+
+    let mut node_scores: HashMap<String, f64> = HashMap::new();
+    let mut rel_scores: HashMap<i64, f64> = HashMap::new();
 
     if !trimmed.is_empty() {
         let escaped = lucene_escape(&trimmed);
-        match fetch_all(
+        for index in ["wakeup_nodes", "entity_fulltext"] {
+            if let Ok(rows) = fetch_all(
+                graph,
+                query(
+                    r#"
+                    CALL db.index.fulltext.queryNodes($index, $q) YIELD node, score
+                    RETURN node.iri AS iri, score
+                    LIMIT $limit
+                    "#,
+                )
+                .param("index", index.to_string())
+                .param("q", escaped.clone())
+                .param("limit", limit * 4),
+            )
+            .await
+            {
+                for row in rows {
+                    if let (Ok(iri), Ok(score)) =
+                        (row.get::<String>("iri"), row.get::<f64>("score"))
+                    {
+                        let e = node_scores.entry(iri).or_insert(0.0);
+                        if score > *e {
+                            *e = score;
+                        }
+                    }
+                }
+            }
+        }
+        for rel_index in ["wakeup_facts", "wakeup_about"] {
+        if let Ok(rows) = fetch_all(
             graph,
             query(
                 r#"
-                CALL db.index.fulltext.queryNodes('entity_fulltext', $q) YIELD node, score
-                WHERE $labelCount = 0 OR any(l IN $labels WHERE l IN labels(node))
-                RETURN node, score
-                ORDER BY score DESC
+                CALL db.index.fulltext.queryRelationships($index, $q) YIELD relationship, score
+                RETURN id(relationship) AS rid, score
                 LIMIT $limit
                 "#,
             )
-            .param("q", escaped)
-            .param("labels", labels.clone())
-            .param("labelCount", labels.len() as i64)
-            .param("limit", limit),
+            .param("index", rel_index.to_string())
+            .param("q", escaped.clone())
+            .param("limit", limit * 4),
         )
         .await
         {
-            Ok(rows) => {
-                let nodes: Vec<Value> = rows
-                    .into_iter()
-                    .filter_map(|row| {
-                        let node: Node = row.get("node").ok()?;
-                        let mut j = node_json(&node);
-                        if let Ok(score) = row.get::<f64>("score") {
-                            j["score"] = json!(score);
-                        }
-                        Some(j)
-                    })
-                    .collect();
-                return Ok(json!({
-                    "query": trimmed,
-                    "mode": "fulltext",
-                    "nodes": nodes,
-                }));
+            for row in rows {
+                if let (Ok(rid), Ok(score)) = (row.get::<i64>("rid"), row.get::<f64>("score")) {
+                    let e = rel_scores.entry(rid).or_insert(0.0);
+                    if score > *e {
+                        *e = score;
+                    }
+                }
             }
-            Err(_) => {}
+        }
         }
     }
+
+    let use_contains = node_scores.is_empty() && rel_scores.is_empty();
+    let iris: Vec<String> = node_scores.keys().cloned().collect();
+    let rids: Vec<i64> = rel_scores.keys().cloned().collect();
 
     let rows = fetch_all(
         graph,
         query(
             r#"
-            MATCH (n:Entity)
-            WHERE ($text = '' OR toLower(coalesce(n.name, '')) CONTAINS toLower($text)
-                   OR toLower(n.iri) CONTAINS toLower($text))
-              AND ($labelCount = 0 OR any(l IN $labels WHERE l IN labels(n)))
-            RETURN n
+            MATCH (s:Entity)-[r]->(o:Entity)
+            WHERE r.validTo IS NULL
+              AND (r.layer IN $layers)
+              AND (type(r) = 'ASSERTS' OR type(r) = 'ABOUT')
+              AND ($labelCount = 0 OR any(l IN $labels WHERE l IN labels(s) OR l IN labels(o)))
+              AND (
+                ($useContains AND (
+                  $text = ''
+                  OR toLower(coalesce(r.factText, '')) CONTAINS $text
+                  OR toLower(coalesce(s.name, '')) CONTAINS $text
+                  OR toLower(s.iri) CONTAINS $text
+                  OR toLower(coalesce(s.searchText, '')) CONTAINS $text
+                  OR toLower(coalesce(s.value, '')) CONTAINS $text
+                  OR toLower(coalesce(o.name, '')) CONTAINS $text
+                  OR toLower(o.iri) CONTAINS $text
+                  OR toLower(coalesce(o.value, '')) CONTAINS $text
+                  OR toLower(coalesce(o.searchText, '')) CONTAINS $text
+                ))
+                OR (NOT $useContains AND (s.iri IN $iris OR o.iri IN $iris OR id(r) IN $rids))
+              )
+            RETURN s, r, o, id(r) AS rid
             LIMIT $limit
             "#,
         )
-        .param("text", trimmed.clone())
+        .param("layers", layers.clone())
         .param("labels", labels.clone())
         .param("labelCount", labels.len() as i64)
-        .param("limit", limit),
+        .param("useContains", use_contains)
+        .param("text", needle.clone())
+        .param("iris", iris)
+        .param("rids", rids)
+        .param("limit", limit * 4),
     )
     .await?;
-    let nodes: Vec<Value> = rows
+
+    let mut facts = Vec::new();
+    let mut seen_facts = HashSet::new();
+    let mut element_iris: HashSet<String> = HashSet::new();
+
+    for row in rows {
+        let s: Node = match row.get("s") {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let o: Node = match row.get("o") {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let r: Relation = match row.get("r") {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let rid: i64 = row.get("rid").unwrap_or(0);
+        let s_iri = s.get::<String>("iri").unwrap_or_default();
+        let o_iri = o.get::<String>("iri").unwrap_or_default();
+        let p = r
+            .get::<String>("propertyIri")
+            .unwrap_or_else(|_| format!("mindreader:property/{}", r.typ()));
+        let layer = r
+            .get::<String>("layer")
+            .unwrap_or_else(|_| "global".into());
+        let key = format!("{s_iri}|{p}|{o_iri}|{layer}");
+        if !seen_facts.insert(key) {
+            continue;
+        }
+        let mut score = 1.0f64;
+        if let Some(sc) = node_scores.get(&s_iri) {
+            score = score.max(*sc);
+        }
+        if let Some(sc) = node_scores.get(&o_iri) {
+            score = score.max(*sc);
+        }
+        if let Some(sc) = rel_scores.get(&rid) {
+            score = score.max(*sc);
+        }
+        element_iris.insert(s_iri.clone());
+        let o_labels: Vec<String> = o
+            .labels()
+            .into_iter()
+            .filter(|l| *l != "Entity")
+            .map(|s| s.to_string())
+            .collect();
+        if o_labels.iter().any(|l| l == "Element") {
+            element_iris.insert(o_iri.clone());
+        }
+        facts.push(WakeFact {
+            s: endpoint_json(&s),
+            s_iri,
+            s_labels: s
+                .labels()
+                .into_iter()
+                .filter(|l| *l != "Entity")
+                .map(|s| s.to_string())
+                .collect(),
+            p,
+            o: endpoint_json(&o),
+            layer,
+            score,
+            spike: None,
+        });
+    }
+
+    let about_iris: Vec<String> = element_iris.iter().cloned().collect();
+    let mut spike_by_about: HashMap<String, (String, Value)> = HashMap::new();
+    let mut spike_list: Vec<Value> = Vec::new();
+    let mut seen_spike = HashSet::new();
+
+    if !about_iris.is_empty() {
+        if let Ok(sp_rows) = fetch_all(
+            graph,
+            query(
+                r#"
+                MATCH (sp:Entity)-[a:ABOUT]->(el:Entity)
+                WHERE a.validTo IS NULL
+                  AND a.layer IN $layers
+                  AND el.iri IN $iris
+                  AND (sp:Knowledge OR sp:Insight OR sp:Pattern OR sp:Signal)
+                RETURN sp, el.iri AS about
+                "#,
+            )
+            .param("layers", layers.clone())
+            .param("iris", about_iris),
+        )
+        .await
+        {
+            for row in sp_rows {
+                let sp: Node = match row.get("sp") {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                let about: String = match row.get("about") {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let labels: Vec<String> = sp
+                    .labels()
+                    .into_iter()
+                    .filter(|l| *l != "Entity")
+                    .map(|s| s.to_string())
+                    .collect();
+                let Some(rank) = spike_label(&labels) else {
+                    continue;
+                };
+                let node = node_json(&sp);
+                let sp_iri = sp.get::<String>("iri").unwrap_or_default();
+                let key = format!("{sp_iri}|{about}");
+                if seen_spike.insert(key) {
+                    spike_list.push(json!({
+                        "node": node.clone(),
+                        "about": about,
+                        "rank": rank,
+                    }));
+                }
+                let better = match spike_by_about.get(&about) {
+                    None => true,
+                    Some((cur, _)) => spike_rank(Some(&rank)) > spike_rank(Some(cur)),
+                };
+                if better {
+                    spike_by_about.insert(about, (rank, node));
+                }
+            }
+        }
+    }
+
+    for fact in &mut facts {
+        if let Some(own) = spike_label(&fact.s_labels) {
+            fact.spike = Some(own);
+        } else if let Some((rank, _)) = spike_by_about.get(&fact.s_iri) {
+            fact.spike = Some(rank.clone());
+        }
+    }
+
+    facts.sort_by(|a, b| {
+        spike_rank(b.spike.as_deref())
+            .cmp(&spike_rank(a.spike.as_deref()))
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+    });
+    facts.truncate(limit as usize);
+
+    spike_list.sort_by(|a, b| {
+        let ra = a.get("rank").and_then(|v| v.as_str());
+        let rb = b.get("rank").and_then(|v| v.as_str());
+        spike_rank(rb).cmp(&spike_rank(ra))
+    });
+
+    let facts_json: Vec<Value> = facts
         .into_iter()
-        .filter_map(|row| row.get::<Node>("n").ok().map(|n| node_json(&n)))
+        .map(|f| {
+            json!({
+                "s": f.s,
+                "p": f.p,
+                "o": f.o,
+                "layer": f.layer,
+                "spike": f.spike,
+                "score": f.score,
+            })
+        })
         .collect();
+
     Ok(json!({
         "query": if trimmed.is_empty() { Value::Null } else { json!(trimmed) },
-        "mode": if trimmed.is_empty() { "labels" } else { "contains" },
-        "nodes": nodes,
+        "mode": "wakeup",
+        "facts": facts_json,
+        "spike": spike_list,
+        "layers": layers,
     }))
+}
+
+struct WakeFact {
+    s: Value,
+    s_iri: String,
+    s_labels: Vec<String>,
+    p: String,
+    o: Value,
+    layer: String,
+    score: f64,
+    spike: Option<String>,
 }
 
 fn lucene_escape(text: &str) -> String {
@@ -347,7 +593,7 @@ pub async fn memory_traverse(graph: &Graph, project: &str, args: TraverseArgs) -
         WHERE all(r IN relationships(path) WHERE
           type(r) IN $rels
           AND r.validTo IS NULL
-          AND (r.layer IS NULL OR r.layer IN $layers)
+          AND (r.layer IN $layers)
         )
         RETURN path
         LIMIT $limit
@@ -449,108 +695,208 @@ pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Re
     let (prop_iri, minted_stub, prop_json) = ensure_property(graph, &args.p).await?;
     let structural = structural_rel_for(&prop_iri);
 
-    let current = find_current(
+    let is_contradicts_rel = structural.as_deref() == Some("CONTRADICTS");
+    let ft = fact_text(&subject.name, &subject.iri, &prop_iri, &object);
+    let visible = visible_layers(project);
+    let conflicts = find_conflicts(
         graph,
         &subject.iri,
         &prop_iri,
         structural.as_deref(),
         &layer,
+        &object.iri,
+        &visible,
     )
     .await?;
 
-    if let Some(cur) = &current {
-        if cur.o_iri == object.iri {
-            return Ok(json!({
-                "noop": true,
-                "s": subject.json,
-                "p": prop_iri,
-                "o": object.json,
-                "layer": layer,
-                "propertyStub": minted_stub,
-                "property": prop_json,
-            }));
-        }
-    }
-
-    let episode = create_episode(graph, "memory_assert", None).await?;
-    let mut superseded = Value::Null;
-
-    if let Some(cur) = &current {
-        close_rel(graph, cur.rel_id, Some(&episode.iri)).await?;
-        create_supersedes(
-            graph,
-            &object.iri,
-            &cur.o_iri,
-            &prop_iri,
-            &layer,
-            &episode,
-        )
-        .await?;
-        superseded = json!({
-            "from": cur.o_iri,
-            "to": object.iri,
-            "propertyIri": prop_iri,
-            "layer": layer,
-        });
-    }
-
-    if let Some(rel_type) = &structural {
-        create_structural(
+    // CONTRADICTS is multi-valued: only the exact (s,p,o,layer) pair is idempotent.
+    // Other properties are single-valued per (s,p,layer): return ALL current matches.
+    let already_current = if is_contradicts_rel {
+        find_current_pair(
             graph,
             &subject.iri,
-            rel_type,
-            &object.iri,
             &prop_iri,
+            structural.as_deref(),
             &layer,
-            &episode,
-            None,
+            &object.iri,
         )
-        .await?;
+        .await?
+        .is_some()
     } else {
-        create_asserts(
+        false
+    };
+    let currents = if is_contradicts_rel {
+        Vec::new()
+    } else {
+        find_current(
             graph,
             &subject.iri,
-            &object.iri,
             &prop_iri,
+            structural.as_deref(),
             &layer,
-            &episode,
-            None,
         )
-        .await?;
+        .await?
+    };
+    let already_current = already_current
+        || (!currents.is_empty() && currents.iter().all(|c| c.o_iri == object.iri));
+
+    if already_current {
+        let mut episode_json = Value::Null;
+        if args.contradicts && !conflicts.is_empty() {
+            let episode = create_episode(graph, "memory_assert", None).await?;
+            write_contradicts(
+                graph,
+                &object.iri,
+                &conflicts,
+                &layer,
+                &episode,
+            )
+            .await?;
+            episode_json = json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool });
+        }
+        return Ok(json!({
+            "noop": true,
+            "s": subject.json,
+            "p": prop_iri,
+            "o": object.json,
+            "layer": layer,
+            "propertyStub": minted_stub,
+            "property": prop_json,
+            "conflicts": conflicts,
+            "episode": episode_json,
+        }));
     }
 
-    if let Some(sp) = &spike {
-        if !o_is_literal && object.labels.iter().any(|l| l == "Element") {
-            let already_about = structural.as_deref() == Some("ABOUT");
-            if !already_about {
-                let about_current =
-                    find_current(graph, &subject.iri, "mindreader:property/ABOUT", Some("ABOUT"), &layer)
-                        .await?;
-                let skip = about_current
-                    .as_ref()
-                    .map(|c| c.o_iri == object.iri)
-                    .unwrap_or(false);
-                if !skip {
-                    if let Some(old) = about_current {
-                        if old.o_iri != object.iri {
-                            close_rel(graph, old.rel_id, Some(&episode.iri)).await?;
-                        }
-                    }
-                    create_structural(
-                        graph,
-                        &subject.iri,
-                        "ABOUT",
-                        &object.iri,
-                        "mindreader:property/ABOUT",
-                        &layer,
-                        &episode,
-                        None,
-                    )
-                    .await?;
-                }
+    let mut about_currents = Vec::new();
+    let mut need_about = false;
+    let mut about_ft = String::new();
+    if spike.is_some() && !o_is_literal && object.labels.iter().any(|l| l == "Element") {
+        let already_about = structural.as_deref() == Some("ABOUT");
+        if !already_about {
+            about_currents = find_current(
+                graph,
+                &subject.iri,
+                "mindreader:property/ABOUT",
+                Some("ABOUT"),
+                &layer,
+            )
+            .await?;
+            let about_already =
+                !about_currents.is_empty() && about_currents.iter().all(|c| c.o_iri == object.iri);
+            if !about_already {
+                need_about = true;
+                about_ft = fact_text(
+                    &subject.name,
+                    &subject.iri,
+                    "mindreader:property/ABOUT",
+                    &object,
+                );
             }
         }
-        let _ = sp;
+    }
+
+    // Close-all-current + create replacement + SUPERSEDES must be one Neo4j txn.
+    // Crash between close and create must not leave validTo set with no replacement.
+    let mut txn = graph.start_txn().await?;
+    let write = async {
+        let episode = create_episode_in_txn(&mut txn, "memory_assert", None).await?;
+        let mut superseded = Value::Null;
+        if !is_contradicts_rel && !currents.is_empty() {
+            let mut from_all: Vec<String> = Vec::new();
+            for cur in &currents {
+                close_rel_txn(&mut txn, cur.rel_id, Some(&episode.iri)).await?;
+                if cur.o_iri != object.iri && !from_all.iter().any(|o| o == &cur.o_iri) {
+                    create_supersedes_txn(
+                        &mut txn,
+                        &object.iri,
+                        &cur.o_iri,
+                        &prop_iri,
+                        &layer,
+                        &episode,
+                    )
+                    .await?;
+                    from_all.push(cur.o_iri.clone());
+                }
+            }
+            if !from_all.is_empty() {
+                superseded = json!({
+                    "from": if from_all.len() == 1 {
+                        json!(from_all[0].clone())
+                    } else {
+                        json!(from_all)
+                    },
+                    "to": object.iri,
+                    "propertyIri": prop_iri,
+                    "layer": layer,
+                });
+            }
+        }
+        if let Some(rel_type) = &structural {
+            create_structural_txn(
+                &mut txn,
+                &subject.iri,
+                rel_type,
+                &object.iri,
+                &prop_iri,
+                &layer,
+                &episode,
+                None,
+                &ft,
+            )
+            .await?;
+        } else {
+            create_asserts_txn(
+                &mut txn,
+                &subject.iri,
+                &object.iri,
+                &prop_iri,
+                &layer,
+                &episode,
+                None,
+                &ft,
+            )
+            .await?;
+        }
+        if need_about {
+            for old in &about_currents {
+                close_rel_txn(&mut txn, old.rel_id, Some(&episode.iri)).await?;
+            }
+            create_structural_txn(
+                &mut txn,
+                &subject.iri,
+                "ABOUT",
+                &object.iri,
+                "mindreader:property/ABOUT",
+                &layer,
+                &episode,
+                None,
+                &about_ft,
+            )
+            .await?;
+        }
+        Ok::<_, anyhow::Error>((episode, superseded))
+    }
+    .await;
+    let (episode, superseded) = match write {
+        Ok(v) => {
+            txn.commit().await?;
+            v
+        }
+        Err(e) => {
+            let _ = txn.rollback().await;
+            return Err(e);
+        }
+    };
+
+    touch_search_text(graph, &subject.iri, Some(&ft)).await?;
+    touch_search_text(graph, &object.iri, Some(&ft)).await?;
+    if need_about {
+        touch_search_text(graph, &subject.iri, Some(&about_ft)).await?;
+        touch_search_text(graph, &object.iri, Some(&about_ft)).await?;
+    }
+
+    if args.contradicts && !conflicts.is_empty() {
+        write_contradicts(graph, &object.iri, &conflicts, &layer, &episode).await?;
     }
 
     Ok(json!({
@@ -564,6 +910,7 @@ pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Re
         "propertyStub": minted_stub,
         "property": prop_json,
         "spike": spike,
+        "conflicts": conflicts,
     }))
 }
 
@@ -578,18 +925,17 @@ async fn find_current(
     prop_iri: &str,
     structural: Option<&str>,
     layer: &str,
-) -> Result<Option<CurrentFact>> {
-    let row = if let Some(rel) = structural {
+) -> Result<Vec<CurrentFact>> {
+    let rows = if let Some(rel) = structural {
         let rel = safe_rel(rel)?;
         let q = format!(
             r#"
             MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity)
             WHERE r.validTo IS NULL AND r.layer = $layer
             RETURN id(r) AS rid, o.iri AS oiri
-            LIMIT 1
             "#
         );
-        fetch_one(
+        fetch_all(
             graph,
             query(&q)
                 .param("s", s.to_string())
@@ -597,14 +943,13 @@ async fn find_current(
         )
         .await?
     } else {
-        fetch_one(
+        fetch_all(
             graph,
             query(
                 r#"
                 MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity)
                 WHERE r.validTo IS NULL AND r.layer = $layer AND r.propertyIri = $p
                 RETURN id(r) AS rid, o.iri AS oiri
-                LIMIT 1
                 "#,
             )
             .param("s", s.to_string())
@@ -613,67 +958,23 @@ async fn find_current(
         )
         .await?
     };
-    Ok(match row {
-        Some(r) => Some(CurrentFact {
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(CurrentFact {
             rel_id: r.get::<i64>("rid")?,
             o_iri: r.get::<String>("oiri")?,
-        }),
-        None => None,
-    })
+        });
+    }
+    Ok(out)
 }
 
+#[allow(dead_code)]
 async fn close_rel(graph: &Graph, rel_id: i64, episode_id: Option<&str>) -> Result<()> {
-    graph
-        .run(
-            query(
-                r#"
-                MATCH ()-[r]->()
-                WHERE id(r) = $rid AND r.validTo IS NULL
-                SET r.validTo = datetime()
-                SET r.retractedBy = $episode
-                "#,
-            )
-            .param("rid", rel_id)
-            .param("episode", episode_id.map(|s| s.to_string())),
-        )
-        .await?;
+    graph.run(close_rel_query(rel_id, episode_id)).await?;
     Ok(())
 }
 
-async fn create_asserts(
-    graph: &Graph,
-    s: &str,
-    o: &str,
-    prop_iri: &str,
-    layer: &str,
-    episode: &Episode,
-    reason: Option<&str>,
-) -> Result<()> {
-    graph
-        .run(
-            query(
-                r#"
-                MATCH (s:Entity {iri: $s}), (o:Entity {iri: $o})
-                CREATE (s)-[r:ASSERTS {
-                    propertyIri: $p,
-                    layer: $layer,
-                    validFrom: datetime(),
-                    episodeId: $episode
-                }]->(o)
-                SET r.reason = $reason
-                "#,
-            )
-            .param("s", s.to_string())
-            .param("o", o.to_string())
-            .param("p", prop_iri.to_string())
-            .param("layer", layer.to_string())
-            .param("episode", episode.iri.clone())
-            .param("reason", reason.map(|s| s.to_string())),
-        )
-        .await?;
-    Ok(())
-}
-
+#[allow(dead_code)]
 async fn create_structural(
     graph: &Graph,
     s: &str,
@@ -683,7 +984,70 @@ async fn create_structural(
     layer: &str,
     episode: &Episode,
     reason: Option<&str>,
+    fact_text: &str,
 ) -> Result<()> {
+    graph
+        .run(structural_query(
+            s, rel_type, o, prop_iri, layer, episode, reason, fact_text,
+        )?)
+        .await?;
+    Ok(())
+}
+
+fn close_rel_query(rel_id: i64, episode_id: Option<&str>) -> neo4rs::Query {
+    query(
+        r#"
+        MATCH ()-[r]->()
+        WHERE id(r) = $rid AND r.validTo IS NULL
+        SET r.validTo = datetime()
+        SET r.retractedBy = $episode
+        "#,
+    )
+    .param("rid", rel_id)
+    .param("episode", episode_id.map(|s| s.to_string()))
+}
+
+fn asserts_query(
+    s: &str,
+    o: &str,
+    prop_iri: &str,
+    layer: &str,
+    episode: &Episode,
+    reason: Option<&str>,
+    fact_text: &str,
+) -> neo4rs::Query {
+    query(
+        r#"
+        MATCH (s:Entity {iri: $s}), (o:Entity {iri: $o})
+        CREATE (s)-[r:ASSERTS {
+            propertyIri: $p,
+            layer: $layer,
+            validFrom: datetime(),
+            episodeId: $episode,
+            factText: $factText
+        }]->(o)
+        SET r.reason = $reason
+        "#,
+    )
+    .param("s", s.to_string())
+    .param("o", o.to_string())
+    .param("p", prop_iri.to_string())
+    .param("layer", layer.to_string())
+    .param("episode", episode.iri.clone())
+    .param("reason", reason.map(|s| s.to_string()))
+    .param("factText", fact_text.to_string())
+}
+
+fn structural_query(
+    s: &str,
+    rel_type: &str,
+    o: &str,
+    prop_iri: &str,
+    layer: &str,
+    episode: &Episode,
+    reason: Option<&str>,
+    fact_text: &str,
+) -> Result<neo4rs::Query> {
     let rel = safe_rel(rel_type)?;
     let q = format!(
         r#"
@@ -692,52 +1056,94 @@ async fn create_structural(
             propertyIri: $p,
             layer: $layer,
             validFrom: datetime(),
-            episodeId: $episode
+            episodeId: $episode,
+            factText: $factText
         }}]->(o)
         SET r.reason = $reason
         "#
     );
-    graph
-        .run(
-            query(&q)
-                .param("s", s.to_string())
-                .param("o", o.to_string())
-                .param("p", prop_iri.to_string())
-                .param("layer", layer.to_string())
-                .param("episode", episode.iri.clone())
-                .param("reason", reason.map(|s| s.to_string())),
-        )
+    Ok(query(&q)
+        .param("s", s.to_string())
+        .param("o", o.to_string())
+        .param("p", prop_iri.to_string())
+        .param("layer", layer.to_string())
+        .param("episode", episode.iri.clone())
+        .param("reason", reason.map(|s| s.to_string()))
+        .param("factText", fact_text.to_string()))
+}
+
+fn supersedes_query(
+    new_o: &str,
+    old_o: &str,
+    prop_iri: &str,
+    layer: &str,
+    episode: &Episode,
+) -> neo4rs::Query {
+    query(
+        r#"
+        MATCH (n:Entity {iri: $new}), (old:Entity {iri: $old})
+        CREATE (n)-[r:SUPERSEDES {
+            propertyIri: $p,
+            layer: $layer,
+            validFrom: datetime(),
+            episodeId: $episode
+        }]->(old)
+        "#,
+    )
+    .param("new", new_o.to_string())
+    .param("old", old_o.to_string())
+    .param("p", prop_iri.to_string())
+    .param("layer", layer.to_string())
+    .param("episode", episode.iri.clone())
+}
+
+async fn close_rel_txn(txn: &mut Txn, rel_id: i64, episode_id: Option<&str>) -> Result<()> {
+    txn.run(close_rel_query(rel_id, episode_id)).await?;
+    Ok(())
+}
+
+async fn create_asserts_txn(
+    txn: &mut Txn,
+    s: &str,
+    o: &str,
+    prop_iri: &str,
+    layer: &str,
+    episode: &Episode,
+    reason: Option<&str>,
+    fact_text: &str,
+) -> Result<()> {
+    txn.run(asserts_query(s, o, prop_iri, layer, episode, reason, fact_text))
         .await?;
     Ok(())
 }
 
-async fn create_supersedes(
-    graph: &Graph,
+async fn create_structural_txn(
+    txn: &mut Txn,
+    s: &str,
+    rel_type: &str,
+    o: &str,
+    prop_iri: &str,
+    layer: &str,
+    episode: &Episode,
+    reason: Option<&str>,
+    fact_text: &str,
+) -> Result<()> {
+    txn.run(structural_query(
+        s, rel_type, o, prop_iri, layer, episode, reason, fact_text,
+    )?)
+    .await?;
+    Ok(())
+}
+
+async fn create_supersedes_txn(
+    txn: &mut Txn,
     new_o: &str,
     old_o: &str,
     prop_iri: &str,
     layer: &str,
     episode: &Episode,
 ) -> Result<()> {
-    graph
-        .run(
-            query(
-                r#"
-                MATCH (n:Entity {iri: $new}), (old:Entity {iri: $old})
-                CREATE (n)-[r:SUPERSEDES {
-                    propertyIri: $p,
-                    layer: $layer,
-                    validFrom: datetime(),
-                    episodeId: $episode
-                }]->(old)
-                "#,
-            )
-            .param("new", new_o.to_string())
-            .param("old", old_o.to_string())
-            .param("p", prop_iri.to_string())
-            .param("layer", layer.to_string())
-            .param("episode", episode.iri.clone()),
-        )
+    txn.run(supersedes_query(new_o, old_o, prop_iri, layer, episode))
         .await?;
     Ok(())
 }
@@ -819,9 +1225,8 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
         .layer
         .clone()
         .unwrap_or_else(|| default_write_layer(project));
-    if args.s.is_some() || args.p.is_some() || args.o.is_some() {
-        assert_writable_layer(&layer, project)?;
-    }
+    // Missing layer → default WRITE layer only. Never anyLayer across tenants.
+    assert_writable_layer(&layer, project)?;
 
     let episode = create_episode(
         graph,
@@ -831,6 +1236,7 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
     .await?;
 
     let mut closed = 0i64;
+    let mut skipped_schema = 0i64;
 
     if let (Some(s), Some(p)) = (args.s.as_deref(), args.p.as_deref()) {
         let s_iri = if is_iri(s) {
@@ -848,7 +1254,7 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
                 format!(
                     r#"
                     MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity {{iri: $o}})
-                    WHERE r.validTo IS NULL AND ($anyLayer OR r.layer = $layer)
+                    WHERE r.validTo IS NULL AND r.layer = $layer
                     SET r.validTo = datetime(), r.retractedBy = $episode, r.reason = coalesce($reason, r.reason)
                     RETURN count(r) AS n
                     "#
@@ -857,7 +1263,7 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
                 format!(
                     r#"
                     MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity)
-                    WHERE r.validTo IS NULL AND ($anyLayer OR r.layer = $layer)
+                    WHERE r.validTo IS NULL AND r.layer = $layer
                     SET r.validTo = datetime(), r.retractedBy = $episode, r.reason = coalesce($reason, r.reason)
                     RETURN count(r) AS n
                     "#
@@ -866,7 +1272,6 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
             let mut qy = query(&q)
                 .param("s", s_iri)
                 .param("layer", layer.clone())
-                .param("anyLayer", args.layer.is_none())
                 .param("episode", episode.iri.clone())
                 .param("reason", args.reason.clone());
             if let Some(o) = o_iri {
@@ -879,14 +1284,14 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
             let q = if o_iri.is_some() {
                 r#"
                 MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity {iri: $o})
-                WHERE r.validTo IS NULL AND r.propertyIri = $p AND ($anyLayer OR r.layer = $layer)
+                WHERE r.validTo IS NULL AND r.propertyIri = $p AND r.layer = $layer
                 SET r.validTo = datetime(), r.retractedBy = $episode, r.reason = coalesce($reason, r.reason)
                 RETURN count(r) AS n
                 "#
             } else {
                 r#"
                 MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity)
-                WHERE r.validTo IS NULL AND r.propertyIri = $p AND ($anyLayer OR r.layer = $layer)
+                WHERE r.validTo IS NULL AND r.propertyIri = $p AND r.layer = $layer
                 SET r.validTo = datetime(), r.retractedBy = $episode, r.reason = coalesce($reason, r.reason)
                 RETURN count(r) AS n
                 "#
@@ -895,7 +1300,6 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
                 .param("s", s_iri)
                 .param("p", prop)
                 .param("layer", layer.clone())
-                .param("anyLayer", args.layer.is_none())
                 .param("episode", episode.iri.clone())
                 .param("reason", args.reason.clone());
             if let Some(o) = o_iri {
@@ -906,24 +1310,62 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
             }
         }
     } else if let Some(iri) = args.iri.as_deref() {
+        let node = get_node(graph, iri).await?;
+        if let Some(n) = &node {
+            let labels: Vec<String> = n
+                .labels()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
+            if labels.iter().any(|l| l == "Class" || l == "Property") {
+                return Err(anyhow!(
+                    "refuse to retract Class/Property by iri ({iri}); pass an explicit triple (s, p) for schema/structural rels"
+                ));
+            }
+        }
+        let protected: Vec<String> = SCHEMA_STRUCTURAL_RELS.iter().map(|s| (*s).to_string()).collect();
         let row = fetch_one(
             graph,
             query(
                 r#"
                 MATCH (n:Entity {iri: $iri})-[r]->(o)
-                WHERE r.validTo IS NULL AND (r.layer IS NULL OR r.layer IN $layers OR r.layer = $layer)
+                WHERE r.validTo IS NULL
+                  AND r.layer = $layer
+                  AND NOT type(r) IN $protected
+                  AND NOT n:Class AND NOT n:Property
+                  AND NOT o:Class AND NOT o:Property
                 SET r.validTo = datetime(), r.retractedBy = $episode, r.reason = coalesce($reason, r.reason)
                 RETURN count(r) AS n
                 "#,
             )
             .param("iri", iri.to_string())
             .param("layer", layer.clone())
-            .param("layers", visible_layers(project))
+            .param("protected", protected.clone())
             .param("episode", episode.iri.clone())
             .param("reason", args.reason.clone()),
         )
         .await?;
         closed = row.and_then(|r| r.get::<i64>("n").ok()).unwrap_or(0);
+        let skip = fetch_one(
+            graph,
+            query(
+                r#"
+                MATCH (n:Entity {iri: $iri})-[r]->(o)
+                WHERE r.validTo IS NULL
+                  AND r.layer = $layer
+                  AND (
+                    type(r) IN $protected
+                    OR n:Class OR n:Property OR o:Class OR o:Property
+                  )
+                RETURN count(r) AS n
+                "#,
+            )
+            .param("iri", iri.to_string())
+            .param("layer", layer.clone())
+            .param("protected", protected),
+        )
+        .await?;
+        skipped_schema = skip.and_then(|r| r.get::<i64>("n").ok()).unwrap_or(0);
     } else {
         return Err(anyhow!(
             "memory_retract needs iri, or s+p (optional o, layer, reason)"
@@ -933,6 +1375,8 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
     Ok(json!({
         "retracted": closed,
         "soft": true,
+        "layer": layer,
+        "skippedSchema": skipped_schema,
         "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
         "reason": args.reason,
     }))
@@ -959,7 +1403,7 @@ fn object_iri_for_retract(o: Option<&Value>) -> Option<String> {
 }
 
 pub async fn memory_schema(graph: &Graph, project: &str, args: SchemaArgs) -> Result<Value> {
-    let kind = args.kind.to_ascii_lowercase();
+    let kind = args.kind.trim().to_ascii_lowercase();
     if kind != "class" && kind != "property" {
         return Err(anyhow!("kind must be class or property"));
     }
@@ -1157,13 +1601,201 @@ async fn ensure_link(
     layer: &str,
     episode: &Episode,
 ) -> Result<()> {
-    if let Some(cur) = find_current(graph, s, prop_iri, Some(rel), layer).await? {
-        if cur.o_iri == o {
-            return Ok(());
-        }
-        close_rel(graph, cur.rel_id, Some(&episode.iri)).await?;
+    let currents = find_current(graph, s, prop_iri, Some(rel), layer).await?;
+    if !currents.is_empty() && currents.iter().all(|c| c.o_iri == o) {
+        return Ok(());
     }
-    create_structural(graph, s, rel, o, prop_iri, layer, episode, None).await
+    let ft = format!("{s} {rel} {o}");
+    let mut txn = graph.start_txn().await?;
+    let write = async {
+        for cur in &currents {
+            close_rel_txn(&mut txn, cur.rel_id, Some(&episode.iri)).await?;
+        }
+        create_structural_txn(&mut txn, s, rel, o, prop_iri, layer, episode, None, &ft).await?;
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    match write {
+        Ok(()) => {
+            txn.commit().await?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = txn.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+
+
+async fn find_current_pair(
+    graph: &Graph,
+    s: &str,
+    prop_iri: &str,
+    structural: Option<&str>,
+    layer: &str,
+    o: &str,
+) -> Result<Option<CurrentFact>> {
+    let row = if let Some(rel) = structural {
+        let rel = safe_rel(rel)?;
+        let q = format!(
+            r#"
+            MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity {{iri: $o}})
+            WHERE r.validTo IS NULL AND r.layer = $layer
+            RETURN id(r) AS rid, o.iri AS oiri
+            "#
+        );
+        fetch_one(
+            graph,
+            query(&q)
+                .param("s", s.to_string())
+                .param("o", o.to_string())
+                .param("layer", layer.to_string()),
+        )
+        .await?
+    } else {
+        fetch_one(
+            graph,
+            query(
+                r#"
+                MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity {iri: $o})
+                WHERE r.validTo IS NULL AND r.layer = $layer AND r.propertyIri = $p
+                RETURN id(r) AS rid, o.iri AS oiri
+                "#,
+            )
+            .param("s", s.to_string())
+            .param("o", o.to_string())
+            .param("layer", layer.to_string())
+            .param("p", prop_iri.to_string()),
+        )
+        .await?
+    };
+    Ok(match row {
+        Some(r) => Some(CurrentFact {
+            rel_id: r.get::<i64>("rid")?,
+            o_iri: r.get::<String>("oiri")?,
+        }),
+        None => None,
+    })
+}
+
+async fn find_conflicts(
+    graph: &Graph,
+    s: &str,
+    prop_iri: &str,
+    structural: Option<&str>,
+    write_layer: &str,
+    o_iri: &str,
+    layers: &[String],
+) -> Result<Vec<Value>> {
+    let rel_type = structural.unwrap_or("ASSERTS");
+    let is_structural = structural.is_some();
+    let rows = fetch_all(
+        graph,
+        query(
+            r#"
+            MATCH (s:Entity {iri: $s})-[r]->(o:Entity)
+            WHERE r.validTo IS NULL
+              AND r.layer IN $layers
+              AND r.layer <> $layer
+              AND o.iri <> $o
+              AND (
+                ($isStructural AND type(r) = $relType)
+                OR (NOT $isStructural AND type(r) = 'ASSERTS' AND r.propertyIri = $p)
+              )
+            RETURN r.layer AS layer, o, coalesce(r.propertyIri, $p) AS p
+            "#,
+        )
+        .param("s", s.to_string())
+        .param("o", o_iri.to_string())
+        .param("layer", write_layer.to_string())
+        .param("layers", layers.to_vec())
+        .param("p", prop_iri.to_string())
+        .param("relType", rel_type.to_string())
+        .param("isStructural", is_structural),
+    )
+    .await?;
+    let mut out = Vec::new();
+    for row in rows {
+        let layer: String = match row.get("layer") {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let o: Node = match row.get("o") {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        let p: String = row.get("p").unwrap_or_else(|_| prop_iri.to_string());
+        out.push(json!({
+            "layer": layer,
+            "o": endpoint_json(&o),
+            "p": p,
+        }));
+    }
+    Ok(out)
+}
+
+async fn write_contradicts(
+    graph: &Graph,
+    new_o: &str,
+    conflicts: &[Value],
+    layer: &str,
+    episode: &Episode,
+) -> Result<()> {
+    for c in conflicts {
+        let Some(old_o) = c
+            .get("o")
+            .and_then(|o| o.get("iri"))
+            .and_then(|v| v.as_str())
+        else {
+            continue;
+        };
+        let ft = format!("{new_o} CONTRADICTS {old_o}");
+        graph
+            .run(
+                query(
+                    r#"
+                    MATCH (n:Entity {iri: $new}), (old:Entity {iri: $old})
+                    OPTIONAL MATCH (n)-[existing:CONTRADICTS]->(old)
+                    WHERE existing.validTo IS NULL
+                    WITH n, old, existing
+                    WHERE existing IS NULL
+                    CREATE (n)-[r:CONTRADICTS {
+                        propertyIri: 'mindreader:property/CONTRADICTS',
+                        layer: $layer,
+                        validFrom: datetime(),
+                        episodeId: $episode,
+                        factText: $factText
+                    }]->(old)
+                    "#,
+                )
+                .param("new", new_o.to_string())
+                .param("old", old_o.to_string())
+                .param("layer", layer.to_string())
+                .param("episode", episode.iri.clone())
+                .param("factText", ft),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> Result<i64> {
+    let row = fetch_one(
+        graph,
+        query(
+            r#"
+            MATCH (a:Entity {iri: $from})-[r:CONTRADICTS]->(b:Entity {iri: $to})
+            WHERE r.validTo IS NULL
+            RETURN count(r) AS n
+            "#,
+        )
+        .param("from", from.to_string())
+        .param("to", to.to_string()),
+    )
+    .await?;
+    Ok(row.and_then(|r| r.get::<i64>("n").ok()).unwrap_or(0))
 }
 
 pub fn map_tool_error(err: anyhow::Error) -> rmcp::model::ErrorData {
@@ -1174,3 +1806,42 @@ pub fn map_tool_error(err: anyhow::Error) -> rmcp::model::ErrorData {
     McpError::internal_error(err.to_string(), None)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use crate::graph::spike_rank;
+
+    #[test]
+    fn spike_rank_order() {
+        assert!(spike_rank(Some("Knowledge")) > spike_rank(Some("Insight")));
+        assert!(spike_rank(Some("Insight")) > spike_rank(Some("Pattern")));
+        assert!(spike_rank(Some("Pattern")) > spike_rank(Some("Signal")));
+        assert!(spike_rank(Some("Signal")) > spike_rank(None));
+    }
+
+    #[test]
+    fn null_layer_never_treated_as_visible() {
+        let src = include_str!("tools.rs");
+        let code = src.split("mod tests").next().unwrap_or(src);
+        assert!(
+            !code.contains("a.layer IS NULL") && !code.contains("r.layer IS NULL"),
+            "read filters must not treat a missing layer as visible"
+        );
+    }
+
+    #[test]
+    fn find_current_returns_all_matches() {
+        let src = include_str!("tools.rs");
+        let start = src.find("async fn find_current(").expect("find_current");
+        let pair = src.find("async fn find_current_pair(").expect("find_current_pair");
+        let end = src.find("async fn find_conflicts(").expect("find_conflicts");
+        assert!(
+            !src[start..pair].contains("LIMIT 1"),
+            "find_current must return/close ALL current (s,p,layer) matches"
+        );
+        assert!(
+            !src[pair..end].contains("LIMIT 1"),
+            "find_current_pair must not LIMIT 1; CONTRADICTS stays multi-valued via pair match, not close-all"
+        );
+    }
+}

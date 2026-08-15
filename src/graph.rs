@@ -4,7 +4,7 @@ use crate::iri::{
     property_iri, slugify,
 };
 use anyhow::{anyhow, Context, Result};
-use neo4rs::{query, Graph, Node, Path, Relation, Row, UnboundedRelation};
+use neo4rs::{query, Graph, Node, Path, Relation, Row, Txn, UnboundedRelation};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -39,6 +39,19 @@ pub const STRUCTURAL: &[&str] = &[
 ];
 
 pub const SPIKE: &[&str] = &["Signal", "Pattern", "Insight", "Knowledge"];
+
+pub const WAKEUP_RELS: &[&str] = &[
+    "ASSERTS",
+    "ABOUT",
+    "INSTANCE_OF",
+    "SUBCLASS_OF",
+    "SUBPROPERTY_OF",
+    "DOMAIN",
+    "RANGE",
+    "EVIDENCE_FOR",
+    "DERIVED_FROM",
+    "SUPPORTS",
+];
 
 const LABEL_OK: &str = "label";
 
@@ -85,6 +98,64 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
     {
         eprintln!("fulltext index skipped: {err}");
     }
+    // Do not ALTER entity_fulltext — Neo4j cannot add properties in place.
+    if let Err(err) = graph
+        .run(query(
+            "CREATE FULLTEXT INDEX wakeup_nodes IF NOT EXISTS FOR (n:Entity) ON EACH [n.name, n.iri, n.searchText, n.value]",
+        ))
+        .await
+    {
+        eprintln!("wakeup_nodes fulltext skipped: {err}");
+    }
+    if let Err(err) = graph
+        .run(query(
+            "CREATE FULLTEXT INDEX wakeup_facts IF NOT EXISTS FOR ()-[r:ASSERTS|ABOUT|INSTANCE_OF|SUBCLASS_OF|SUBPROPERTY_OF|DOMAIN|RANGE|EVIDENCE_FOR|DERIVED_FROM|SUPPORTS]-() ON EACH [r.factText]",
+        ))
+        .await
+    {
+        eprintln!("wakeup_facts multi-type fulltext skipped: {err}");
+        if let Err(err2) = graph
+            .run(query(
+                "CREATE FULLTEXT INDEX wakeup_facts IF NOT EXISTS FOR ()-[r:ASSERTS]-() ON EACH [r.factText]",
+            ))
+            .await
+        {
+            eprintln!("wakeup_facts ASSERTS fulltext skipped: {err2}");
+        }
+    }
+    if let Err(err) = graph
+        .run(query(
+            "CREATE FULLTEXT INDEX wakeup_about IF NOT EXISTS FOR ()-[r:ABOUT]-() ON EACH [r.factText]",
+        ))
+        .await
+    {
+        eprintln!("wakeup_about fulltext skipped: {err}");
+    }
+    graph
+        .run(query(
+            r#"
+            MATCH (n:Entity)
+            WHERE n.searchText IS NULL
+            SET n.searchText = trim(coalesce(n.name, '') + ' ' + coalesce(n.iri, '') + ' ' + coalesce(n.value, ''))
+            "#,
+        ))
+        .await
+        .ok();
+    graph
+        .run(query(
+            r#"
+            MATCH (s:Entity)-[r]->(o:Entity)
+            WHERE r.factText IS NULL
+              AND type(r) IN ['ASSERTS','ABOUT','INSTANCE_OF','SUBCLASS_OF','SUBPROPERTY_OF','DOMAIN','RANGE','EVIDENCE_FOR','DERIVED_FROM','SUPPORTS']
+            SET r.factText = trim(
+              coalesce(s.name, s.iri) + ' ' +
+              coalesce(last(split(coalesce(r.propertyIri, type(r)), '/')), type(r)) + ' ' +
+              coalesce(o.value, o.name, o.iri)
+            )
+            "#,
+        ))
+        .await
+        .ok();
 
     graph
         .run(query(
@@ -360,8 +431,10 @@ pub async fn merge_node(
             r#"
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime()
-            ON MATCH SET n.name = coalesce(n.name, $name)
+            ON CREATE SET n.name = $name, n.createdAt = datetime(),
+              n.searchText = trim($name + ' ' + $iri)
+            ON MATCH SET n.name = coalesce(n.name, $name),
+              n.searchText = coalesce(n.searchText, trim(coalesce(n.name, $name) + ' ' + $iri))
             RETURN n, existing IS NULL AS created
             "#,
         )
@@ -418,7 +491,9 @@ pub async fn merge_literal(graph: &Graph, value: &str, datatype: &str) -> Result
             r#"
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Literal {iri: $iri})
-            ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype, n.createdAt = datetime()
+            ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype, n.createdAt = datetime(),
+              n.searchText = trim($name + ' ' + $iri + ' ' + $value)
+            ON MATCH SET n.searchText = coalesce(n.searchText, trim(coalesce(n.name, $name) + ' ' + $iri + ' ' + coalesce(n.value, $value)))
             RETURN n, existing IS NULL AS created
             "#,
         )
@@ -470,28 +545,43 @@ pub struct Episode {
     pub tool: String,
 }
 
-pub async fn create_episode(graph: &Graph, tool: &str, note: Option<&str>) -> Result<Episode> {
-    let iri = mint_iri("episode", &Uuid::new_v4().to_string(), true);
-    let row = fetch_one(
-        graph,
-        query(
-            r#"
-            CREATE (e:Entity:Episode {iri: $iri, tool: $tool, at: datetime(), createdAt: datetime(), name: $iri})
-            SET e.note = $note
-            RETURN e.iri AS iri, toString(e.at) AS at
-            "#,
-        )
-        .param("iri", iri.clone())
-        .param("tool", tool.to_string())
-        .param("note", note.map(|s| s.to_string())),
+fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
+    query(
+        r#"
+        CREATE (e:Entity:Episode {iri: $iri, tool: $tool, at: datetime(), createdAt: datetime(), name: $iri})
+        SET e.note = $note
+        RETURN e.iri AS iri, toString(e.at) AS at
+        "#,
     )
-    .await?
-    .ok_or_else(|| anyhow!("failed to create episode"))?;
+    .param("iri", iri.to_string())
+    .param("tool", tool.to_string())
+    .param("note", note.map(|s| s.to_string()))
+}
+
+fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
     Ok(Episode {
         iri: row.get::<String>("iri")?,
         at: row.get::<String>("at").unwrap_or_default(),
         tool: tool.to_string(),
     })
+}
+
+pub async fn create_episode(graph: &Graph, tool: &str, note: Option<&str>) -> Result<Episode> {
+    let iri = mint_iri("episode", &Uuid::new_v4().to_string(), true);
+    let row = fetch_one(graph, episode_query(&iri, tool, note))
+        .await?
+        .ok_or_else(|| anyhow!("failed to create episode"))?;
+    episode_from_row(&row, tool)
+}
+
+pub async fn create_episode_in_txn(txn: &mut Txn, tool: &str, note: Option<&str>) -> Result<Episode> {
+    let iri = mint_iri("episode", &Uuid::new_v4().to_string(), true);
+    let mut stream = txn.execute(episode_query(&iri, tool, note)).await?;
+    let row = stream
+        .next(txn.handle())
+        .await?
+        .ok_or_else(|| anyhow!("failed to create episode"))?;
+    episode_from_row(&row, tool)
 }
 
 pub async fn get_node(graph: &Graph, iri: &str) -> Result<Option<Node>> {
@@ -504,4 +594,106 @@ pub async fn get_node(graph: &Graph, iri: &str) -> Result<Option<Node>> {
         Some(r) => Some(r.get("n")?),
         None => None,
     })
+}
+
+pub fn fact_text(s_name: &str, s_iri: &str, prop_iri: &str, o: &MergedNode) -> String {
+    let s_part = if !s_name.is_empty() { s_name } else { s_iri };
+    let p_part = name_from_iri(prop_iri);
+    let o_part = o
+        .json
+        .get("value")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if !o.name.is_empty() {
+                Some(o.name.as_str())
+            } else {
+                None
+            }
+        })
+        .unwrap_or(o.iri.as_str());
+    format!("{s_part} {p_part} {o_part}")
+}
+
+pub fn endpoint_json(node: &Node) -> Value {
+    let labels: Vec<String> = node
+        .labels()
+        .into_iter()
+        .filter(|l| *l != "Entity")
+        .map(|s| s.to_string())
+        .collect();
+    let iri = node.get::<String>("iri").unwrap_or_default();
+    if labels.iter().any(|l| l == "Literal") {
+        let value = node
+            .get::<String>("value")
+            .ok()
+            .or_else(|| node.get::<String>("name").ok())
+            .unwrap_or_default();
+        let datatype = node
+            .get::<String>("datatype")
+            .unwrap_or_else(|_| "xsd:string".into());
+        return json!({
+            "iri": iri,
+            "value": value,
+            "datatype": datatype,
+        });
+    }
+    json!({
+        "iri": iri,
+        "name": node.get::<String>("name").ok(),
+        "labels": labels,
+    })
+}
+
+pub async fn touch_search_text(graph: &Graph, iri: &str, extra: Option<&str>) -> Result<()> {
+    graph
+        .run(
+            query(
+                r#"
+                MATCH (n:Entity {iri: $iri})
+                WITH n, trim(coalesce(n.name, '') + ' ' + n.iri + ' ' + coalesce(n.value, '')) AS base
+                SET n.searchText = CASE
+                  WHEN $extra IS NULL OR $extra = '' THEN coalesce(n.searchText, base)
+                  WHEN coalesce(n.searchText, '') CONTAINS $extra THEN n.searchText
+                  ELSE trim(coalesce(n.searchText, base) + ' ' + $extra)
+                END
+                "#,
+            )
+            .param("iri", iri.to_string())
+            .param("extra", extra.map(|s| s.to_string())),
+        )
+        .await?;
+    Ok(())
+}
+
+pub fn spike_label(labels: &[String]) -> Option<String> {
+    for rank in ["Knowledge", "Insight", "Pattern", "Signal"] {
+        if labels.iter().any(|l| l == rank) {
+            return Some(rank.to_string());
+        }
+    }
+    None
+}
+
+pub fn spike_rank(label: Option<&str>) -> i32 {
+    match label {
+        Some("Knowledge") => 4,
+        Some("Insight") => 3,
+        Some("Pattern") => 2,
+        Some("Signal") => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::spike_rank;
+
+    #[test]
+    fn spike_rank_orders() {
+        assert!(spike_rank(Some("Knowledge")) > spike_rank(Some("Insight")));
+        assert!(spike_rank(Some("Insight")) > spike_rank(Some("Pattern")));
+        assert!(spike_rank(Some("Pattern")) > spike_rank(Some("Signal")));
+        assert!(spike_rank(Some("Signal")) > spike_rank(None));
+    }
 }

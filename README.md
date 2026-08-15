@@ -7,9 +7,9 @@ Stdio MCP server that stores agent memory in Neo4j as RDFS schema-as-data: every
 | Tool | Arguments | What it does |
 | --- | --- | --- |
 | `memory_get` | `iri`, `hops?` (`0` or `1`, default `0`) | Fetch a node; with `hops=1` include current visible neighbors. |
-| `memory_search` | `text?`, `labels?`, `limit?` (default 20) | Full-text / contains search. Hop-capped; walk with traverse. |
+| `memory_search` | `text?`, `labels?`, `limit?` (default 20) | Wake-up: current visible facts (`s,p,o`) plus ABOUT SPIKE, ranked Knowledge > Insight > Pattern > Signal. Not a node directory. |
 | `memory_traverse` | `from`, `rels?`, `depth?` (1–3, hard cap 3), `limit?` | Walk the fixed relationship set from a node. |
-| `memory_assert` | `s`, `p`, `o`, `layer?`, `spike?` | MERGE a triple. Same current triple is a no-op; same `(s,p,layer)` with a new `o` closes the old edge and `SUPERSEDES`. `s`/`o` are an IRI string or `{iri,name,labels?}`. JSON number/bool `o` becomes a `:Literal`. `spike` labels `s` and adds `ABOUT` when `o` is an Element. |
+| `memory_assert` | `s`, `p`, `o`, `layer?`, `spike?`, `contradicts?` | MERGE a triple. Same current triple is a no-op; same `(s,p,layer)` with a new `o` closes the old edge and `SUPERSEDES`. Always returns `conflicts[]` when another visible layer has a different current `o` for `(s,p)`. `contradicts: true` writes multi-valued `CONTRADICTS` (does not supersede a previous fight). `spike` labels `s` and adds `ABOUT` when `o` is an Element. |
 | `memory_retract` | `iri?` **or** `s`,`p`,`o?`,`layer?`, plus `reason?` | Soft-retract (`validTo=now`). Nodes stay gettable. Never hard-deletes. |
 | `memory_schema` | `kind` (`class` or `property`), `name` or `iri`, `subClassOf?`, `subPropertyOf?`, `domain?`, `range?` | Declare schema nodes and RDFS links. |
 
