@@ -357,8 +357,14 @@ mod tests {
         let tools: Vec<_> = router.list_all();
         let assert = tools.iter().find(|t| t.name == "memory_assert").unwrap();
         let schema = assert.schema_as_json_value();
-        let props = schema.get("properties").and_then(|p| p.as_object()).unwrap();
-        assert!(props.contains_key("contradicts"), "contradicts missing: {schema}");
+        let props = schema
+            .get("properties")
+            .and_then(|p| p.as_object())
+            .unwrap();
+        assert!(
+            props.contains_key("contradicts"),
+            "contradicts missing: {schema}"
+        );
         assert_eq!(
             props["contradicts"].get("type").and_then(|v| v.as_str()),
             Some("boolean")

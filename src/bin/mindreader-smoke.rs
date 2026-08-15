@@ -223,7 +223,9 @@ async fn run() -> Result<u32> {
         .map(|v| {
             let text = v.to_string();
             v.get("found").and_then(|x| x.as_bool()).unwrap_or(false)
-                && (text.contains(&project_iri) || text.contains("worksOn") || text.contains("graph-memory"))
+                && (text.contains(&project_iri)
+                    || text.contains("worksOn")
+                    || text.contains("graph-memory"))
         })
         .unwrap_or(false);
     r.check(
@@ -249,7 +251,11 @@ async fn run() -> Result<u32> {
         .ok()
         .map(|v| {
             let mode_ok = v.get("mode").and_then(|m| m.as_str()) == Some("wakeup");
-            let facts = v.get("facts").and_then(|n| n.as_array()).cloned().unwrap_or_default();
+            let facts = v
+                .get("facts")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
             let hit = facts.iter().any(|f| {
                 let s = f.get("s");
                 s.and_then(|n| n.get("iri"))
@@ -265,7 +271,12 @@ async fn run() -> Result<u32> {
             mode_ok && hit
         })
         .unwrap_or(false);
-    r.check(5, "memory_search \"Bruno\" returns facts (wakeup)", found_bruno, &format!("{search:?}"));
+    r.check(
+        5,
+        "memory_search \"Bruno\" returns facts (wakeup)",
+        found_bruno,
+        &format!("{search:?}"),
+    );
 
     // 6. traverse from Bruno depth 2
     let trav = tools::memory_traverse(
@@ -290,7 +301,12 @@ async fn run() -> Result<u32> {
                     .unwrap_or(false)
         })
         .unwrap_or(false);
-    r.check(6, "memory_traverse from Bruno depth 2", trav_ok, &format!("{trav:?}"));
+    r.check(
+        6,
+        "memory_traverse from Bruno depth 2",
+        trav_ok,
+        &format!("{trav:?}"),
+    );
 
     // 7. re-assert same worksOn — idempotent
     let again = tools::memory_assert(
@@ -337,12 +353,17 @@ async fn run() -> Result<u32> {
     .await;
     let (cur_n2, cur_objs2) =
         tools::count_current_asserts(&graph, &bruno_iri, "worksOn", "project:graph-memory").await?;
-    let hist = tools::count_historical_asserts(&graph, &bruno_iri, "worksOn", "project:graph-memory")
-        .await?;
+    let hist =
+        tools::count_historical_asserts(&graph, &bruno_iri, "worksOn", "project:graph-memory")
+            .await?;
     let other_iri = other
         .as_ref()
         .ok()
-        .and_then(|v| v.get("o").and_then(|o| o.get("iri")).and_then(|x| x.as_str()))
+        .and_then(|v| {
+            v.get("o")
+                .and_then(|o| o.get("iri"))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or("")
         .to_string();
     let superseded = other
@@ -432,7 +453,6 @@ async fn run() -> Result<u32> {
         &format!("{rejected:?}"),
     );
 
-
     // --- v1.1: conflicts, CONTRADICTS, wakeup rank ---
     // Unique names so a second smoke run does not inherit leftover CONTRADICTS.
     let tag = std::time::SystemTime::now()
@@ -460,13 +480,21 @@ async fn run() -> Result<u32> {
     let a_iri = a
         .as_ref()
         .ok()
-        .and_then(|v| v.get("o").and_then(|o| o.get("iri")).and_then(|x| x.as_str()))
+        .and_then(|v| {
+            v.get("o")
+                .and_then(|o| o.get("iri"))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or("")
         .to_string();
     let v11_iri = a
         .as_ref()
         .ok()
-        .and_then(|v| v.get("s").and_then(|s| s.get("iri")).and_then(|x| x.as_str()))
+        .and_then(|v| {
+            v.get("s")
+                .and_then(|s| s.get("iri"))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or("")
         .to_string();
     r.check(
@@ -492,7 +520,11 @@ async fn run() -> Result<u32> {
     let b_iri = b
         .as_ref()
         .ok()
-        .and_then(|v| v.get("o").and_then(|o| o.get("iri")).and_then(|x| x.as_str()))
+        .and_then(|v| {
+            v.get("o")
+                .and_then(|o| o.get("iri"))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or("")
         .to_string();
     let conflicts = b
@@ -555,7 +587,11 @@ async fn run() -> Result<u32> {
     let a2_iri = a2
         .as_ref()
         .ok()
-        .and_then(|v| v.get("o").and_then(|o| o.get("iri")).and_then(|x| x.as_str()))
+        .and_then(|v| {
+            v.get("o")
+                .and_then(|o| o.get("iri"))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or("")
         .to_string();
     let b3 = tools::memory_assert(
@@ -609,32 +645,50 @@ async fn run() -> Result<u32> {
         },
     )
     .await;
-    let wake_ok = wake.as_ref().ok().map(|v| {
-        let mode = v.get("mode").and_then(|m| m.as_str()) == Some("wakeup");
-        let facts = v.get("facts").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-        let spikes = v.get("spike").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-        let has_fact = !facts.is_empty()
-            && facts.iter().any(|f| {
-                f.get("s").and_then(|s| s.get("iri")).and_then(|x| x.as_str()) == Some(bruno_iri.as_str())
-                    || f.get("p").and_then(|x| x.as_str()).unwrap_or("").contains("worksOn")
-                    || f.to_string().to_ascii_lowercase().contains("bruno")
+    let wake_ok = wake
+        .as_ref()
+        .ok()
+        .map(|v| {
+            let mode = v.get("mode").and_then(|m| m.as_str()) == Some("wakeup");
+            let facts = v
+                .get("facts")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let spikes = v
+                .get("spike")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let has_fact = !facts.is_empty()
+                && facts.iter().any(|f| {
+                    f.get("s")
+                        .and_then(|s| s.get("iri"))
+                        .and_then(|x| x.as_str())
+                        == Some(bruno_iri.as_str())
+                        || f.get("p")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("")
+                            .contains("worksOn")
+                        || f.to_string().to_ascii_lowercase().contains("bruno")
+                });
+            let no_nodes_dir = v.get("nodes").is_none();
+            let first_spike = spikes
+                .first()
+                .and_then(|s| s.get("rank").and_then(|x| x.as_str()));
+            let knowledge_first = first_spike == Some("Knowledge");
+            let bruno_fact_spike = facts.iter().find(|f| {
+                f.get("s")
+                    .and_then(|s| s.get("iri"))
+                    .and_then(|x| x.as_str())
+                    == Some(bruno_iri.as_str())
             });
-        let no_nodes_dir = v.get("nodes").is_none();
-        let first_spike = spikes
-            .first()
-            .and_then(|s| s.get("rank").and_then(|x| x.as_str()));
-        let knowledge_first = first_spike == Some("Knowledge");
-        let bruno_fact_spike = facts.iter().find(|f| {
-            f.get("s")
-                .and_then(|s| s.get("iri"))
-                .and_then(|x| x.as_str())
-                == Some(bruno_iri.as_str())
-        });
-        let fact_ranked = bruno_fact_spike
-            .and_then(|f| f.get("spike").and_then(|x| x.as_str()))
-            == Some("Knowledge");
-        mode && has_fact && no_nodes_dir && knowledge_first && fact_ranked
-    }).unwrap_or(false);
+            let fact_ranked = bruno_fact_spike
+                .and_then(|f| f.get("spike").and_then(|x| x.as_str()))
+                == Some("Knowledge");
+            mode && has_fact && no_nodes_dir && knowledge_first && fact_ranked
+        })
+        .unwrap_or(false);
     r.check(
         16,
         "v1.1 memory_search Bruno returns facts+ABOUT SPIKE; Knowledge ranks above Signal",
@@ -666,18 +720,20 @@ async fn run() -> Result<u32> {
     )
     .await;
     let lit_ok = lit.is_ok()
-        && lit_search.as_ref().ok().map(|v| {
-            v.get("mode").and_then(|m| m.as_str()) == Some("wakeup")
-                && v.get("facts")
-                    .and_then(|n| n.as_array())
-                    .map(|arr| {
-                        arr.iter().any(|f| {
-                            f.to_string().contains("v11-unique-literal-token")
+        && lit_search
+            .as_ref()
+            .ok()
+            .map(|v| {
+                v.get("mode").and_then(|m| m.as_str()) == Some("wakeup")
+                    && v.get("facts")
+                        .and_then(|n| n.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .any(|f| f.to_string().contains("v11-unique-literal-token"))
                         })
-                    })
-                    .unwrap_or(false)
-        })
-        .unwrap_or(false);
+                        .unwrap_or(false)
+            })
+            .unwrap_or(false);
     r.check(
         17,
         "v1.1 memory_search finds literal/factText (not node directory)",
@@ -716,7 +772,11 @@ async fn run() -> Result<u32> {
     let retract_s_iri = g_assert
         .as_ref()
         .ok()
-        .and_then(|v| v.get("s").and_then(|s| s.get("iri")).and_then(|x| x.as_str()))
+        .and_then(|v| {
+            v.get("s")
+                .and_then(|s| s.get("iri"))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or("")
         .to_string();
     let retract_nolayer = tools::memory_retract(
@@ -734,8 +794,7 @@ async fn run() -> Result<u32> {
     .await;
     let (g_left, _) =
         tools::count_current_asserts(&graph, &retract_s_iri, "desk", "global").await?;
-    let (p_left, _) =
-        tools::count_current_asserts(&graph, &retract_s_iri, "desk", project).await?;
+    let (p_left, _) = tools::count_current_asserts(&graph, &retract_s_iri, "desk", project).await?;
     let used_layer = retract_nolayer
         .as_ref()
         .ok()
@@ -832,17 +891,35 @@ async fn run() -> Result<u32> {
         },
     )
     .await;
-    let search_hides = null_search.as_ref().ok().map(|v| {
-        let facts = v.get("facts").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-        facts.iter().all(|f| !f.to_string().contains(&null_token))
-    }).unwrap_or(false);
-    let get_hides = null_get.as_ref().ok().map(|v| {
-        !v.to_string().contains(&null_sp)
-    }).unwrap_or(false);
-    let spike_hides = null_wake.as_ref().ok().map(|v| {
-        let spikes = v.get("spike").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-        spikes.iter().all(|s| !s.to_string().contains(&null_sp))
-    }).unwrap_or(false);
+    let search_hides = null_search
+        .as_ref()
+        .ok()
+        .map(|v| {
+            let facts = v
+                .get("facts")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
+            facts.iter().all(|f| !f.to_string().contains(&null_token))
+        })
+        .unwrap_or(false);
+    let get_hides = null_get
+        .as_ref()
+        .ok()
+        .map(|v| !v.to_string().contains(&null_sp))
+        .unwrap_or(false);
+    let spike_hides = null_wake
+        .as_ref()
+        .ok()
+        .map(|v| {
+            let spikes = v
+                .get("spike")
+                .and_then(|n| n.as_array())
+                .cloned()
+                .unwrap_or_default();
+            spikes.iter().all(|s| !s.to_string().contains(&null_sp))
+        })
+        .unwrap_or(false);
     r.check(
         19,
         "NULL-layer edges stay invisible (search facts, get hops, ABOUT spike)",
@@ -904,13 +981,16 @@ async fn run() -> Result<u32> {
     let c_iri = multi_c
         .as_ref()
         .ok()
-        .and_then(|v| v.get("o").and_then(|o| o.get("iri")).and_then(|x| x.as_str()))
+        .and_then(|v| {
+            v.get("o")
+                .and_then(|o| o.get("iri"))
+                .and_then(|x| x.as_str())
+        })
         .unwrap_or("")
         .to_string();
     let (after_n, after_objs) =
         tools::count_current_asserts(&graph, &multi_s, "worksOn", project).await?;
-    let hist_multi =
-        tools::count_historical_asserts(&graph, &multi_s, "worksOn", project).await?;
+    let hist_multi = tools::count_historical_asserts(&graph, &multi_s, "worksOn", project).await?;
     r.check(
         20,
         "assert supersede closes ALL current (s,p,layer) matches, not LIMIT 1",
@@ -927,7 +1007,6 @@ async fn run() -> Result<u32> {
 
     Ok(r.failed)
 }
-
 
 async fn count_contradicts(graph: &neo4rs::Graph, from_iri: &str) -> Result<i64> {
     let row = mindreader::graph::fetch_one(

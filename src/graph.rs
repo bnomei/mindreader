@@ -87,7 +87,9 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
                     }
                     return Ok(g);
                 }
-                Err(err) => errors.push(format!("attempt={attempt} endpoint={endpoint} error={err}")),
+                Err(err) => {
+                    errors.push(format!("attempt={attempt} endpoint={endpoint} error={err}"))
+                }
             }
         }
         if attempt < 3 {
@@ -225,9 +227,7 @@ pub fn safe_label(label: &str) -> Result<String> {
     let Some(first) = label.chars().next() else {
         return Err(anyhow!("invalid label: {label}"));
     };
-    if label.is_empty()
-        || !first.is_ascii_alphabetic()
-        || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    if !first.is_ascii_alphabetic() || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return Err(anyhow!("invalid label: {label}"));
     }
@@ -240,9 +240,10 @@ pub fn safe_rel(rel: &str) -> Result<String> {
     let Some(first) = up.chars().next() else {
         return Err(anyhow!("invalid relationship type: {rel}"));
     };
-    if up.is_empty()
-        || !first.is_ascii_uppercase()
-        || !up.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    if !first.is_ascii_uppercase()
+        || !up
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
         return Err(anyhow!("invalid relationship type: {rel}"));
     }
@@ -256,7 +257,10 @@ pub fn structural_rel_for(property: &str) -> Option<String> {
     if STRUCTURAL.contains(&candidate.as_str()) {
         return Some(candidate);
     }
-    if STRUCTURAL.iter().any(|s| iri == format!("mindreader:property/{s}")) {
+    if STRUCTURAL
+        .iter()
+        .any(|s| iri == format!("mindreader:property/{s}"))
+    {
         return Some(name.to_ascii_uppercase());
     }
     None
@@ -438,10 +442,7 @@ pub async fn merge_node(
         let seed = spec.name.as_deref().unwrap_or("unnamed");
         mint_iri(&kind, seed, default_lower_for_kind(&kind))
     };
-    let name = spec
-        .name
-        .clone()
-        .unwrap_or_else(|| name_from_iri(&iri));
+    let name = spec.name.clone().unwrap_or_else(|| name_from_iri(&iri));
     let mut labels = Vec::new();
     if let Some(l) = label_for_kind(&kind) {
         labels.push(l.to_string());
@@ -608,7 +609,11 @@ pub async fn create_episode(graph: &Graph, tool: &str, note: Option<&str>) -> Re
     episode_from_row(&row, tool)
 }
 
-pub async fn create_episode_in_txn(txn: &mut Txn, tool: &str, note: Option<&str>) -> Result<Episode> {
+pub async fn create_episode_in_txn(
+    txn: &mut Txn,
+    tool: &str,
+    note: Option<&str>,
+) -> Result<Episode> {
     let iri = mint_iri("episode", &Uuid::new_v4().to_string(), true);
     let mut stream = txn.execute(episode_query(&iri, tool, note)).await?;
     let row = stream
