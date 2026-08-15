@@ -4,7 +4,7 @@ use mindreader::domain::{EntityInput, ObjectInput};
 use mindreader::graph::{self};
 use mindreader::tools::{
     self, AssertArgs, GetArgs, ReplaceArgs, RetractArgs, RetractTargetArgs, SchemaArgs, SearchArgs,
-    TraverseArgs,
+    StatsArgs, TraverseArgs,
 };
 use mindreader::Mindreader;
 use serde_json::Value;
@@ -134,6 +134,12 @@ async fn run() -> Result<u32> {
     let graph = graph::connect(&cfg).await?;
     graph::bootstrap(&graph).await?;
     let project = cfg.project.as_str();
+    let stats = tools::memory_stats(&graph, project, StatsArgs::default()).await?;
+    if stats.pointer("/model/ready").and_then(Value::as_bool) != Some(true) {
+        return Err(anyhow!(
+            "memory_stats reports graph model is not ready: {stats}"
+        ));
+    }
     let mut r = Report::new();
     // Run-unique fixtures keep repeated smoke runs independent.
     let tag = std::time::SystemTime::now()
@@ -1121,6 +1127,61 @@ async fn run() -> Result<u32> {
             && !after_objs.iter().any(|o| o == &multi_a),
         &format!(
             "before={before_n} {before_objs:?} after={after_n} {after_objs:?} hist={hist_multi} supersedes={supersedes_multi} c={multi_c:?}"
+        ),
+    );
+
+    let race_s1 = format!("mindreader:element/race-one-{tag}");
+    let race_s2 = format!("mindreader:element/race-two-{tag}");
+    let race_old = format!("mindreader:element/race-old-{tag}");
+    let race_new = format!("mindreader:element/race-new-{tag}");
+    for subject in [&race_s1, &race_s2] {
+        tools::memory_assert(
+            &graph,
+            project,
+            AssertArgs {
+                s: entity_iri(subject.clone()),
+                p: "worksOn".into(),
+                o: object_iri(race_old.clone()),
+                layer: Some("global".into()),
+                spike: None,
+                contradicts: false,
+            },
+        )
+        .await?;
+    }
+    let race_one = tools::memory_assert(
+        &graph,
+        project,
+        AssertArgs {
+            s: entity_iri(race_s1),
+            p: "worksOn".into(),
+            o: object_iri(race_new.clone()),
+            layer: Some(project.into()),
+            spike: None,
+            contradicts: true,
+        },
+    );
+    let race_two = tools::memory_assert(
+        &graph,
+        project,
+        AssertArgs {
+            s: entity_iri(race_s2),
+            p: "worksOn".into(),
+            o: object_iri(race_new.clone()),
+            layer: Some(project.into()),
+            spike: None,
+            contradicts: true,
+        },
+    );
+    let (race_one, race_two) = tokio::join!(race_one, race_two);
+    let contradiction_count =
+        tools::count_current_contradicts(&graph, &race_new, &race_old).await?;
+    r.check(
+        22,
+        "concurrent derived contradiction writes remain exact-pair idempotent",
+        race_one.is_ok() && race_two.is_ok() && contradiction_count == 1,
+        &format!(
+            "first={race_one:?} second={race_two:?} activeContradictions={contradiction_count}"
         ),
     );
 

@@ -198,7 +198,7 @@ async fn verify_required_constraints(graph: &Graph) -> Result<()> {
             r#"
             SHOW CONSTRAINTS
             YIELD name, type, entityType, labelsOrTypes, properties
-            WHERE name IN ['entity_iri', 'fact_lock_key']
+            WHERE name IN ['mindreader_meta_key', 'entity_iri', 'fact_lock_key']
             RETURN name, type AS constraintType, entityType, labelsOrTypes, properties
             "#,
         ),
@@ -207,6 +207,7 @@ async fn verify_required_constraints(graph: &Graph) -> Result<()> {
     .context("inspect required Neo4j constraints")?;
 
     for (name, label, property) in [
+        ("mindreader_meta_key", "MindreaderMeta", "key"),
         ("entity_iri", "Entity", "iri"),
         ("fact_lock_key", "FactLock", "key"),
     ] {
@@ -263,6 +264,7 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
                 "Mindreader database model version {version} is incompatible with required version {MODEL_VERSION}; {RESET_REQUIRED}"
             ));
         }
+        ensure_model_marker_constraint(graph).await?;
         return Ok(());
     }
 
@@ -274,10 +276,25 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
         .context("read Neo4j node count")?;
 
     if node_count > 0 {
+        let concurrent_markers = fetch_all(
+            graph,
+            query("MATCH (m:MindreaderMeta {key: $key}) RETURN m.version AS version")
+                .param("key", MODEL_MARKER_KEY),
+        )
+        .await
+        .context("recheck model marker after concurrent bootstrap activity")?;
+        if concurrent_markers.len() == 1
+            && concurrent_markers[0].get::<i64>("version").ok() == Some(MODEL_VERSION)
+        {
+            ensure_model_marker_constraint(graph).await?;
+            return Ok(());
+        }
         return Err(anyhow!(
             "found {node_count} pre-existing node(s) without a Mindreader database model marker; no data migration is supported, so {RESET_REQUIRED}"
         ));
     }
+
+    ensure_model_marker_constraint(graph).await?;
 
     graph
         .run(
@@ -290,6 +307,16 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
         .await
         .context("create Mindreader database model marker")?;
 
+    Ok(())
+}
+
+async fn ensure_model_marker_constraint(graph: &Graph) -> Result<()> {
+    graph
+        .run(query(
+            "CREATE CONSTRAINT mindreader_meta_key IF NOT EXISTS FOR (m:MindreaderMeta) REQUIRE m.key IS UNIQUE",
+        ))
+        .await
+        .context("create model marker key uniqueness constraint")?;
     Ok(())
 }
 
@@ -816,128 +843,6 @@ pub async fn acquire_fact_locks_in_txn(
     Ok(())
 }
 
-pub async fn merge_node(
-    graph: &Graph,
-    spec: &NodeSpec,
-    default_kind: &str,
-    extra_labels: &[String],
-) -> Result<MergedNode> {
-    let (iri, name, labels) = resolved_node_parts(spec, default_kind, extra_labels)?;
-
-    let row = fetch_one(
-        graph,
-        query(
-            r#"
-            OPTIONAL MATCH (existing:Entity {iri: $iri})
-            MERGE (n:Entity {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime()
-            ON MATCH SET n.name = coalesce(n.name, $name)
-            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
-            RETURN n, existing IS NULL AS created
-            "#,
-        )
-        .param("iri", iri.clone())
-        .param("name", name.clone()),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("failed to MERGE node {iri}"))?;
-    let created: bool = row.get("created").unwrap_or(false);
-
-    if !labels.is_empty() {
-        let set_labels = labels
-            .iter()
-            .map(|l| safe_label(l))
-            .collect::<Result<Vec<_>>>()?;
-        let set = set_labels
-            .iter()
-            .map(|l| format!("n:{l}"))
-            .collect::<Vec<_>>()
-            .join(" SET ");
-        let q = format!("MATCH (n:Entity {{iri: $iri}}) SET {set} RETURN n");
-        graph.run(query(&q).param("iri", iri.clone())).await?;
-    }
-
-    let after = fetch_one(
-        graph,
-        query("MATCH (n:Entity {iri: $iri}) RETURN n").param("iri", iri.clone()),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("missing node after MERGE {iri}"))?;
-    let node: Node = after.get("n")?;
-    let labels = node
-        .labels()
-        .into_iter()
-        .filter(|l| *l != "Entity")
-        .map(|s| s.to_string())
-        .collect();
-    Ok(MergedNode {
-        iri,
-        name,
-        labels,
-        created,
-        json: node_json(&node),
-    })
-}
-
-pub async fn merge_literal(graph: &Graph, value: &str, datatype: &str) -> Result<MergedNode> {
-    let iri = literal_iri(value, datatype);
-    let row = fetch_one(
-        graph,
-        query(
-            r#"
-            OPTIONAL MATCH (existing:Entity {iri: $iri})
-            MERGE (n:Entity:Literal {iri: $iri})
-            ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype,
-              n.createdAt = datetime()
-            ON MATCH SET n.name = coalesce(n.name, $name),
-              n.value = coalesce(n.value, $value), n.datatype = coalesce(n.datatype, $datatype)
-            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, $value))
-            RETURN n, existing IS NULL AS created
-            "#,
-        )
-        .param("iri", iri.clone())
-        .param("name", value.to_string())
-        .param("value", value.to_string())
-        .param("datatype", datatype.to_string()),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("failed to MERGE literal {iri}"))?;
-    let node: Node = row.get("n")?;
-    let created: bool = row.get("created").unwrap_or(false);
-    Ok(MergedNode {
-        iri,
-        name: value.to_string(),
-        labels: vec!["Literal".into()],
-        created,
-        json: node_json(&node),
-    })
-}
-
-pub async fn ensure_property(graph: &Graph, p: &str) -> Result<(String, bool, Value)> {
-    let iri = property_iri(p);
-    let name = name_from_iri(&iri);
-    let row = fetch_one(
-        graph,
-        query(
-            r#"
-            OPTIONAL MATCH (existing:Entity {iri: $iri})
-            MERGE (n:Entity:Property {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = true
-            ON MATCH SET n.name = coalesce(n.name, $name)
-            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
-            RETURN n, existing IS NULL AS created
-            "#,
-        )
-        .param("iri", iri.clone())
-        .param("name", name),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("failed to MERGE property {iri}"))?;
-    let node: Node = row.get("n")?;
-    let created: bool = row.get("created").unwrap_or(false);
-    Ok((iri, created, node_json(&node)))
-}
-
 #[derive(Debug, Clone)]
 pub struct Episode {
     pub iri: String,
@@ -964,14 +869,6 @@ fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
         at: row.get::<String>("at").unwrap_or_default(),
         tool: tool.to_string(),
     })
-}
-
-pub async fn create_episode(graph: &Graph, tool: &str, note: Option<&str>) -> Result<Episode> {
-    let iri = mint_iri("episode", &Uuid::new_v4().to_string(), true);
-    let row = fetch_one(graph, episode_query(&iri, tool, note))
-        .await?
-        .ok_or_else(|| anyhow!("failed to create episode"))?;
-    episode_from_row(&row, tool)
 }
 
 pub async fn create_episode_in_txn(
@@ -1047,27 +944,6 @@ pub fn endpoint_json(node: &Node) -> Value {
         "name": node.get::<String>("name").ok(),
         "labels": labels,
     })
-}
-
-pub async fn touch_search_text(graph: &Graph, iri: &str, extra: Option<&str>) -> Result<()> {
-    graph
-        .run(
-            query(
-                r#"
-                MATCH (n:Entity {iri: $iri})
-                WITH n, trim(coalesce(n.name, '') + ' ' + n.iri + ' ' + coalesce(n.value, '')) AS base
-                SET n.searchText = CASE
-                  WHEN $extra IS NULL OR $extra = '' THEN coalesce(n.searchText, base)
-                  WHEN coalesce(n.searchText, '') CONTAINS $extra THEN n.searchText
-                  ELSE trim(coalesce(n.searchText, base) + ' ' + $extra)
-                END
-                "#,
-            )
-            .param("iri", iri.to_string())
-            .param("extra", extra.map(|s| s.to_string())),
-        )
-        .await?;
-    Ok(())
 }
 
 pub fn spike_label(labels: &[String]) -> Option<String> {

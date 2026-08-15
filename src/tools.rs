@@ -1,6 +1,7 @@
 use crate::config::GLOBAL_LAYER;
 use crate::domain::{
-    DomainError, EntityInput, EntityRef, ObjectInput, ObjectValue, RetractScope, SpikeRank,
+    DomainError, EntityInput, EntityRef, ObjectInput, ObjectValue, PredicateRef, RetractScope,
+    SpikeRank,
 };
 use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, endpoint_json, ensure_property_in_txn,
@@ -11,11 +12,12 @@ use crate::graph::{
 use crate::iri::{class_iri, name_from_iri, property_iri};
 use crate::layers::{assert_writable_layer, default_write_layer, visible_layers, LayerError};
 use anyhow::{anyhow, Result};
-use neo4rs::{query, Graph, Node, Path, Relation, Txn};
+use neo4rs::{query, Error as Neo4jDriverError, Graph, Neo4jErrorKind, Node, Path, Relation, Txn};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use tokio::time::{sleep, Duration};
 
 const SCHEMA_STRUCTURAL_RELS: &[&str] = &[
     "INSTANCE_OF",
@@ -24,6 +26,30 @@ const SCHEMA_STRUCTURAL_RELS: &[&str] = &[
     "DOMAIN",
     "RANGE",
 ];
+const SYSTEM_OWNED_RELS: &[&str] = &["CONTRADICTS", "SUPERSEDES"];
+
+fn reject_system_owned_predicate(predicate: &str) -> Result<()> {
+    if structural_rel_for(predicate)
+        .as_deref()
+        .is_some_and(|rel| SYSTEM_OWNED_RELS.contains(&rel))
+    {
+        return Err(DomainError::InvalidInput(format!(
+            "predicate {predicate:?} is system-owned and cannot be mutated directly"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn is_transient_neo4j_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<Neo4jDriverError>()
+            .is_some_and(|driver| {
+                matches!(driver, Neo4jDriverError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
+            })
+    })
+}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetArgs {
@@ -56,7 +82,7 @@ pub struct TraverseArgs {
     pub limit: Option<u32>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AssertArgs {
     pub s: EntityInput,
     pub p: String,
@@ -69,7 +95,7 @@ pub struct AssertArgs {
     pub contradicts: bool,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReplaceArgs {
     pub s: EntityInput,
     pub p: String,
@@ -85,7 +111,7 @@ pub struct ReplaceArgs {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RetractTargetArgs {
     pub kind: String,
     pub s: EntityInput,
@@ -95,7 +121,7 @@ pub struct RetractTargetArgs {
     pub o: Option<ObjectInput>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RetractArgs {
     pub target: RetractTargetArgs,
     #[serde(default)]
@@ -104,7 +130,7 @@ pub struct RetractArgs {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SchemaArgs {
     pub kind: String,
     #[serde(default)]
@@ -195,6 +221,9 @@ pub async fn memory_get(graph: &Graph, project: &str, args: GetArgs) -> Result<V
 pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Result<Value> {
     let layers = visible_layers(project);
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as i64;
+    // Bound relationship fan-out before materialization. Rust applies the final
+    // SPIKE/full-text ordering and deterministic tie-break within this window.
+    let candidate_limit = (limit * 20).clamp(100, 2_000);
     let labels = args.labels.unwrap_or_default();
     let text = args.text.unwrap_or_default();
     let trimmed = text.trim().to_string();
@@ -215,63 +244,54 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
 
     if !trimmed.is_empty() {
         let escaped = lucene_escape(&trimmed);
-        for index in ["wakeup_nodes", "entity_fulltext"] {
-            if let Ok(rows) = fetch_all(
-                graph,
-                query(
-                    r#"
-                    CALL db.index.fulltext.queryNodes($index, $q) YIELD node, score
-                    RETURN node.iri AS iri, score
-                    LIMIT $limit
-                    "#,
-                )
-                .param("index", index.to_string())
-                .param("q", escaped.clone())
-                .param("limit", limit * 4),
+        let rows = fetch_all(
+            graph,
+            query(
+                r#"
+                CALL db.index.fulltext.queryNodes('wakeup_nodes', $q) YIELD node, score
+                RETURN node.iri AS iri, score
+                ORDER BY score DESC, iri ASC
+                LIMIT $limit
+                "#,
             )
-            .await
-            {
-                for row in rows {
-                    if let (Ok(iri), Ok(score)) =
-                        (row.get::<String>("iri"), row.get::<f64>("score"))
-                    {
-                        let e = node_scores.entry(iri).or_insert(0.0);
-                        if score > *e {
-                            *e = score;
-                        }
-                    }
+            .param("q", escaped.clone())
+            .param("limit", limit * 4),
+        )
+        .await?;
+        for row in rows {
+            if let (Ok(iri), Ok(score)) = (row.get::<String>("iri"), row.get::<f64>("score")) {
+                let entry = node_scores.entry(iri).or_insert(0.0);
+                if score > *entry {
+                    *entry = score;
                 }
             }
         }
-        for rel_index in ["wakeup_facts", "wakeup_about"] {
-            if let Ok(rows) = fetch_all(
-                graph,
-                query(
-                    r#"
-                CALL db.index.fulltext.queryRelationships($index, $q) YIELD relationship, score
+
+        let rows = fetch_all(
+            graph,
+            query(
+                r#"
+                CALL db.index.fulltext.queryRelationships('wakeup_facts', $q) YIELD relationship, score
                 RETURN id(relationship) AS rid, score
+                ORDER BY score DESC, rid ASC
                 LIMIT $limit
                 "#,
-                )
-                .param("index", rel_index.to_string())
-                .param("q", escaped.clone())
-                .param("limit", limit * 4),
             )
-            .await
-            {
-                for row in rows {
-                    if let (Ok(rid), Ok(score)) = (row.get::<i64>("rid"), row.get::<f64>("score")) {
-                        let e = rel_scores.entry(rid).or_insert(0.0);
-                        if score > *e {
-                            *e = score;
-                        }
-                    }
+            .param("q", escaped)
+            .param("limit", limit * 4),
+        )
+        .await?;
+        for row in rows {
+            if let (Ok(rid), Ok(score)) = (row.get::<i64>("rid"), row.get::<f64>("score")) {
+                let entry = rel_scores.entry(rid).or_insert(0.0);
+                if score > *entry {
+                    *entry = score;
                 }
             }
         }
     }
 
-    let use_contains = node_scores.is_empty() && rel_scores.is_empty();
+    let use_contains = trimmed.is_empty();
     let iris: Vec<String> = node_scores.keys().cloned().collect();
     let rids: Vec<i64> = rel_scores.keys().cloned().collect();
 
@@ -300,7 +320,14 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
                 OR (NOT $useContains AND (s.iri IN $iris OR o.iri IN $iris OR id(r) IN $rids))
               )
             RETURN s, r, o, id(r) AS rid
-            LIMIT $limit
+            ORDER BY
+              CASE WHEN id(r) IN $rids THEN 0 ELSE 1 END,
+              s.iri ASC,
+              coalesce(r.propertyIri, type(r)) ASC,
+              o.iri ASC,
+              r.layer ASC,
+              id(r) ASC
+            LIMIT $candidateLimit
             "#,
         )
         .param("layers", layers.clone())
@@ -310,7 +337,7 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
         .param("text", needle.clone())
         .param("iris", iris)
         .param("rids", rids)
-        .param("limit", limit * 4),
+        .param("candidateLimit", candidate_limit),
     )
     .await?;
 
@@ -385,7 +412,7 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
     let mut seen_spike = HashSet::new();
 
     if !about_iris.is_empty() {
-        if let Ok(sp_rows) = fetch_all(
+        let sp_rows = fetch_all(
             graph,
             query(
                 r#"
@@ -400,43 +427,41 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
             .param("layers", layers.clone())
             .param("iris", about_iris),
         )
-        .await
-        {
-            for row in sp_rows {
-                let sp: Node = match row.get("sp") {
-                    Ok(n) => n,
-                    Err(_) => continue,
-                };
-                let about: String = match row.get("about") {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let labels: Vec<String> = sp
-                    .labels()
-                    .into_iter()
-                    .filter(|l| *l != "Entity")
-                    .map(|s| s.to_string())
-                    .collect();
-                let Some(rank) = spike_label(&labels) else {
-                    continue;
-                };
-                let node = node_json(&sp);
-                let sp_iri = sp.get::<String>("iri").unwrap_or_default();
-                let key = format!("{sp_iri}|{about}");
-                if seen_spike.insert(key) {
-                    spike_list.push(json!({
-                        "node": node.clone(),
-                        "about": about,
-                        "rank": rank,
-                    }));
-                }
-                let better = match spike_by_about.get(&about) {
-                    None => true,
-                    Some((cur, _)) => spike_rank(Some(&rank)) > spike_rank(Some(cur)),
-                };
-                if better {
-                    spike_by_about.insert(about, (rank, node));
-                }
+        .await?;
+        for row in sp_rows {
+            let sp: Node = match row.get("sp") {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            let about: String = match row.get("about") {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let labels: Vec<String> = sp
+                .labels()
+                .into_iter()
+                .filter(|l| *l != "Entity")
+                .map(|s| s.to_string())
+                .collect();
+            let Some(rank) = spike_label(&labels) else {
+                continue;
+            };
+            let node = node_json(&sp);
+            let sp_iri = sp.get::<String>("iri").unwrap_or_default();
+            let key = format!("{sp_iri}|{about}");
+            if seen_spike.insert(key) {
+                spike_list.push(json!({
+                    "node": node.clone(),
+                    "about": about,
+                    "rank": rank,
+                }));
+            }
+            let better = match spike_by_about.get(&about) {
+                None => true,
+                Some((cur, _)) => spike_rank(Some(&rank)) > spike_rank(Some(cur)),
+            };
+            if better {
+                spike_by_about.insert(about, (rank, node));
             }
         }
     }
@@ -457,13 +482,32 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
+            .then_with(|| a.s_iri.cmp(&b.s_iri))
+            .then_with(|| a.p.cmp(&b.p))
+            .then_with(|| a.layer.cmp(&b.layer))
+            .then_with(|| {
+                a.o.get("iri")
+                    .and_then(Value::as_str)
+                    .cmp(&b.o.get("iri").and_then(Value::as_str))
+            })
     });
     facts.truncate(limit as usize);
 
     spike_list.sort_by(|a, b| {
         let ra = a.get("rank").and_then(|v| v.as_str());
         let rb = b.get("rank").and_then(|v| v.as_str());
-        spike_rank(rb).cmp(&spike_rank(ra))
+        spike_rank(rb)
+            .cmp(&spike_rank(ra))
+            .then_with(|| {
+                a.get("about")
+                    .and_then(Value::as_str)
+                    .cmp(&b.get("about").and_then(Value::as_str))
+            })
+            .then_with(|| {
+                a.pointer("/node/iri")
+                    .and_then(Value::as_str)
+                    .cmp(&b.pointer("/node/iri").and_then(Value::as_str))
+            })
     });
 
     let facts_json: Vec<Value> = facts
@@ -550,13 +594,57 @@ pub async fn memory_stats(graph: &Graph, project: &str, _args: StatsArgs) -> Res
         })
         .collect::<Vec<_>>();
 
+    let marker = fetch_one(
+        graph,
+        query("MATCH (m:MindreaderMeta {key: $key}) RETURN m.version AS version")
+            .param("key", MODEL_MARKER_KEY),
+    )
+    .await?;
+    let marker_version = marker.and_then(|row| row.get::<i64>("version").ok());
+    let index_rows = fetch_all(
+        graph,
+        query(
+            "SHOW INDEXES YIELD name, state \
+             WHERE name IN ['wakeup_nodes', 'wakeup_facts'] \
+             RETURN name, state",
+        ),
+    )
+    .await?;
+    let indexes_online = ["wakeup_nodes", "wakeup_facts"].iter().all(|required| {
+        index_rows.iter().any(|row| {
+            row.get::<String>("name").ok().as_deref() == Some(*required)
+                && row.get::<String>("state").ok().as_deref() == Some("ONLINE")
+        })
+    });
+    let constraint_rows = fetch_all(
+        graph,
+        query(
+            "SHOW CONSTRAINTS YIELD name \
+             WHERE name IN ['mindreader_meta_key', 'entity_iri', 'fact_lock_key'] \
+             RETURN name",
+        ),
+    )
+    .await?;
+    let constraints_present = ["mindreader_meta_key", "entity_iri", "fact_lock_key"]
+        .iter()
+        .all(|required| {
+            constraint_rows
+                .iter()
+                .any(|row| row.get::<String>("name").ok().as_deref() == Some(*required))
+        });
+    let model_ready =
+        marker_version == Some(MODEL_VERSION) && indexes_online && constraints_present;
+
     Ok(json!({
         "project": project,
         "layers": layers,
         "model": {
             "marker": MODEL_MARKER_KEY,
-            "version": MODEL_VERSION,
-            "ready": true
+            "version": marker_version,
+            "requiredVersion": MODEL_VERSION,
+            "indexesOnline": indexes_online,
+            "constraintsPresent": constraints_present,
+            "ready": model_ready
         },
         "counts": {
             "nodes": nodes,
@@ -597,7 +685,14 @@ pub async fn memory_traverse(graph: &Graph, project: &str, args: TraverseArgs) -
     let layers = visible_layers(project);
     let rels: Vec<String> = if let Some(rs) = args.rels.filter(|r| !r.is_empty()) {
         rs.into_iter()
-            .map(|r| safe_rel(&r))
+            .map(|relationship| {
+                safe_rel(&relationship).map_err(|_| {
+                    DomainError::InvalidInput(format!(
+                        "invalid relationship type: {relationship:?}"
+                    ))
+                    .into()
+                })
+            })
             .collect::<Result<Vec<_>>>()?
     } else {
         FIXED_RELS.iter().map(|s| (*s).to_string()).collect()
@@ -680,6 +775,20 @@ pub async fn memory_traverse(graph: &Graph, project: &str, args: TraverseArgs) -
 }
 
 pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Result<Value> {
+    for attempt in 0..3_u64 {
+        match memory_assert_once(graph, project, args.clone()).await {
+            Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
+                sleep(Duration::from_millis(25 * (attempt + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+async fn memory_assert_once(graph: &Graph, project: &str, args: AssertArgs) -> Result<Value> {
+    let predicate = PredicateRef::parse(&args.p)?;
+    reject_system_owned_predicate(predicate.iri())?;
     let layer = args
         .layer
         .clone()
@@ -709,7 +818,7 @@ pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Re
         .resolved_iri(&s_kind)
     });
     let object_value = ObjectValue::from_input(args.o)?;
-    let prop_iri = property_iri(&args.p);
+    let prop_iri = predicate.iri().to_string();
     let structural = structural_rel_for(&prop_iri);
     let visible = visible_layers(project);
     let mut txn = graph.start_txn().await?;
@@ -723,6 +832,13 @@ pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Re
                 subject_iri.clone(),
                 "mindreader:property/ABOUT".into(),
                 layer.clone(),
+            ));
+        }
+        if args.contradicts {
+            locks.push((
+                object_value.resolved_iri(),
+                "mindreader:property/CONTRADICTS".into(),
+                GLOBAL_LAYER.into(),
             ));
         }
         acquire_fact_locks_in_txn(&mut txn, &locks).await?;
@@ -841,7 +957,9 @@ pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Re
     let (episode, subject, object, minted_stub, prop_json, conflicts) = match write {
         Ok(v) => {
             if v.0.is_some() {
-                txn.commit().await?;
+                txn.commit()
+                    .await
+                    .map_err(|error| anyhow!("commit memory_assert transaction failed: {error}"))?;
             } else {
                 txn.rollback().await?;
             }
@@ -868,6 +986,20 @@ pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Re
 }
 
 pub async fn memory_replace(graph: &Graph, project: &str, args: ReplaceArgs) -> Result<Value> {
+    for attempt in 0..3_u64 {
+        match memory_replace_once(graph, project, args.clone()).await {
+            Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
+                sleep(Duration::from_millis(25 * (attempt + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+async fn memory_replace_once(graph: &Graph, project: &str, args: ReplaceArgs) -> Result<Value> {
+    let predicate = PredicateRef::parse(&args.p)?;
+    reject_system_owned_predicate(predicate.iri())?;
     let layer = args
         .layer
         .clone()
@@ -895,15 +1027,22 @@ pub async fn memory_replace(graph: &Graph, project: &str, args: ReplaceArgs) -> 
     let old_iri = old_value.resolved_iri();
     let new_value = ObjectValue::from_input(args.new)?;
     let new_iri = new_value.resolved_iri();
-    let prop_iri = property_iri(&args.p);
+    let prop_iri = predicate.iri().to_string();
     let structural = structural_rel_for(&prop_iri);
     let visible = visible_layers(project);
     let mut txn = graph.start_txn().await?;
     let write = async {
-        let locks = visible
+        let mut locks = visible
             .iter()
             .map(|visible_layer| (subject_iri.clone(), prop_iri.clone(), visible_layer.clone()))
             .collect::<Vec<_>>();
+        if args.contradicts {
+            locks.push((
+                new_iri.clone(),
+                "mindreader:property/CONTRADICTS".into(),
+                GLOBAL_LAYER.into(),
+            ));
+        }
         acquire_fact_locks_in_txn(&mut txn, &locks).await?;
         let old_currents = find_current_pairs_txn(
             &mut txn,
@@ -1037,7 +1176,9 @@ pub async fn memory_replace(graph: &Graph, project: &str, args: ReplaceArgs) -> 
     let (episode, subject_json, new_json, minted_stub, prop_json, conflicts) = match write {
         Ok(value) => {
             if value.0.is_some() {
-                txn.commit().await?;
+                txn.commit().await.map_err(|error| {
+                    anyhow!("commit memory_replace transaction failed: {error}")
+                })?;
             } else {
                 txn.rollback().await?;
             }
@@ -1069,10 +1210,8 @@ pub async fn memory_replace(graph: &Graph, project: &str, args: ReplaceArgs) -> 
     }))
 }
 
-#[allow(dead_code)]
 struct CurrentFact {
     rel_id: i64,
-    o_iri: String,
 }
 
 struct FactWrite<'a> {
@@ -1098,62 +1237,6 @@ async fn merge_object_in_txn(
             false,
         )),
     }
-}
-
-#[allow(dead_code)]
-async fn find_current(
-    graph: &Graph,
-    s: &str,
-    prop_iri: &str,
-    structural: Option<&str>,
-    layer: &str,
-) -> Result<Vec<CurrentFact>> {
-    let rows = if let Some(rel) = structural {
-        let rel = safe_rel(rel)?;
-        let q = format!(
-            r#"
-            MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity)
-            WHERE r.validTo IS NULL AND r.layer = $layer
-            RETURN id(r) AS rid, o.iri AS oiri
-            "#
-        );
-        fetch_all(
-            graph,
-            query(&q)
-                .param("s", s.to_string())
-                .param("layer", layer.to_string()),
-        )
-        .await?
-    } else {
-        fetch_all(
-            graph,
-            query(
-                r#"
-                MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity)
-                WHERE r.validTo IS NULL AND r.layer = $layer AND r.propertyIri = $p
-                RETURN id(r) AS rid, o.iri AS oiri
-                "#,
-            )
-            .param("s", s.to_string())
-            .param("layer", layer.to_string())
-            .param("p", prop_iri.to_string()),
-        )
-        .await?
-    };
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(CurrentFact {
-            rel_id: r.get::<i64>("rid")?,
-            o_iri: r.get::<String>("oiri")?,
-        });
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-async fn close_rel(graph: &Graph, rel_id: i64, episode_id: Option<&str>) -> Result<()> {
-    graph.run(close_rel_query(rel_id, episode_id)).await?;
-    Ok(())
 }
 
 fn close_rel_query(rel_id: i64, episode_id: Option<&str>) -> neo4rs::Query {
@@ -1241,12 +1324,6 @@ fn supersedes_query(
     .param("p", prop_iri.to_string())
     .param("layer", layer.to_string())
     .param("episode", episode.iri.clone())
-}
-
-#[allow(dead_code)]
-async fn close_rel_txn(txn: &mut Txn, rel_id: i64, episode_id: Option<&str>) -> Result<()> {
-    txn.run(close_rel_query(rel_id, episode_id)).await?;
-    Ok(())
 }
 
 async fn close_rel_txn_with_reason(
@@ -1351,6 +1428,18 @@ pub async fn count_historical_asserts(graph: &Graph, s: &str, p: &str, layer: &s
 }
 
 pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> Result<Value> {
+    for attempt in 0..3_u64 {
+        match memory_retract_once(graph, project, args.clone()).await {
+            Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
+                sleep(Duration::from_millis(25 * (attempt + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+async fn memory_retract_once(graph: &Graph, project: &str, args: RetractArgs) -> Result<Value> {
     let layer = args
         .layer
         .clone()
@@ -1359,7 +1448,15 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
     let scope = RetractScope::parse(&args.target.kind)?;
     let subject = EntityRef::from_input(args.target.s)?;
     let subject_iri = subject.resolved_iri("element");
-    let predicate = args.target.p.as_deref().map(property_iri);
+    let predicate = args
+        .target
+        .p
+        .map(PredicateRef::parse)
+        .transpose()?
+        .map(|predicate| predicate.iri().to_string());
+    if let Some(predicate) = &predicate {
+        reject_system_owned_predicate(predicate)?;
+    }
     let object_iri = args
         .target
         .o
@@ -1391,6 +1488,7 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
 
     let protected: Vec<String> = SCHEMA_STRUCTURAL_RELS
         .iter()
+        .chain(SYSTEM_OWNED_RELS)
         .map(|value| (*value).to_string())
         .collect();
     let mut txn = graph.start_txn().await?;
@@ -1487,7 +1585,9 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
         )
         .await?;
     }
-    txn.commit().await?;
+    txn.commit()
+        .await
+        .map_err(|error| anyhow!("commit memory_retract transaction failed: {error}"))?;
 
     Ok(json!({
         "retracted": relationship_ids.len(),
@@ -1499,21 +1599,45 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
 }
 
 pub async fn memory_schema(graph: &Graph, project: &str, args: SchemaArgs) -> Result<Value> {
+    for attempt in 0..3_u64 {
+        match memory_schema_once(graph, project, args.clone()).await {
+            Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
+                sleep(Duration::from_millis(25 * (attempt + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop always returns")
+}
+
+async fn memory_schema_once(graph: &Graph, project: &str, args: SchemaArgs) -> Result<Value> {
     let kind = args.kind.trim().to_ascii_lowercase();
     if kind != "class" && kind != "property" {
-        return Err(anyhow!("kind must be class or property"));
+        return Err(DomainError::InvalidInput("kind must be class or property".into()).into());
     }
     let seed = args
         .iri
         .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
         .or(args.name.as_deref())
-        .ok_or_else(|| anyhow!("memory_schema needs name or iri"))?;
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DomainError::InvalidInput("memory_schema requires a nonempty name or iri".into())
+        })?;
     let iri = if kind == "class" {
         class_iri(seed)
     } else {
         property_iri(seed)
     };
-    let name = args.name.clone().unwrap_or_else(|| name_from_iri(&iri));
+    let name = args
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| name_from_iri(&iri));
     if kind == "class"
         && (args.sub_property_of.is_some() || args.domain.is_some() || args.range.is_some())
     {
@@ -1527,6 +1651,19 @@ pub async fn memory_schema(graph: &Graph, project: &str, args: SchemaArgs) -> Re
             "property schema declarations do not accept subClassOf".into(),
         )
         .into());
+    }
+    for (field, value) in [
+        ("subClassOf", args.sub_class_of.as_deref()),
+        ("subPropertyOf", args.sub_property_of.as_deref()),
+        ("domain", args.domain.as_deref()),
+        ("range", args.range.as_deref()),
+    ] {
+        if value.is_some_and(|value| value.trim().is_empty()) {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_schema {field} cannot be empty"
+            ))
+            .into());
+        }
     }
 
     let label = if kind == "class" { "Class" } else { "Property" };
@@ -1695,7 +1832,9 @@ pub async fn memory_schema(graph: &Graph, project: &str, args: SchemaArgs) -> Re
     let (episode, node, links) = match write {
         Ok(value) => {
             if value.0.is_some() {
-                txn.commit().await?;
+                txn.commit()
+                    .await
+                    .map_err(|error| anyhow!("commit memory_schema transaction failed: {error}"))?;
             } else {
                 txn.rollback().await?;
             }
@@ -1714,107 +1853,6 @@ pub async fn memory_schema(graph: &Graph, project: &str, args: SchemaArgs) -> Re
         "noop": episode.is_none(),
         "episode": episode.map(|episode| json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool })).unwrap_or(Value::Null),
     }))
-}
-
-#[allow(dead_code)]
-async fn ensure_link(
-    graph: &Graph,
-    s: &str,
-    rel: &str,
-    o: &str,
-    prop_iri: &str,
-    layer: &str,
-    episode: &Episode,
-) -> Result<()> {
-    let currents = find_current(graph, s, prop_iri, Some(rel), layer).await?;
-    if !currents.is_empty() && currents.iter().all(|c| c.o_iri == o) {
-        return Ok(());
-    }
-    let ft = format!("{s} {rel} {o}");
-    let mut txn = graph.start_txn().await?;
-    let write = async {
-        for cur in &currents {
-            close_rel_txn(&mut txn, cur.rel_id, Some(&episode.iri)).await?;
-        }
-        create_structural_txn(
-            &mut txn,
-            rel,
-            &FactWrite {
-                s,
-                o,
-                prop_iri,
-                layer,
-                episode,
-                reason: None,
-                fact_text: &ft,
-            },
-        )
-        .await?;
-        Ok::<_, anyhow::Error>(())
-    }
-    .await;
-    match write {
-        Ok(()) => {
-            txn.commit().await?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = txn.rollback().await;
-            Err(e)
-        }
-    }
-}
-
-#[allow(dead_code)]
-async fn find_current_pair(
-    graph: &Graph,
-    s: &str,
-    prop_iri: &str,
-    structural: Option<&str>,
-    layer: &str,
-    o: &str,
-) -> Result<Option<CurrentFact>> {
-    let row = if let Some(rel) = structural {
-        let rel = safe_rel(rel)?;
-        let q = format!(
-            r#"
-            MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity {{iri: $o}})
-            WHERE r.validTo IS NULL AND r.layer = $layer
-            RETURN id(r) AS rid, o.iri AS oiri
-            "#
-        );
-        fetch_one(
-            graph,
-            query(&q)
-                .param("s", s.to_string())
-                .param("o", o.to_string())
-                .param("layer", layer.to_string()),
-        )
-        .await?
-    } else {
-        fetch_one(
-            graph,
-            query(
-                r#"
-                MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity {iri: $o})
-                WHERE r.validTo IS NULL AND r.layer = $layer AND r.propertyIri = $p
-                RETURN id(r) AS rid, o.iri AS oiri
-                "#,
-            )
-            .param("s", s.to_string())
-            .param("o", o.to_string())
-            .param("layer", layer.to_string())
-            .param("p", prop_iri.to_string()),
-        )
-        .await?
-    };
-    Ok(match row {
-        Some(r) => Some(CurrentFact {
-            rel_id: r.get::<i64>("rid")?,
-            o_iri: r.get::<String>("oiri")?,
-        }),
-        None => None,
-    })
 }
 
 async fn find_current_pairs_txn(
@@ -1859,7 +1897,6 @@ async fn find_current_pairs_txn(
         .map(|row| {
             Ok(CurrentFact {
                 rel_id: row.get("rid")?,
-                o_iri: row.get("oiri")?,
             })
         })
         .collect()
@@ -1994,109 +2031,6 @@ async fn write_contradicts_txn(
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn find_conflicts(
-    graph: &Graph,
-    s: &str,
-    prop_iri: &str,
-    structural: Option<&str>,
-    write_layer: &str,
-    o_iri: &str,
-    layers: &[String],
-) -> Result<Vec<Value>> {
-    let rel_type = structural.unwrap_or("ASSERTS");
-    let is_structural = structural.is_some();
-    let rows = fetch_all(
-        graph,
-        query(
-            r#"
-            MATCH (s:Entity {iri: $s})-[r]->(o:Entity)
-            WHERE r.validTo IS NULL
-              AND r.layer IN $layers
-              AND r.layer <> $layer
-              AND o.iri <> $o
-              AND (
-                ($isStructural AND type(r) = $relType)
-                OR (NOT $isStructural AND type(r) = 'ASSERTS' AND r.propertyIri = $p)
-              )
-            RETURN r.layer AS layer, o, coalesce(r.propertyIri, $p) AS p
-            "#,
-        )
-        .param("s", s.to_string())
-        .param("o", o_iri.to_string())
-        .param("layer", write_layer.to_string())
-        .param("layers", layers.to_vec())
-        .param("p", prop_iri.to_string())
-        .param("relType", rel_type.to_string())
-        .param("isStructural", is_structural),
-    )
-    .await?;
-    let mut out = Vec::new();
-    for row in rows {
-        let layer: String = match row.get("layer") {
-            Ok(s) => s,
-            Err(_) => continue,
-        };
-        let o: Node = match row.get("o") {
-            Ok(n) => n,
-            Err(_) => continue,
-        };
-        let p: String = row.get("p").unwrap_or_else(|_| prop_iri.to_string());
-        out.push(json!({
-            "layer": layer,
-            "o": endpoint_json(&o),
-            "p": p,
-        }));
-    }
-    Ok(out)
-}
-
-#[allow(dead_code)]
-async fn write_contradicts(
-    graph: &Graph,
-    new_o: &str,
-    conflicts: &[Value],
-    layer: &str,
-    episode: &Episode,
-) -> Result<()> {
-    for c in conflicts {
-        let Some(old_o) = c
-            .get("o")
-            .and_then(|o| o.get("iri"))
-            .and_then(|v| v.as_str())
-        else {
-            continue;
-        };
-        let ft = format!("{new_o} CONTRADICTS {old_o}");
-        graph
-            .run(
-                query(
-                    r#"
-                    MATCH (n:Entity {iri: $new}), (old:Entity {iri: $old})
-                    OPTIONAL MATCH (n)-[existing:CONTRADICTS]->(old)
-                    WHERE existing.validTo IS NULL
-                    WITH n, old, existing
-                    WHERE existing IS NULL
-                    CREATE (n)-[r:CONTRADICTS {
-                        propertyIri: 'mindreader:property/CONTRADICTS',
-                        layer: $layer,
-                        validFrom: datetime(),
-                        episodeId: $episode,
-                        factText: $factText
-                    }]->(old)
-                    "#,
-                )
-                .param("new", new_o.to_string())
-                .param("old", old_o.to_string())
-                .param("layer", layer.to_string())
-                .param("episode", episode.iri.clone())
-                .param("factText", ft),
-            )
-            .await?;
-    }
-    Ok(())
-}
-
 pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> Result<i64> {
     let row = fetch_one(
         graph,
@@ -2119,11 +2053,20 @@ pub fn map_tool_error(err: anyhow::Error) -> rmcp::model::ErrorData {
     if let Some(layer) = err.downcast_ref::<LayerError>() {
         return McpError::invalid_params(layer.0.clone(), None);
     }
+    if let Some(domain) = err.downcast_ref::<DomainError>() {
+        let reason = match domain {
+            DomainError::InvalidInput(_) => "invalid_input",
+            DomainError::Precondition(_) => "precondition_failed",
+        };
+        return McpError::invalid_params(domain.to_string(), Some(json!({ "reason": reason })));
+    }
     McpError::internal_error(err.to_string(), None)
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{map_tool_error, reject_system_owned_predicate};
+    use crate::domain::DomainError;
     use crate::graph::spike_rank;
 
     #[test]
@@ -2145,22 +2088,34 @@ mod tests {
     }
 
     #[test]
-    fn find_current_returns_all_matches() {
+    fn transactional_pair_lookup_returns_all_matches() {
         let src = include_str!("tools.rs");
-        let start = src.find("async fn find_current(").expect("find_current");
-        let pair = src
-            .find("async fn find_current_pair(")
-            .expect("find_current_pair");
+        let start = src
+            .find("async fn find_current_pairs_txn(")
+            .expect("find_current_pairs_txn");
         let end = src
-            .find("async fn find_conflicts(")
-            .expect("find_conflicts");
+            .find("async fn find_current_pair_txn(")
+            .expect("find_current_pair_txn");
         assert!(
-            !src[start..pair].contains("LIMIT 1"),
-            "find_current must return/close ALL current (s,p,layer) matches"
+            !src[start..end].contains("LIMIT 1"),
+            "replacement must close every duplicate current exact fact"
         );
-        assert!(
-            !src[pair..end].contains("LIMIT 1"),
-            "find_current_pair must not LIMIT 1; CONTRADICTS stays multi-valued via pair match, not close-all"
+    }
+
+    #[test]
+    fn system_owned_history_predicates_are_not_client_writable() {
+        assert!(reject_system_owned_predicate("SUPERSEDES").is_err());
+        assert!(reject_system_owned_predicate("mindreader:property/CONTRADICTS").is_err());
+        assert!(reject_system_owned_predicate("worksOn").is_ok());
+    }
+
+    #[test]
+    fn domain_errors_are_mcp_invalid_params() {
+        let error = map_tool_error(DomainError::Precondition("missing old fact".into()).into());
+        assert_eq!(error.code.0, -32602);
+        assert_eq!(
+            error.data.and_then(|data| data.get("reason").cloned()),
+            Some(serde_json::json!("precondition_failed"))
         );
     }
 }

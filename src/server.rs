@@ -70,9 +70,9 @@ fn entity_input_schema() -> serde_json::Value {
         "description": "An entity reference. Runtime validation requires at least one of iri or name.",
         "properties": {
             "kind": { "type": "string", "enum": ["entity"] },
-            "iri": { "type": "string" },
-            "name": { "type": "string" },
-            "labels": { "type": "array", "items": { "type": "string" } }
+            "iri": { "type": "string", "minLength": 1 },
+            "name": { "type": "string", "minLength": 1 },
+            "labels": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$" } }
         },
         "required": ["kind"]
     })
@@ -84,11 +84,11 @@ fn object_input_schema() -> serde_json::Value {
         "description": "A tagged entity or literal. Entity values use iri/name/labels; literal values use value and optional datatype.",
         "properties": {
             "kind": { "type": "string", "enum": ["entity", "literal"] },
-            "iri": { "type": "string" },
-            "name": { "type": "string" },
-            "labels": { "type": "array", "items": { "type": "string" } },
+            "iri": { "type": "string", "minLength": 1 },
+            "name": { "type": "string", "minLength": 1 },
+            "labels": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$" } },
             "value": { "type": "string" },
-            "datatype": { "type": "string", "default": "xsd:string" }
+            "datatype": { "type": "string", "minLength": 1, "default": "xsd:string" }
         },
         "required": ["kind"]
     })
@@ -100,7 +100,7 @@ fn schema_memory_assert() -> Arc<rmcp::model::JsonObject> {
         "type": "object",
         "properties": {
             "s": entity_input_schema(),
-            "p": { "type": "string" },
+            "p": { "type": "string", "minLength": 1 },
             "o": object_input_schema(),
             "layer": { "type": "string" },
             "spike": {
@@ -118,7 +118,7 @@ fn schema_memory_replace() -> Arc<rmcp::model::JsonObject> {
         "type": "object",
         "properties": {
             "s": entity_input_schema(),
-            "p": { "type": "string" },
+            "p": { "type": "string", "minLength": 1 },
             "old": object_input_schema(),
             "new": object_input_schema(),
             "layer": { "type": "string" },
@@ -146,7 +146,7 @@ fn schema_memory_retract() -> Arc<rmcp::model::JsonObject> {
                         "enum": ["fact", "predicate", "subject"]
                     },
                     "s": entity_input_schema(),
-                    "p": { "type": "string" },
+                    "p": { "type": "string", "minLength": 1 },
                     "o": object_input_schema()
                 },
                 "required": ["kind", "s"]
@@ -163,12 +163,12 @@ fn schema_memory_schema() -> Arc<rmcp::model::JsonObject> {
         "type": "object",
         "properties": {
             "kind": { "type": "string", "enum": ["class", "property"] },
-            "name": { "type": "string" },
-            "iri": { "type": "string" },
-            "subClassOf": { "type": "string" },
-            "subPropertyOf": { "type": "string" },
-            "domain": { "type": "string" },
-            "range": { "type": "string" }
+            "name": { "type": "string", "minLength": 1 },
+            "iri": { "type": "string", "minLength": 1 },
+            "subClassOf": { "type": "string", "minLength": 1 },
+            "subPropertyOf": { "type": "string", "minLength": 1 },
+            "domain": { "type": "string", "minLength": 1 },
+            "range": { "type": "string", "minLength": 1 }
         },
         "required": ["kind"]
     }))
@@ -284,7 +284,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_stats",
-        description = "Operational counters for nodes, active/historical edges, episodes, and per-layer active edge totals visible to this project.",
+        description = "Operational graph-model readiness plus counters for nodes, active/historical edges, episodes, and per-layer active edge totals visible to this project.",
         input_schema = schema_memory_stats()
     )]
     async fn memory_stats(
@@ -297,7 +297,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_assert",
-        description = "Use to add one exact fact as a triple (s, p, o). Facts are set-valued: another current object for the same subject and property remains current. Reasserting the exact current triple is a no-op. Optional spike labels this as Signal, Pattern, Insight, or Knowledge ABOUT an Element. Optional contradicts=true records a fight with another visible layer's current (s,p). Encode a triple — do not dump prose or markdown.",
+        description = "Use to add one exact fact as a triple (s, p, o). Facts are set-valued: another current object for the same subject and property remains current. Reasserting the exact current triple is a no-op. Optional spike labels this as Signal, Pattern, Insight, or Knowledge ABOUT an Element. Optional contradicts=true records a fight with another visible layer's current (s,p). CONTRADICTS and SUPERSEDES are system-owned. Encode a triple — do not dump prose or markdown.",
         input_schema = schema_memory_assert()
     )]
     async fn memory_assert(
@@ -323,7 +323,7 @@ impl Mindreader {
 
     #[tool(
         name = "memory_retract",
-        description = "Use to withdraw current facts you no longer stand behind. Retraction is soft (validTo); nodes and history are never deleted. target.kind=fact closes one exact triple, predicate intentionally closes all objects for one subject/property, and subject intentionally closes retractable outgoing facts for one subject. Omit layer to use this project's write layer. Use memory_replace for corrections.",
+        description = "Use to withdraw current facts you no longer stand behind. Retraction is soft (validTo); nodes and system-owned history are preserved. target.kind=fact closes one exact triple, predicate intentionally closes all objects for one subject/property, and subject intentionally closes retractable outgoing facts for one subject. Omit layer to use this project's write layer. Use memory_replace for corrections.",
         input_schema = schema_memory_retract()
     )]
     async fn memory_retract(
@@ -450,6 +450,11 @@ mod tests {
             assert_props["o"]["properties"]["kind"]["enum"],
             serde_json::json!(["entity", "literal"])
         );
+        assert_eq!(assert_props["p"]["minLength"], 1);
+        assert_eq!(
+            assert_props["s"]["properties"]["labels"]["items"]["pattern"],
+            "^[A-Za-z][A-Za-z0-9_]*$"
+        );
         let required = assert_schema
             .get("required")
             .and_then(|r| r.as_array())
@@ -471,6 +476,7 @@ mod tests {
         }
         assert_eq!(replace_schema["properties"]["old"]["type"], "object");
         assert_eq!(replace_schema["properties"]["new"]["type"], "object");
+        assert_eq!(replace_schema["properties"]["p"]["minLength"], 1);
 
         let retract_schema = tools
             .iter()
@@ -485,6 +491,7 @@ mod tests {
         );
         assert_eq!(target["properties"]["s"]["type"], "object");
         assert_eq!(target["properties"]["o"]["type"], "object");
+        assert_eq!(target["properties"]["p"]["minLength"], 1);
     }
 
     #[test]

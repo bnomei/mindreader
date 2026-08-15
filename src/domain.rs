@@ -39,6 +39,32 @@ impl ProjectId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PredicateRef(String);
+
+impl PredicateRef {
+    pub fn parse(value: impl Into<String>) -> Result<Self, DomainError> {
+        let value = value.into();
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(DomainError::InvalidInput(
+                "predicate cannot be empty".into(),
+            ));
+        }
+        let iri = crate::iri::property_iri(trimmed);
+        if crate::iri::name_from_iri(&iri).trim().is_empty() {
+            return Err(DomainError::InvalidInput(format!(
+                "predicate has no local name: {trimmed:?}"
+            )));
+        }
+        Ok(Self(iri))
+    }
+
+    pub fn iri(&self) -> &str {
+        &self.0
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EntityInput {
     pub kind: String,
@@ -170,10 +196,21 @@ fn validate_entity_parts(
             )));
         }
     }
-    if labels.iter().any(|label| label.trim().is_empty()) {
-        return Err(DomainError::InvalidInput(
-            "entity labels cannot be empty".into(),
-        ));
+    for label in &labels {
+        let Some(first) = label.chars().next() else {
+            return Err(DomainError::InvalidInput(
+                "entity labels cannot be empty".into(),
+            ));
+        };
+        if !first.is_ascii_alphabetic()
+            || !label
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            return Err(DomainError::InvalidInput(format!(
+                "invalid entity label: {label:?}"
+            )));
+        }
     }
     Ok(EntityRef { iri, name, labels })
 }
@@ -247,7 +284,7 @@ impl RetractScope {
 
 #[cfg(test)]
 mod tests {
-    use super::{literal_iri, EntityInput, EntityRef, ObjectInput, ObjectValue};
+    use super::{literal_iri, EntityInput, EntityRef, ObjectInput, ObjectValue, PredicateRef};
 
     #[test]
     fn tagged_inputs_reject_ambiguous_shapes() {
@@ -278,6 +315,15 @@ mod tests {
         assert_ne!(
             literal_iri("42", "xsd:integer"),
             literal_iri("42", "xsd:string")
+        );
+    }
+
+    #[test]
+    fn predicates_are_nonempty_and_canonical() {
+        assert!(PredicateRef::parse("   ").is_err());
+        assert_eq!(
+            PredicateRef::parse(" worksOn ").unwrap().iri(),
+            "mindreader:property/worksOn"
         );
     }
 }
