@@ -1,0 +1,30 @@
+[package]
+name = "mindreader"
+version = "0.1.0"
+edition = "2021"
+description = "Neo4j RDFS schema-as-data memory MCP server"
+publish = false
+
+[lib]
+name = "mindreader"
+path = "src/lib.rs"
+
+[[bin]]
+name = "mindreader"
+path = "src/main.rs"
+
+[[bin]]
+name = "mindreader-smoke"
+path = "src/bin/mindreader-smoke.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+dotenvy = "0.15.7"
+neo4rs = "0.8.0"
+rmcp = { version = "0.8.3", features = ["server", "transport-io", "macros", "schemars"] }
+schemars = "1.2.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
+uuid = { version = "1.24.1", features = ["v4"] }
