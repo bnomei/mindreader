@@ -1,0 +1,25 @@
+{
+  "name": "mindreader",
+  "version": "0.1.0",
+  "description": "Deterministic, privacy-first Neo4j memory MCP server",
+  "transport": {
+    "type": "stdio",
+    "command": "mindreader",
+    "args": []
+  },
+  "environment": [
+    "NEO4J_URI",
+    "NEO4J_USER",
+    "NEO4J_PASSWORD",
+    "MINDREADER_PROJECT"
+  ],
+  "tools": [
+    "memory_get",
+    "memory_search",
+    "memory_traverse",
+    "memory_stats",
+    "memory_assert",
+    "memory_retract",
+    "memory_schema"
+  ]
+}

@@ -7,6 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use neo4rs::{query, Graph, Node, Path, Relation, Row, Txn, UnboundedRelation};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 pub const FIXED_RELS: &[&str] = &[
@@ -56,25 +57,50 @@ pub const WAKEUP_RELS: &[&str] = &[
 const LABEL_OK: &str = "label";
 
 pub async fn connect(cfg: &Config) -> Result<Graph> {
-    match Graph::new(cfg.uri.as_str(), cfg.user.as_str(), cfg.password.as_str()).await {
-        Ok(g) => Ok(g),
-        Err(first) => {
-            let stripped = cfg
-                .uri
-                .trim_start_matches("bolt://")
-                .trim_start_matches("neo4j://")
-                .trim_start_matches("bolt+s://")
-                .trim_start_matches("neo4j+s://");
-            Graph::new(stripped, cfg.user.as_str(), cfg.password.as_str())
-                .await
-                .map_err(|second| {
-                    anyhow!(
-                        "neo4j connect failed at {} ({first}); retry at {stripped}: {second}",
-                        cfg.uri
-                    )
-                })
+    let stripped = cfg
+        .uri
+        .trim_start_matches("bolt://")
+        .trim_start_matches("neo4j://")
+        .trim_start_matches("bolt+s://")
+        .trim_start_matches("neo4j+s://")
+        .to_string();
+    let mut endpoints = vec![cfg.uri.clone()];
+    if stripped != cfg.uri {
+        endpoints.push(stripped);
+    }
+
+    let mut errors = Vec::new();
+    for attempt in 1..=3 {
+        for endpoint in &endpoints {
+            match Graph::new(endpoint.as_str(), cfg.user.as_str(), cfg.password.as_str()).await {
+                Ok(g) => {
+                    if attempt > 1 {
+                        eprintln!(
+                            "{}",
+                            json!({
+                                "level": "info",
+                                "event": "neo4j_connect_recovered",
+                                "attempt": attempt,
+                                "endpoint": endpoint
+                            })
+                        );
+                    }
+                    return Ok(g);
+                }
+                Err(err) => {
+                    errors.push(format!("attempt={attempt} endpoint={endpoint} error={err}"))
+                }
+            }
+        }
+        if attempt < 3 {
+            sleep(Duration::from_millis(250 * attempt as u64)).await;
         }
     }
+
+    Err(anyhow!(
+        "neo4j connect failed after retries: {}",
+        errors.join(" | ")
+    ))
 }
 
 pub async fn bootstrap(graph: &Graph) -> Result<()> {
@@ -198,9 +224,10 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
 }
 
 pub fn safe_label(label: &str) -> Result<String> {
-    if label.is_empty()
-        || !label.chars().next().unwrap().is_ascii_alphabetic()
-        || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+    let Some(first) = label.chars().next() else {
+        return Err(anyhow!("invalid label: {label}"));
+    };
+    if !first.is_ascii_alphabetic() || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
         return Err(anyhow!("invalid label: {label}"));
     }
@@ -210,9 +237,13 @@ pub fn safe_label(label: &str) -> Result<String> {
 
 pub fn safe_rel(rel: &str) -> Result<String> {
     let up = rel.to_ascii_uppercase();
-    if up.is_empty()
-        || !up.chars().next().unwrap().is_ascii_uppercase()
-        || !up.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    let Some(first) = up.chars().next() else {
+        return Err(anyhow!("invalid relationship type: {rel}"));
+    };
+    if !first.is_ascii_uppercase()
+        || !up
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
         return Err(anyhow!("invalid relationship type: {rel}"));
     }
@@ -226,7 +257,10 @@ pub fn structural_rel_for(property: &str) -> Option<String> {
     if STRUCTURAL.contains(&candidate.as_str()) {
         return Some(candidate);
     }
-    if STRUCTURAL.iter().any(|s| iri == format!("mindreader:property/{s}")) {
+    if STRUCTURAL
+        .iter()
+        .any(|s| iri == format!("mindreader:property/{s}"))
+    {
         return Some(name.to_ascii_uppercase());
     }
     None
@@ -408,10 +442,7 @@ pub async fn merge_node(
         let seed = spec.name.as_deref().unwrap_or("unnamed");
         mint_iri(&kind, seed, default_lower_for_kind(&kind))
     };
-    let name = spec
-        .name
-        .clone()
-        .unwrap_or_else(|| name_from_iri(&iri));
+    let name = spec.name.clone().unwrap_or_else(|| name_from_iri(&iri));
     let mut labels = Vec::new();
     if let Some(l) = label_for_kind(&kind) {
         labels.push(l.to_string());
@@ -446,9 +477,13 @@ pub async fn merge_node(
     let created: bool = row.get("created").unwrap_or(false);
 
     if !labels.is_empty() {
-        let set = labels
+        let set_labels = labels
             .iter()
-            .map(|l| format!("n:{}", safe_label(l).unwrap()))
+            .map(|l| safe_label(l))
+            .collect::<Result<Vec<_>>>()?;
+        let set = set_labels
+            .iter()
+            .map(|l| format!("n:{l}"))
             .collect::<Vec<_>>()
             .join(" SET ");
         let q = format!("MATCH (n:Entity {{iri: $iri}}) SET {set} RETURN n");
@@ -574,7 +609,11 @@ pub async fn create_episode(graph: &Graph, tool: &str, note: Option<&str>) -> Re
     episode_from_row(&row, tool)
 }
 
-pub async fn create_episode_in_txn(txn: &mut Txn, tool: &str, note: Option<&str>) -> Result<Episode> {
+pub async fn create_episode_in_txn(
+    txn: &mut Txn,
+    tool: &str,
+    note: Option<&str>,
+) -> Result<Episode> {
     let iri = mint_iri("episode", &Uuid::new_v4().to_string(), true);
     let mut stream = txn.execute(episode_query(&iri, tool, note)).await?;
     let row = stream
@@ -687,7 +726,7 @@ pub fn spike_rank(label: Option<&str>) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::spike_rank;
+    use super::{safe_label, safe_rel, spike_rank};
 
     #[test]
     fn spike_rank_orders() {
@@ -695,5 +734,22 @@ mod tests {
         assert!(spike_rank(Some("Insight")) > spike_rank(Some("Pattern")));
         assert!(spike_rank(Some("Pattern")) > spike_rank(Some("Signal")));
         assert!(spike_rank(Some("Signal")) > spike_rank(None));
+    }
+
+    #[test]
+    fn safe_label_rejects_injection_shapes() {
+        assert!(safe_label("Element").is_ok());
+        assert!(safe_label("").is_err());
+        assert!(safe_label("1Element").is_err());
+        assert!(safe_label("Element-Bad").is_err());
+        assert!(safe_label("Element SET n.pwned=true").is_err());
+    }
+
+    #[test]
+    fn safe_rel_rejects_injection_shapes() {
+        assert_eq!(safe_rel("asserts").unwrap(), "ASSERTS");
+        assert!(safe_rel("").is_err());
+        assert!(safe_rel("ASSERTS-BAD").is_err());
+        assert!(safe_rel("ASSERTS MATCH (n)").is_err());
     }
 }

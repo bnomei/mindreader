@@ -2,7 +2,7 @@ use crate::config::GLOBAL_LAYER;
 use crate::graph::{
     create_episode, create_episode_in_txn, endpoint_json, ensure_property, fact_text, fetch_all,
     fetch_one, get_node, merge_literal, merge_node, node_json, path_to_json, rel_json, safe_rel,
-    spike_label, spike_rank, structural_rel_for, touch_search_text, Episode, FIXED_RELS, NodeSpec,
+    spike_label, spike_rank, structural_rel_for, touch_search_text, Episode, NodeSpec, FIXED_RELS,
     SPIKE,
 };
 use crate::iri::{class_iri, is_iri, name_from_iri, property_iri};
@@ -22,7 +22,6 @@ const SCHEMA_STRUCTURAL_RELS: &[&str] = &[
     "RANGE",
 ];
 
-
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct GetArgs {
     pub iri: String,
@@ -39,6 +38,9 @@ pub struct SearchArgs {
     #[serde(default)]
     pub limit: Option<u32>,
 }
+
+#[derive(Debug, Deserialize, JsonSchema, Default)]
+pub struct StatsArgs {}
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TraverseArgs {
@@ -139,7 +141,9 @@ fn parse_node_spec(v: &Value) -> Result<NodeSpec> {
             }
             Ok(NodeSpec { iri, name, labels })
         }
-        _ => Err(anyhow!("subject/object must be a string IRI/name or {{iri,name,labels}}")),
+        _ => Err(anyhow!(
+            "subject/object must be a string IRI/name or {{iri,name,labels}}"
+        )),
     }
 }
 
@@ -165,7 +169,11 @@ fn parse_object(v: &Value) -> Result<ObjectKind> {
                 datatype: datatype.into(),
             })
         }
-        Value::Object(map) if map.contains_key("value") && !map.contains_key("iri") && !map.contains_key("name") => {
+        Value::Object(map)
+            if map.contains_key("value")
+                && !map.contains_key("iri")
+                && !map.contains_key("name") =>
+        {
             let value = match &map["value"] {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
@@ -296,30 +304,30 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
             }
         }
         for rel_index in ["wakeup_facts", "wakeup_about"] {
-        if let Ok(rows) = fetch_all(
-            graph,
-            query(
-                r#"
+            if let Ok(rows) = fetch_all(
+                graph,
+                query(
+                    r#"
                 CALL db.index.fulltext.queryRelationships($index, $q) YIELD relationship, score
                 RETURN id(relationship) AS rid, score
                 LIMIT $limit
                 "#,
+                )
+                .param("index", rel_index.to_string())
+                .param("q", escaped.clone())
+                .param("limit", limit * 4),
             )
-            .param("index", rel_index.to_string())
-            .param("q", escaped.clone())
-            .param("limit", limit * 4),
-        )
-        .await
-        {
-            for row in rows {
-                if let (Ok(rid), Ok(score)) = (row.get::<i64>("rid"), row.get::<f64>("score")) {
-                    let e = rel_scores.entry(rid).or_insert(0.0);
-                    if score > *e {
-                        *e = score;
+            .await
+            {
+                for row in rows {
+                    if let (Ok(rid), Ok(score)) = (row.get::<i64>("rid"), row.get::<f64>("score")) {
+                        let e = rel_scores.entry(rid).or_insert(0.0);
+                        if score > *e {
+                            *e = score;
+                        }
                     }
                 }
             }
-        }
         }
     }
 
@@ -389,9 +397,7 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
         let p = r
             .get::<String>("propertyIri")
             .unwrap_or_else(|_| format!("mindreader:property/{}", r.typ()));
-        let layer = r
-            .get::<String>("layer")
-            .unwrap_or_else(|_| "global".into());
+        let layer = r.get::<String>("layer").unwrap_or_else(|_| "global".into());
         let key = format!("{s_iri}|{p}|{o_iri}|{layer}");
         if !seen_facts.insert(key) {
             continue;
@@ -543,6 +549,80 @@ pub async fn memory_search(graph: &Graph, project: &str, args: SearchArgs) -> Re
     }))
 }
 
+pub async fn memory_stats(graph: &Graph, project: &str, _args: StatsArgs) -> Result<Value> {
+    let layers = visible_layers(project);
+    let row = fetch_one(
+        graph,
+        query(
+            r#"
+            MATCH (n:Entity)
+            WITH count(n) AS nodes
+            CALL {
+              MATCH ()-[r]->()
+              WHERE r.validTo IS NULL AND r.layer IN $layers
+              RETURN count(r) AS activeEdges
+            }
+            CALL {
+              MATCH ()-[r]->()
+              WHERE r.validTo IS NOT NULL AND r.layer IN $layers
+              RETURN count(r) AS historicalEdges
+            }
+            CALL {
+              MATCH (e:Entity:Episode)
+              RETURN count(e) AS episodes
+            }
+            RETURN nodes, activeEdges, historicalEdges, episodes
+            "#,
+        )
+        .param("layers", layers.clone()),
+    )
+    .await?;
+    let (nodes, active_edges, historical_edges, episodes) = match row {
+        Some(r) => (
+            r.get::<i64>("nodes").unwrap_or(0),
+            r.get::<i64>("activeEdges").unwrap_or(0),
+            r.get::<i64>("historicalEdges").unwrap_or(0),
+            r.get::<i64>("episodes").unwrap_or(0),
+        ),
+        None => (0, 0, 0, 0),
+    };
+
+    let layer_rows = fetch_all(
+        graph,
+        query(
+            r#"
+            MATCH ()-[r]->()
+            WHERE r.validTo IS NULL AND r.layer IN $layers
+            RETURN r.layer AS layer, count(r) AS count
+            ORDER BY count DESC, layer ASC
+            "#,
+        )
+        .param("layers", layers.clone()),
+    )
+    .await?;
+    let by_layer = layer_rows
+        .into_iter()
+        .map(|r| {
+            json!({
+                "layer": r.get::<String>("layer").unwrap_or_default(),
+                "count": r.get::<i64>("count").unwrap_or(0),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "project": project,
+        "layers": layers,
+        "counts": {
+            "nodes": nodes,
+            "activeEdges": active_edges,
+            "historicalEdges": historical_edges,
+            "episodes": episodes
+        },
+        "activeEdgesByLayer": by_layer
+    }))
+}
+
 struct WakeFact {
     s: Value,
     s_iri: String,
@@ -571,7 +651,9 @@ pub async fn memory_traverse(graph: &Graph, project: &str, args: TraverseArgs) -
     let limit = args.limit.unwrap_or(50).clamp(1, 200) as i64;
     let layers = visible_layers(project);
     let rels: Vec<String> = if let Some(rs) = args.rels.filter(|r| !r.is_empty()) {
-        rs.into_iter().map(|r| safe_rel(&r)).collect::<Result<Vec<_>>>()?
+        rs.into_iter()
+            .map(|r| safe_rel(&r))
+            .collect::<Result<Vec<_>>>()?
     } else {
         FIXED_RELS.iter().map(|s| (*s).to_string()).collect()
     };
@@ -737,21 +819,14 @@ pub async fn memory_assert(graph: &Graph, project: &str, args: AssertArgs) -> Re
         )
         .await?
     };
-    let already_current = already_current
-        || (!currents.is_empty() && currents.iter().all(|c| c.o_iri == object.iri));
+    let already_current =
+        already_current || (!currents.is_empty() && currents.iter().all(|c| c.o_iri == object.iri));
 
     if already_current {
         let mut episode_json = Value::Null;
         if args.contradicts && !conflicts.is_empty() {
             let episode = create_episode(graph, "memory_assert", None).await?;
-            write_contradicts(
-                graph,
-                &object.iri,
-                &conflicts,
-                &layer,
-                &episode,
-            )
-            .await?;
+            write_contradicts(graph, &object.iri, &conflicts, &layer, &episode).await?;
             episode_json = json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool });
         }
         return Ok(json!({
@@ -1112,8 +1187,10 @@ async fn create_asserts_txn(
     reason: Option<&str>,
     fact_text: &str,
 ) -> Result<()> {
-    txn.run(asserts_query(s, o, prop_iri, layer, episode, reason, fact_text))
-        .await?;
+    txn.run(asserts_query(
+        s, o, prop_iri, layer, episode, reason, fact_text,
+    ))
+    .await?;
     Ok(())
 }
 
@@ -1196,12 +1273,7 @@ pub async fn count_current_asserts(
     Ok((n, objects))
 }
 
-pub async fn count_historical_asserts(
-    graph: &Graph,
-    s: &str,
-    p: &str,
-    layer: &str,
-) -> Result<i64> {
+pub async fn count_historical_asserts(graph: &Graph, s: &str, p: &str, layer: &str) -> Result<i64> {
     let prop = property_iri(p);
     let row = fetch_one(
         graph,
@@ -1228,12 +1300,7 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
     // Missing layer → default WRITE layer only. Never anyLayer across tenants.
     assert_writable_layer(&layer, project)?;
 
-    let episode = create_episode(
-        graph,
-        "memory_retract",
-        args.reason.as_deref(),
-    )
-    .await?;
+    let episode = create_episode(graph, "memory_retract", args.reason.as_deref()).await?;
 
     let mut closed = 0i64;
     let mut skipped_schema = 0i64;
@@ -1312,18 +1379,17 @@ pub async fn memory_retract(graph: &Graph, project: &str, args: RetractArgs) -> 
     } else if let Some(iri) = args.iri.as_deref() {
         let node = get_node(graph, iri).await?;
         if let Some(n) = &node {
-            let labels: Vec<String> = n
-                .labels()
-                .into_iter()
-                .map(|s| s.to_string())
-                .collect();
+            let labels: Vec<String> = n.labels().into_iter().map(|s| s.to_string()).collect();
             if labels.iter().any(|l| l == "Class" || l == "Property") {
                 return Err(anyhow!(
                     "refuse to retract Class/Property by iri ({iri}); pass an explicit triple (s, p) for schema/structural rels"
                 ));
             }
         }
-        let protected: Vec<String> = SCHEMA_STRUCTURAL_RELS.iter().map(|s| (*s).to_string()).collect();
+        let protected: Vec<String> = SCHEMA_STRUCTURAL_RELS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
         let row = fetch_one(
             graph,
             query(
@@ -1417,10 +1483,7 @@ pub async fn memory_schema(graph: &Graph, project: &str, args: SchemaArgs) -> Re
     } else {
         property_iri(seed)
     };
-    let name = args
-        .name
-        .clone()
-        .unwrap_or_else(|| name_from_iri(&iri));
+    let name = args.name.clone().unwrap_or_else(|| name_from_iri(&iri));
     let label = if kind == "class" { "Class" } else { "Property" };
     let spec = NodeSpec {
         iri: Some(iri.clone()),
@@ -1429,9 +1492,7 @@ pub async fn memory_schema(graph: &Graph, project: &str, args: SchemaArgs) -> Re
     };
     let node = merge_node(graph, &spec, &kind, &[]).await?;
     graph
-        .run(
-            query("MATCH (n:Entity {iri: $iri}) SET n.stub = false").param("iri", iri.clone()),
-        )
+        .run(query("MATCH (n:Entity {iri: $iri}) SET n.stub = false").param("iri", iri.clone()))
         .await
         .ok();
 
@@ -1627,8 +1688,6 @@ async fn ensure_link(
     }
 }
 
-
-
 async fn find_current_pair(
     graph: &Graph,
     s: &str,
@@ -1806,7 +1865,6 @@ pub fn map_tool_error(err: anyhow::Error) -> rmcp::model::ErrorData {
     McpError::internal_error(err.to_string(), None)
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::graph::spike_rank;
@@ -1833,8 +1891,12 @@ mod tests {
     fn find_current_returns_all_matches() {
         let src = include_str!("tools.rs");
         let start = src.find("async fn find_current(").expect("find_current");
-        let pair = src.find("async fn find_current_pair(").expect("find_current_pair");
-        let end = src.find("async fn find_conflicts(").expect("find_conflicts");
+        let pair = src
+            .find("async fn find_current_pair(")
+            .expect("find_current_pair");
+        let end = src
+            .find("async fn find_conflicts(")
+            .expect("find_conflicts");
         assert!(
             !src[start..pair].contains("LIMIT 1"),
             "find_current must return/close ALL current (s,p,layer) matches"
