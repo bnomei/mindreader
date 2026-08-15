@@ -9,15 +9,11 @@
    - `cargo test`
    - `cargo run --bin mindreader-smoke` (when Neo4j is available)
 
-## Schema migration/versioning strategy
+## Graph model versioning
 
-mindreader bootstraps required constraints/indexes with `IF NOT EXISTS` and keeps schema evolution additive.
+Mindreader supports only a fresh database for the current graph model. Bootstrap records a model marker and rejects an unversioned non-empty database or a mismatched version.
 
-When introducing schema changes:
-- keep migrations idempotent,
-- prefer additive changes over destructive rewrites,
-- include compatibility notes in PRs,
-- bump crate version following SemVer.
+For incompatible model changes, bump the graph model version, keep fresh bootstrap idempotent, document that operators must recreate the Neo4j database or volume, and do not add compatibility migrations or data backfills.
 
 ## Release discipline
 

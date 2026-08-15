@@ -15,8 +15,10 @@ It is designed for:
 ## Core model
 
 - Facts are asserted as `s,p,o` edges (usually `ASSERTS`) with `layer` and `validFrom`.
-- Corrections create new current facts and close old ones (`validTo` + `SUPERSEDES`).
+- Assertions are set-valued; only the exact `(s,p,o,layer)` is idempotent.
+- `memory_replace` corrects one exact old fact, preserves unrelated values, and records `SUPERSEDES` atomically.
 - Retract is soft-delete (`validTo`), not hard-delete.
+- `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates.
 - Reads are layer-aware: only `global` + current project layer are visible.
 
 ## Wakeup-first session flow
@@ -35,8 +37,9 @@ Use this as a first-class session start pattern:
 | `memory_get` | Fetch one node by IRI, optionally with one-hop neighbors. |
 | `memory_traverse` | Walk fixed, typed relationships from a starting node. |
 | `memory_stats` | Operational counters for nodes/edges/episodes and per-layer activity. |
-| `memory_assert` | Insert/update a fact with provenance and supersession semantics. |
-| `memory_retract` | Soft-retract current facts (`validTo`), never hard-delete. |
+| `memory_assert` | Add a set-valued fact with provenance; an exact reassertion is a no-op. |
+| `memory_replace` | Correct one exact current fact and record `SUPERSEDES` atomically. |
+| `memory_retract` | Soft-retract an exact fact, predicate scope, or subject scope. |
 | `memory_schema` | Declare Class/Property schema-as-data entities and links. |
 
 ## IRI minting rules
@@ -128,9 +131,9 @@ docker compose run --rm mindreader
 ## Minimal end-to-end example (assert → search → traverse)
 
 1. `memory_assert`
-   - `s`: `{ "name": "Alice", "labels": ["Element"] }`
+   - `s`: `{ "kind": "entity", "name": "Alice", "labels": ["Element"] }`
    - `p`: `worksOn`
-   - `o`: `{ "name": "mindreader", "labels": ["Element"] }`
+   - `o`: `{ "kind": "entity", "name": "mindreader", "labels": ["Element"] }`
    - `layer`: `project:graph-memory`
 
 2. `memory_search`
@@ -143,7 +146,10 @@ docker compose run --rm mindreader
 ## Operational notes
 
 - Connection startup includes bounded retry/backoff for transient Neo4j failures.
-- `memory_stats` provides a lightweight operator view of graph activity.
+- Mutations are transaction-scoped, use deterministic fact locks, and retry only uncommitted Neo4j transient failures.
+- `memory_stats` reports the live graph-model marker, required constraints/indexes, and graph activity.
+- The current graph model requires a fresh database. Incompatible or unversioned non-empty databases are rejected; no migration or backfill runs.
+- `memory_search` uses only the required full-text indexes and a deterministic bounded candidate window.
 - Secrets stay env-only; Cypher uses parameters for user-provided values.
 
 ## Smoke test
