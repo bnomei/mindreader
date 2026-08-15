@@ -26,10 +26,10 @@ MCP server: `user-mindreader`. Always call `user-mindreader:<tool>`.
 ## Steps
 
 1. `user-mindreader:memory_search` for the thing and the relation. If the fact is already current, stop.
-2. One triple per `user-mindreader:memory_assert`. `s` and `o` are things. `p` is a relation.
+2. One triple per `user-mindreader:memory_assert`. Use tagged entity/literal objects for `s` and `o`; `p` is a relation.
 3. Layer: `project:<slug>` for this work. `global` only if it should survive every project.
 4. `spike=Knowledge` only if you would bet on it. Otherwise `Signal` (raw) or `Insight` (interpreted). Do not auto-promote.
-5. Correct a value by asserting the new `o` (supersedes). Retract only to withdraw.
+5. Add another valid value with `memory_assert`. Correct one exact old value with `memory_replace`; retract only to withdraw.
 6. If another visible layer has a different current `(s,p)`, set `contradicts=true`.
 7. Search again for `s` or the topic. If the new fact is missing, fix the assert.
 
@@ -38,8 +38,8 @@ MCP server: `user-mindreader`. Always call `user-mindreader:<tool>`.
 Good:
 
 ```
-s=Alice  p=worksOn  o=mindreader  layer=project:graph-memory  spike=Knowledge
-s=Bob    p=INSTANCE_OF  o=mindreader:class/Agent
+s={kind:entity,name:Alice}  p=worksOn  o={kind:entity,name:mindreader}  layer=project:graph-memory  spike=Knowledge
+s={kind:entity,name:Bob}    p=INSTANCE_OF  o={kind:entity,iri:mindreader:class/Agent}
 ```
 
 Bad:

@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Result};
 use mindreader::config::Config;
+use mindreader::domain::{EntityInput, ObjectInput};
 use mindreader::graph::{self};
 use mindreader::tools::{
-    self, AssertArgs, GetArgs, RetractArgs, SchemaArgs, SearchArgs, TraverseArgs,
+    self, AssertArgs, GetArgs, ReplaceArgs, RetractArgs, RetractTargetArgs, SchemaArgs, SearchArgs,
+    TraverseArgs,
 };
 use mindreader::Mindreader;
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::process::ExitCode;
 
 struct Report {
@@ -48,6 +50,57 @@ fn iri_of(v: &Value) -> Option<String> {
         })
 }
 
+fn entity(name: impl Into<String>, labels: &[&str]) -> EntityInput {
+    EntityInput {
+        kind: "entity".into(),
+        iri: None,
+        name: Some(name.into()),
+        labels: labels.iter().map(|label| (*label).to_string()).collect(),
+    }
+}
+
+fn entity_iri(iri: impl Into<String>) -> EntityInput {
+    EntityInput {
+        kind: "entity".into(),
+        iri: Some(iri.into()),
+        name: None,
+        labels: Vec::new(),
+    }
+}
+
+fn object(name: impl Into<String>, labels: &[&str]) -> ObjectInput {
+    ObjectInput {
+        kind: "entity".into(),
+        iri: None,
+        name: Some(name.into()),
+        labels: labels.iter().map(|label| (*label).to_string()).collect(),
+        value: None,
+        datatype: None,
+    }
+}
+
+fn object_iri(iri: impl Into<String>) -> ObjectInput {
+    ObjectInput {
+        kind: "entity".into(),
+        iri: Some(iri.into()),
+        name: None,
+        labels: Vec::new(),
+        value: None,
+        datatype: None,
+    }
+}
+
+fn literal(value: impl Into<String>) -> ObjectInput {
+    ObjectInput {
+        kind: "literal".into(),
+        iri: None,
+        name: None,
+        labels: Vec::new(),
+        value: Some(value.into()),
+        datatype: None,
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -74,14 +127,21 @@ async fn run() -> Result<u32> {
         "registered tools: {}",
         Mindreader::registered_tool_names().join(", ")
     );
-    if Mindreader::registered_tool_names().len() != 7 {
-        return Err(anyhow!("expected 7 registered tools"));
+    if Mindreader::registered_tool_names().len() != 8 {
+        return Err(anyhow!("expected 8 registered tools"));
     }
 
     let graph = graph::connect(&cfg).await?;
     graph::bootstrap(&graph).await?;
     let project = cfg.project.as_str();
     let mut r = Report::new();
+    // Run-unique fixtures keep repeated smoke runs independent.
+    let tag = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_else(|_| "x".into());
+    let subject_name = format!("test-subject-{tag}");
+    let subject_fallback_iri = format!("mindreader:element/{subject_name}");
 
     // 1. schema
     let person = tools::memory_schema(
@@ -147,26 +207,26 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    // 2. assert Bruno worksOn graph-memory
+    // 2. assert the fixture subject worksOn graph-memory
     let asserted = tools::memory_assert(
         &graph,
         project,
         AssertArgs {
-            s: json!({"name": "Bruno", "labels": ["Element"]}),
+            s: entity(subject_name.clone(), &["Element"]),
             p: "worksOn".into(),
-            o: json!({"name": "graph-memory", "labels": ["Element"]}),
+            o: object("graph-memory", &["Element"]),
             layer: Some("project:graph-memory".into()),
             spike: None,
             contradicts: false,
         },
     )
     .await;
-    let (bruno_iri, project_iri) = match &asserted {
+    let (subject_iri, project_iri) = match &asserted {
         Ok(v) => (
             v.get("s")
                 .and_then(|s| s.get("iri"))
                 .and_then(|x| x.as_str())
-                .unwrap_or("mindreader:element/bruno")
+                .unwrap_or(&subject_fallback_iri)
                 .to_string(),
             v.get("o")
                 .and_then(|s| s.get("iri"))
@@ -175,25 +235,25 @@ async fn run() -> Result<u32> {
                 .to_string(),
         ),
         Err(_) => (
-            "mindreader:element/bruno".into(),
+            subject_fallback_iri.clone(),
             "mindreader:element/graph-memory".into(),
         ),
     };
     r.check(
         2,
-        "memory_assert Element Bruno worksOn graph-memory Project",
+        "memory_assert fixture subject worksOn graph-memory Project",
         asserted.is_ok(),
-        &format!("bruno={bruno_iri} project={project_iri} raw={asserted:?}"),
+        &format!("subject={subject_iri} project={project_iri} raw={asserted:?}"),
     );
 
-    // 3. Signal ABOUT Bruno, layer global
+    // 3. Signal ABOUT the fixture subject, layer global
     let signal = tools::memory_assert(
         &graph,
         project,
         AssertArgs {
-            s: json!({"name": "bruno-observed", "labels": ["Signal"]}),
+            s: entity(format!("observed-{tag}"), &["Signal"]),
             p: "ABOUT".into(),
-            o: json!({"iri": bruno_iri}),
+            o: object_iri(subject_iri.clone()),
             layer: Some("global".into()),
             spike: Some("Signal".into()),
             contradicts: false,
@@ -202,17 +262,17 @@ async fn run() -> Result<u32> {
     .await;
     r.check(
         3,
-        "memory_assert Signal ABOUT Bruno layer global",
+        "memory_assert Signal ABOUT fixture subject layer global",
         signal.is_ok(),
         &format!("{signal:?}"),
     );
 
-    // 4. get Bruno hops=1 sees project fact
+    // 4. get the fixture subject with hops=1 and see the project fact
     let got = tools::memory_get(
         &graph,
         project,
         GetArgs {
-            iri: bruno_iri.clone(),
+            iri: subject_iri.clone(),
             hops: Some(1),
         },
     )
@@ -230,23 +290,23 @@ async fn run() -> Result<u32> {
         .unwrap_or(false);
     r.check(
         4,
-        "memory_get Bruno hops=1 sees the project fact",
+        "memory_get fixture subject hops=1 sees the project fact",
         sees_project,
         &format!("{got:?}"),
     );
 
-    // 5. search Bruno
+    // 5. search for the fixture subject
     let search = tools::memory_search(
         &graph,
         project,
         SearchArgs {
-            text: Some("Bruno".into()),
+            text: Some(subject_name.clone()),
             labels: None,
             limit: Some(20),
         },
     )
     .await;
-    let found_bruno = search
+    let found_subject = search
         .as_ref()
         .ok()
         .map(|v| {
@@ -260,30 +320,30 @@ async fn run() -> Result<u32> {
                 let s = f.get("s");
                 s.and_then(|n| n.get("iri"))
                     .and_then(|x| x.as_str())
-                    .map(|s| s == bruno_iri || s.contains("bruno"))
+                    .map(|s| s == subject_iri)
                     .unwrap_or(false)
                     || s.and_then(|n| n.get("name"))
                         .and_then(|x| x.as_str())
-                        .map(|s| s.eq_ignore_ascii_case("Bruno"))
+                        .map(|s| s == subject_name)
                         .unwrap_or(false)
-                    || f.to_string().to_ascii_lowercase().contains("bruno")
+                    || f.to_string().contains(&subject_name)
             });
             mode_ok && hit
         })
         .unwrap_or(false);
     r.check(
         5,
-        "memory_search \"Bruno\" returns facts (wakeup)",
-        found_bruno,
+        "memory_search fixture subject returns facts (wakeup)",
+        found_subject,
         &format!("{search:?}"),
     );
 
-    // 6. traverse from Bruno depth 2
+    // 6. traverse from the fixture subject at depth 2
     let trav = tools::memory_traverse(
         &graph,
         project,
         TraverseArgs {
-            from: bruno_iri.clone(),
+            from: subject_iri.clone(),
             rels: None,
             depth: Some(2),
             limit: Some(50),
@@ -303,7 +363,7 @@ async fn run() -> Result<u32> {
         .unwrap_or(false);
     r.check(
         6,
-        "memory_traverse from Bruno depth 2",
+        "memory_traverse from fixture subject depth 2",
         trav_ok,
         &format!("{trav:?}"),
     );
@@ -313,9 +373,9 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         AssertArgs {
-            s: json!({"iri": bruno_iri}),
+            s: entity_iri(subject_iri.clone()),
             p: "worksOn".into(),
-            o: json!({"iri": project_iri}),
+            o: object_iri(project_iri.clone()),
             layer: Some("project:graph-memory".into()),
             spike: None,
             contradicts: false,
@@ -323,7 +383,8 @@ async fn run() -> Result<u32> {
     )
     .await;
     let (cur_n, cur_objs) =
-        tools::count_current_asserts(&graph, &bruno_iri, "worksOn", "project:graph-memory").await?;
+        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
+            .await?;
     let idem = again
         .as_ref()
         .ok()
@@ -337,14 +398,14 @@ async fn run() -> Result<u32> {
         &format!("count={cur_n} objects={cur_objs:?} again={again:?}"),
     );
 
-    // 8. assert worksOn different o — supersedes
+    // 8. assert a different worksOn object — both values remain current
     let other = tools::memory_assert(
         &graph,
         project,
         AssertArgs {
-            s: json!({"iri": bruno_iri}),
+            s: entity_iri(subject_iri.clone()),
             p: "worksOn".into(),
-            o: json!({"name": "other-desk", "labels": ["Element"]}),
+            o: object(format!("other-desk-{tag}"), &["Element"]),
             layer: Some("project:graph-memory".into()),
             spike: None,
             contradicts: false,
@@ -352,9 +413,7 @@ async fn run() -> Result<u32> {
     )
     .await;
     let (cur_n2, cur_objs2) =
-        tools::count_current_asserts(&graph, &bruno_iri, "worksOn", "project:graph-memory").await?;
-    let hist =
-        tools::count_historical_asserts(&graph, &bruno_iri, "worksOn", "project:graph-memory")
+        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
             .await?;
     let other_iri = other
         .as_ref()
@@ -366,31 +425,84 @@ async fn run() -> Result<u32> {
         })
         .unwrap_or("")
         .to_string();
-    let superseded = other
-        .as_ref()
-        .ok()
-        .and_then(|v| v.get("superseded"))
-        .map(|s| !s.is_null())
-        .unwrap_or(false)
-        && cur_n2 == 1
-        && hist >= 1
+    let set_valued = other.is_ok()
+        && cur_n2 == 2
+        && cur_objs2.iter().any(|o| o == &project_iri)
         && cur_objs2.iter().any(|o| o == &other_iri);
     r.check(
         8,
-        "assert worksOn different o supersedes (old validTo set)",
-        superseded,
-        &format!("current={cur_n2} hist={hist} objs={cur_objs2:?} other={other:?}"),
+        "assert worksOn different object keeps both values current",
+        set_valued,
+        &format!("current={cur_n2} objs={cur_objs2:?} other={other:?}"),
     );
 
-    // 9. retract — soft; node still gettable
+    // 9. replace one exact fact, preserving the unrelated current value
+    let replaced = tools::memory_replace(
+        &graph,
+        project,
+        ReplaceArgs {
+            s: entity_iri(subject_iri.clone()),
+            p: "worksOn".into(),
+            old: object_iri(project_iri.clone()),
+            new: object(format!("replacement-desk-{tag}"), &["Element"]),
+            layer: Some("project:graph-memory".into()),
+            spike: None,
+            contradicts: false,
+            reason: Some("smoke exact replacement".into()),
+        },
+    )
+    .await;
+    let replacement_iri = replaced
+        .as_ref()
+        .ok()
+        .and_then(|v| {
+            v.get("new")
+                .and_then(|o| o.get("iri"))
+                .and_then(|x| x.as_str())
+        })
+        .unwrap_or("")
+        .to_string();
+    let (cur_n3, cur_objs3) =
+        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
+            .await?;
+    let hist =
+        tools::count_historical_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
+            .await?;
+    let supersedes = count_supersedes(
+        &graph,
+        &replacement_iri,
+        &project_iri,
+        "worksOn",
+        "project:graph-memory",
+    )
+    .await?;
+    let replace_ok = replaced.is_ok()
+        && cur_n3 == 2
+        && hist >= 1
+        && supersedes == 1
+        && cur_objs3.iter().any(|o| o == &replacement_iri)
+        && cur_objs3.iter().any(|o| o == &other_iri)
+        && !cur_objs3.iter().any(|o| o == &project_iri);
+    r.check(
+        9,
+        "memory_replace closes only the exact old fact and writes SUPERSEDES",
+        replace_ok,
+        &format!(
+            "current={cur_n3} hist={hist} supersedes={supersedes} objs={cur_objs3:?} replace={replaced:?}"
+        ),
+    );
+
+    // 10. retract one exact fact — soft; node and unrelated value remain
     let retracted = tools::memory_retract(
         &graph,
         project,
         RetractArgs {
-            iri: None,
-            s: Some(bruno_iri.clone()),
-            p: Some("worksOn".into()),
-            o: Some(json!(other_iri)),
+            target: RetractTargetArgs {
+                kind: "fact".into(),
+                s: entity_iri(subject_iri.clone()),
+                p: Some("worksOn".into()),
+                o: Some(object_iri(replacement_iri.clone())),
+            },
             layer: Some("project:graph-memory".into()),
             reason: Some("smoke retract".into()),
         },
@@ -400,13 +512,14 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         GetArgs {
-            iri: bruno_iri.clone(),
+            iri: subject_iri.clone(),
             hops: Some(0),
         },
     )
     .await;
-    let (cur_n3, _) =
-        tools::count_current_asserts(&graph, &bruno_iri, "worksOn", "project:graph-memory").await?;
+    let (cur_n4, cur_objs4) =
+        tools::count_current_asserts(&graph, &subject_iri, "worksOn", "project:graph-memory")
+            .await?;
     let retract_ok = retracted
         .as_ref()
         .ok()
@@ -417,22 +530,23 @@ async fn run() -> Result<u32> {
             .ok()
             .and_then(|v| v.get("found").and_then(|x| x.as_bool()))
             .unwrap_or(false)
-        && cur_n3 == 0;
+        && cur_n4 == 1
+        && cur_objs4.iter().any(|o| o == &other_iri);
     r.check(
-        9,
-        "retract is soft; node still gettable",
+        10,
+        "exact fact retract is soft; node and unrelated value remain",
         retract_ok,
-        &format!("retract={retracted:?} get={still:?} current_asserts={cur_n3}"),
+        &format!("retract={retracted:?} get={still:?} current={cur_n4} objs={cur_objs4:?}"),
     );
 
-    // 10. layer project:other rejected
+    // 11. layer project:other rejected
     let rejected = tools::memory_assert(
         &graph,
         project,
         AssertArgs {
-            s: json!({"iri": bruno_iri}),
+            s: entity_iri(subject_iri.clone()),
             p: "worksOn".into(),
-            o: json!({"iri": project_iri}),
+            o: object_iri(project_iri.clone()),
             layer: Some("project:other".into()),
             spike: None,
             contradicts: false,
@@ -447,19 +561,15 @@ async fn run() -> Result<u32> {
         Ok(_) => false,
     };
     r.check(
-        10,
+        11,
         "layer project:other is rejected",
         reject_ok,
         &format!("{rejected:?}"),
     );
 
     // --- v1.1: conflicts, CONTRADICTS, wakeup rank ---
-    // Unique names so a second smoke run does not inherit leftover CONTRADICTS.
-    let tag = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis().to_string())
-        .unwrap_or_else(|_| "x".into());
-    let v11_s = json!({"name": format!("v11-subj-{tag}"), "labels": ["Element"]});
+    // Unique names prevent repeated smoke runs from inheriting CONTRADICTS edges.
+    let v11_s = entity(format!("v11-subj-{tag}"), &["Element"]);
     let desk_a = format!("v11-alpha-{tag}");
     let desk_b = format!("v11-beta-{tag}");
     let desk_c = format!("v11-gamma-{tag}");
@@ -470,7 +580,7 @@ async fn run() -> Result<u32> {
         AssertArgs {
             s: v11_s.clone(),
             p: "worksOn".into(),
-            o: json!({"name": desk_a, "labels": ["Element"]}),
+            o: object(desk_a.clone(), &["Element"]),
             layer: Some("global".into()),
             spike: None,
             contradicts: false,
@@ -498,7 +608,7 @@ async fn run() -> Result<u32> {
         .unwrap_or("")
         .to_string();
     r.check(
-        11,
+        12,
         "v1.1 assert subject worksOn A on global",
         a.is_ok() && !a_iri.is_empty(),
         &format!("{a:?}"),
@@ -510,7 +620,7 @@ async fn run() -> Result<u32> {
         AssertArgs {
             s: v11_s.clone(),
             p: "worksOn".into(),
-            o: json!({"name": desk_b, "labels": ["Element"]}),
+            o: object(desk_b.clone(), &["Element"]),
             layer: Some("project:graph-memory".into()),
             spike: None,
             contradicts: false,
@@ -544,7 +654,7 @@ async fn run() -> Result<u32> {
     });
     let contradicts_before = count_contradicts(&graph, &b_iri).await.unwrap_or(-1);
     r.check(
-        12,
+        13,
         "v1.1 project worksOn B returns conflicts[] for global/A; no CONTRADICTS without flag",
         b.is_ok() && mentions_global_a && contradicts_before == 0,
         &format!("conflicts={conflicts:?} contradicts={contradicts_before} b={b:?}"),
@@ -554,9 +664,9 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         AssertArgs {
-            s: json!({"iri": v11_iri}),
+            s: entity_iri(v11_iri.clone()),
             p: "worksOn".into(),
-            o: json!({"iri": b_iri}),
+            o: object_iri(b_iri.clone()),
             layer: Some("project:graph-memory".into()),
             spike: None,
             contradicts: true,
@@ -565,7 +675,7 @@ async fn run() -> Result<u32> {
     .await;
     let contradicts_after = count_contradicts(&graph, &b_iri).await.unwrap_or(-1);
     r.check(
-        13,
+        14,
         "v1.1 contradicts:true writes CONTRADICTS to conflicting o",
         b2.is_ok() && contradicts_after == 1,
         &format!("contradicts={contradicts_after} b2={b2:?}"),
@@ -575,9 +685,9 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         AssertArgs {
-            s: json!({"iri": v11_iri}),
+            s: entity_iri(v11_iri.clone()),
             p: "worksOn".into(),
-            o: json!({"name": desk_c, "labels": ["Element"]}),
+            o: object(desk_c.clone(), &["Element"]),
             layer: Some("global".into()),
             spike: None,
             contradicts: false,
@@ -598,9 +708,9 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         AssertArgs {
-            s: json!({"iri": v11_iri}),
+            s: entity_iri(v11_iri.clone()),
             p: "worksOn".into(),
-            o: json!({"iri": b_iri}),
+            o: object_iri(b_iri.clone()),
             layer: Some("project:graph-memory".into()),
             spike: None,
             contradicts: true,
@@ -609,7 +719,7 @@ async fn run() -> Result<u32> {
     .await;
     let contradicts_multi = count_contradicts(&graph, &b_iri).await.unwrap_or(-1);
     r.check(
-        14,
+        15,
         "v1.1 later fight adds another CONTRADICTS (does not supersede first)",
         a2.is_ok() && b3.is_ok() && contradicts_multi == 2 && !a2_iri.is_empty(),
         &format!("contradicts={contradicts_multi} a2={a2:?} b3={b3:?}"),
@@ -619,9 +729,9 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         AssertArgs {
-            s: json!({"name": "bruno-known", "labels": ["Knowledge"]}),
+            s: entity(format!("known-{tag}"), &["Knowledge"]),
             p: "ABOUT".into(),
-            o: json!({"iri": bruno_iri}),
+            o: object_iri(subject_iri.clone()),
             layer: Some("global".into()),
             spike: Some("Knowledge".into()),
             contradicts: false,
@@ -629,8 +739,8 @@ async fn run() -> Result<u32> {
     )
     .await;
     r.check(
-        15,
-        "v1.1 Knowledge ABOUT Bruno",
+        16,
+        "v1.1 Knowledge ABOUT fixture subject",
         knowledge.is_ok(),
         &format!("{knowledge:?}"),
     );
@@ -639,7 +749,7 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         SearchArgs {
-            text: Some("Bruno".into()),
+            text: Some(subject_name.clone()),
             labels: None,
             limit: Some(30),
         },
@@ -665,33 +775,35 @@ async fn run() -> Result<u32> {
                     f.get("s")
                         .and_then(|s| s.get("iri"))
                         .and_then(|x| x.as_str())
-                        == Some(bruno_iri.as_str())
+                        == Some(subject_iri.as_str())
                         || f.get("p")
                             .and_then(|x| x.as_str())
                             .unwrap_or("")
                             .contains("worksOn")
-                        || f.to_string().to_ascii_lowercase().contains("bruno")
+                        || f.to_string().contains(&subject_name)
                 });
             let no_nodes_dir = v.get("nodes").is_none();
             let first_spike = spikes
                 .first()
                 .and_then(|s| s.get("rank").and_then(|x| x.as_str()));
             let knowledge_first = first_spike == Some("Knowledge");
-            let bruno_fact_spike = facts.iter().find(|f| {
-                f.get("s")
-                    .and_then(|s| s.get("iri"))
-                    .and_then(|x| x.as_str())
-                    == Some(bruno_iri.as_str())
+            let subject_fact_spike = facts.iter().find(|f| {
+                ["s", "o"].iter().any(|endpoint| {
+                    f.get(*endpoint)
+                        .and_then(|node| node.get("iri"))
+                        .and_then(|iri| iri.as_str())
+                        == Some(subject_iri.as_str())
+                })
             });
-            let fact_ranked = bruno_fact_spike
+            let fact_ranked = subject_fact_spike
                 .and_then(|f| f.get("spike").and_then(|x| x.as_str()))
                 == Some("Knowledge");
             mode && has_fact && no_nodes_dir && knowledge_first && fact_ranked
         })
         .unwrap_or(false);
     r.check(
-        16,
-        "v1.1 memory_search Bruno returns facts+ABOUT SPIKE; Knowledge ranks above Signal",
+        17,
+        "v1.1 memory_search fixture subject returns facts+ABOUT SPIKE; Knowledge ranks above Signal",
         wake_ok,
         &format!("{wake:?}"),
     );
@@ -700,9 +812,9 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         AssertArgs {
-            s: json!({"iri": bruno_iri}),
+            s: entity_iri(subject_iri.clone()),
             p: "note".into(),
-            o: json!({"value": "v11-unique-literal-token"}),
+            o: literal("v11-unique-literal-token"),
             layer: Some("project:graph-memory".into()),
             spike: None,
             contradicts: false,
@@ -735,21 +847,21 @@ async fn run() -> Result<u32> {
             })
             .unwrap_or(false);
     r.check(
-        17,
+        18,
         "v1.1 memory_search finds literal/factText (not node directory)",
         lit_ok,
         &format!("assert={lit:?} search={lit_search:?}"),
     );
 
-    // 18. retract without layer uses default_write_layer only
-    let retract_s = json!({"name": format!("v11-retract-s-{tag}"), "labels": ["Element"]});
+    // 19. retract without layer uses default_write_layer only
+    let retract_s = entity(format!("v11-retract-s-{tag}"), &["Element"]);
     let g_assert = tools::memory_assert(
         &graph,
         project,
         AssertArgs {
             s: retract_s.clone(),
             p: "desk".into(),
-            o: json!({"name": format!("v11-retract-g-{tag}"), "labels": ["Element"]}),
+            o: object(format!("v11-retract-g-{tag}"), &["Element"]),
             layer: Some("global".into()),
             spike: None,
             contradicts: false,
@@ -762,7 +874,7 @@ async fn run() -> Result<u32> {
         AssertArgs {
             s: retract_s.clone(),
             p: "desk".into(),
-            o: json!({"name": format!("v11-retract-p-{tag}"), "labels": ["Element"]}),
+            o: object(format!("v11-retract-p-{tag}"), &["Element"]),
             layer: None,
             spike: None,
             contradicts: false,
@@ -783,10 +895,12 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         RetractArgs {
-            iri: None,
-            s: Some(retract_s_iri.clone()),
-            p: Some("desk".into()),
-            o: None,
+            target: RetractTargetArgs {
+                kind: "predicate".into(),
+                s: entity_iri(retract_s_iri.clone()),
+                p: Some("desk".into()),
+                o: None,
+            },
             layer: None,
             reason: Some("smoke retract no layer".into()),
         },
@@ -801,7 +915,7 @@ async fn run() -> Result<u32> {
         .and_then(|v| v.get("layer").and_then(|x| x.as_str()))
         .unwrap_or("");
     r.check(
-        18,
+        19,
         "retract without layer uses default_write_layer only; other layers untouched",
         g_assert.is_ok()
             && p_assert.is_ok()
@@ -814,7 +928,7 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    // 19. NULL-layer edges stay invisible (search + get + ABOUT spike)
+    // 20. NULL-layer edges stay invisible (search + get + ABOUT spike)
     let null_token = format!("v11-null-layer-token-{tag}");
     let null_s = format!("mindreader:element/v11-null-s-{tag}");
     let null_o = format!("mindreader:element/v11-null-o-{tag}");
@@ -848,7 +962,7 @@ async fn run() -> Result<u32> {
                 MERGE (sp:Entity:Signal {iri: $iri})
                 ON CREATE SET sp.name = $name, sp.createdAt = datetime()
                 WITH sp
-                MATCH (el:Entity {iri: $bruno})
+                MATCH (el:Entity {iri: $subject})
                 CREATE (sp)-[a:ABOUT {
                     propertyIri: 'mindreader:property/ABOUT',
                     factText: $ft,
@@ -858,8 +972,8 @@ async fn run() -> Result<u32> {
             )
             .param("iri", null_sp.clone())
             .param("name", format!("v11-null-spike-{tag}"))
-            .param("bruno", bruno_iri.clone())
-            .param("ft", format!("null spike about bruno {tag}")),
+            .param("subject", subject_iri.clone())
+            .param("ft", format!("null spike about fixture subject {tag}")),
         )
         .await?;
     let null_search = tools::memory_search(
@@ -876,7 +990,7 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         GetArgs {
-            iri: bruno_iri.clone(),
+            iri: subject_iri.clone(),
             hops: Some(1),
         },
     )
@@ -885,7 +999,7 @@ async fn run() -> Result<u32> {
         &graph,
         project,
         SearchArgs {
-            text: Some("Bruno".into()),
+            text: Some(subject_name.clone()),
             labels: None,
             limit: Some(30),
         },
@@ -921,7 +1035,7 @@ async fn run() -> Result<u32> {
         })
         .unwrap_or(false);
     r.check(
-        19,
+        20,
         "NULL-layer edges stay invisible (search facts, get hops, ABOUT spike)",
         search_hides && get_hides && spike_hides,
         &format!(
@@ -929,7 +1043,7 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    // 20. find_current closes ALL current (s,p,layer) on supersede
+    // 21. exact replacement preserves unrelated current values
     let multi_s = format!("mindreader:element/v11-multi-s-{tag}");
     let multi_a = format!("mindreader:element/v11-multi-a-{tag}");
     let multi_b = format!("mindreader:element/v11-multi-b-{tag}");
@@ -965,16 +1079,18 @@ async fn run() -> Result<u32> {
         .await?;
     let (before_n, before_objs) =
         tools::count_current_asserts(&graph, &multi_s, "worksOn", project).await?;
-    let multi_c = tools::memory_assert(
+    let multi_c = tools::memory_replace(
         &graph,
         project,
-        AssertArgs {
-            s: json!({"iri": multi_s}),
+        ReplaceArgs {
+            s: entity_iri(multi_s.clone()),
             p: "worksOn".into(),
-            o: json!({"name": format!("v11-multi-c-{tag}"), "labels": ["Element"]}),
+            old: object_iri(multi_a.clone()),
+            new: object(format!("v11-multi-c-{tag}"), &["Element"]),
             layer: Some(project.to_string()),
             spike: None,
             contradicts: false,
+            reason: Some("smoke preserve unrelated current fact".into()),
         },
     )
     .await;
@@ -982,7 +1098,7 @@ async fn run() -> Result<u32> {
         .as_ref()
         .ok()
         .and_then(|v| {
-            v.get("o")
+            v.get("new")
                 .and_then(|o| o.get("iri"))
                 .and_then(|x| x.as_str())
         })
@@ -991,17 +1107,20 @@ async fn run() -> Result<u32> {
     let (after_n, after_objs) =
         tools::count_current_asserts(&graph, &multi_s, "worksOn", project).await?;
     let hist_multi = tools::count_historical_asserts(&graph, &multi_s, "worksOn", project).await?;
+    let supersedes_multi = count_supersedes(&graph, &c_iri, &multi_a, "worksOn", project).await?;
     r.check(
-        20,
-        "assert supersede closes ALL current (s,p,layer) matches, not LIMIT 1",
+        21,
+        "memory_replace closes one exact fact and preserves unrelated current values",
         before_n == 2
             && multi_c.is_ok()
-            && after_n == 1
-            && hist_multi >= 2
+            && after_n == 2
+            && hist_multi >= 1
+            && supersedes_multi == 1
             && after_objs.iter().any(|o| o == &c_iri)
-            && !after_objs.iter().any(|o| o == &multi_a || o == &multi_b),
+            && after_objs.iter().any(|o| o == &multi_b)
+            && !after_objs.iter().any(|o| o == &multi_a),
         &format!(
-            "before={before_n} {before_objs:?} after={after_n} {after_objs:?} hist={hist_multi} c={multi_c:?}"
+            "before={before_n} {before_objs:?} after={after_n} {after_objs:?} hist={hist_multi} supersedes={supersedes_multi} c={multi_c:?}"
         ),
     );
 
@@ -1019,6 +1138,31 @@ async fn count_contradicts(graph: &neo4rs::Graph, from_iri: &str) -> Result<i64>
             "#,
         )
         .param("iri", from_iri.to_string()),
+    )
+    .await?;
+    Ok(row.and_then(|r| r.get::<i64>("n").ok()).unwrap_or(0))
+}
+
+async fn count_supersedes(
+    graph: &neo4rs::Graph,
+    from_iri: &str,
+    to_iri: &str,
+    property: &str,
+    layer: &str,
+) -> Result<i64> {
+    let row = mindreader::graph::fetch_one(
+        graph,
+        neo4rs::query(
+            r#"
+            MATCH (new:Entity {iri: $new})-[r:SUPERSEDES]->(old:Entity {iri: $old})
+            WHERE r.validTo IS NULL AND r.propertyIri = $property AND r.layer = $layer
+            RETURN count(r) AS n
+            "#,
+        )
+        .param("new", from_iri.to_string())
+        .param("old", to_iri.to_string())
+        .param("property", mindreader::iri::property_iri(property))
+        .param("layer", layer.to_string()),
     )
     .await?;
     Ok(row.and_then(|r| r.get::<i64>("n").ok()).unwrap_or(0))

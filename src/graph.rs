@@ -1,7 +1,8 @@
 use crate::config::Config;
+use crate::domain::literal_iri;
 use crate::iri::{
     default_lower_for_kind, kind_for_label, kind_from_iri, label_for_kind, mint_iri, name_from_iri,
-    property_iri, slugify,
+    property_iri,
 };
 use anyhow::{anyhow, Context, Result};
 use neo4rs::{query, Graph, Node, Path, Relation, Row, Txn, UnboundedRelation};
@@ -56,6 +57,14 @@ pub const WAKEUP_RELS: &[&str] = &[
 
 const LABEL_OK: &str = "label";
 
+pub const MODEL_MARKER_KEY: &str = "model";
+pub const MODEL_VERSION: i64 = 2;
+
+const RESET_REQUIRED: &str = "recreate the Neo4j database or volume before starting Mindreader";
+const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] =
+    &[("wakeup_nodes", "NODE"), ("wakeup_facts", "RELATIONSHIP")];
+const WAKEUP_NODE_PROPERTIES: &[&str] = &["name", "iri", "searchText", "value"];
+
 pub async fn connect(cfg: &Config) -> Result<Graph> {
     let stripped = cfg
         .uri
@@ -104,6 +113,8 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
 }
 
 pub async fn bootstrap(graph: &Graph) -> Result<()> {
+    ensure_model_marker(graph).await?;
+
     graph
         .run(query(
             "CREATE CONSTRAINT entity_iri IF NOT EXISTS FOR (n:Entity) REQUIRE n.iri IS UNIQUE",
@@ -112,76 +123,23 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
         .context("create iri uniqueness constraint")?;
     graph
         .run(query(
-            "CREATE INDEX entity_name IF NOT EXISTS FOR (n:Entity) ON (n.name)",
+            "CREATE CONSTRAINT fact_lock_key IF NOT EXISTS FOR (n:FactLock) REQUIRE n.key IS UNIQUE",
         ))
         .await
-        .ok();
-    if let Err(err) = graph
-        .run(query(
-            "CREATE FULLTEXT INDEX entity_fulltext IF NOT EXISTS FOR (n:Entity) ON EACH [n.name, n.iri]",
-        ))
-        .await
-    {
-        eprintln!("fulltext index skipped: {err}");
-    }
-    // Do not ALTER entity_fulltext — Neo4j cannot add properties in place.
-    if let Err(err) = graph
+        .context("create fact lock key uniqueness constraint")?;
+
+    graph
         .run(query(
             "CREATE FULLTEXT INDEX wakeup_nodes IF NOT EXISTS FOR (n:Entity) ON EACH [n.name, n.iri, n.searchText, n.value]",
         ))
         .await
-    {
-        eprintln!("wakeup_nodes fulltext skipped: {err}");
-    }
-    if let Err(err) = graph
+        .context("create required wakeup_nodes full-text index")?;
+    graph
         .run(query(
             "CREATE FULLTEXT INDEX wakeup_facts IF NOT EXISTS FOR ()-[r:ASSERTS|ABOUT|INSTANCE_OF|SUBCLASS_OF|SUBPROPERTY_OF|DOMAIN|RANGE|EVIDENCE_FOR|DERIVED_FROM|SUPPORTS]-() ON EACH [r.factText]",
         ))
         .await
-    {
-        eprintln!("wakeup_facts multi-type fulltext skipped: {err}");
-        if let Err(err2) = graph
-            .run(query(
-                "CREATE FULLTEXT INDEX wakeup_facts IF NOT EXISTS FOR ()-[r:ASSERTS]-() ON EACH [r.factText]",
-            ))
-            .await
-        {
-            eprintln!("wakeup_facts ASSERTS fulltext skipped: {err2}");
-        }
-    }
-    if let Err(err) = graph
-        .run(query(
-            "CREATE FULLTEXT INDEX wakeup_about IF NOT EXISTS FOR ()-[r:ABOUT]-() ON EACH [r.factText]",
-        ))
-        .await
-    {
-        eprintln!("wakeup_about fulltext skipped: {err}");
-    }
-    graph
-        .run(query(
-            r#"
-            MATCH (n:Entity)
-            WHERE n.searchText IS NULL
-            SET n.searchText = trim(coalesce(n.name, '') + ' ' + coalesce(n.iri, '') + ' ' + coalesce(n.value, ''))
-            "#,
-        ))
-        .await
-        .ok();
-    graph
-        .run(query(
-            r#"
-            MATCH (s:Entity)-[r]->(o:Entity)
-            WHERE r.factText IS NULL
-              AND type(r) IN ['ASSERTS','ABOUT','INSTANCE_OF','SUBCLASS_OF','SUBPROPERTY_OF','DOMAIN','RANGE','EVIDENCE_FOR','DERIVED_FROM','SUPPORTS']
-            SET r.factText = trim(
-              coalesce(s.name, s.iri) + ' ' +
-              coalesce(last(split(coalesce(r.propertyIri, type(r)), '/')), type(r)) + ' ' +
-              coalesce(o.value, o.name, o.iri)
-            )
-            "#,
-        ))
-        .await
-        .ok();
+        .context("create required wakeup_facts full-text index")?;
 
     graph
         .run(query(
@@ -193,6 +151,7 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
             ] AS row
             MERGE (c:Entity:Class {iri: row.iri})
             ON CREATE SET c.name = row.name, c.createdAt = datetime()
+            SET c.searchText = trim(coalesce(c.name, row.name) + ' ' + c.iri)
             "#,
         ))
         .await
@@ -216,11 +175,187 @@ pub async fn bootstrap(graph: &Graph) -> Result<()> {
             ] AS row
             MERGE (p:Entity:Property {iri: row.iri})
             ON CREATE SET p.name = row.name, p.createdAt = datetime()
+            SET p.searchText = trim(coalesce(p.name, row.name) + ' ' + p.iri)
             "#,
         ))
         .await
         .context("seed structural properties")?;
+
+    graph
+        .run(query("CALL db.awaitIndexes($timeout_seconds)").param("timeout_seconds", 300_i64))
+        .await
+        .context("wait for required Neo4j indexes to become online")?;
+    verify_required_constraints(graph).await?;
+    verify_required_fulltext_indexes(graph).await?;
+
     Ok(())
+}
+
+async fn verify_required_constraints(graph: &Graph) -> Result<()> {
+    let rows = fetch_all(
+        graph,
+        query(
+            r#"
+            SHOW CONSTRAINTS
+            YIELD name, type, entityType, labelsOrTypes, properties
+            WHERE name IN ['entity_iri', 'fact_lock_key']
+            RETURN name, type AS constraintType, entityType, labelsOrTypes, properties
+            "#,
+        ),
+    )
+    .await
+    .context("inspect required Neo4j constraints")?;
+
+    for (name, label, property) in [
+        ("entity_iri", "Entity", "iri"),
+        ("fact_lock_key", "FactLock", "key"),
+    ] {
+        let row = rows
+            .iter()
+            .find(|row| matches!(row.get::<String>("name"), Ok(actual) if actual == name))
+            .ok_or_else(|| anyhow!("required Neo4j constraint {name} is missing"))?;
+        let constraint_type = row
+            .get::<String>("constraintType")
+            .with_context(|| format!("read type of Neo4j constraint {name}"))?;
+        let entity_type = row
+            .get::<String>("entityType")
+            .with_context(|| format!("read entity type of Neo4j constraint {name}"))?;
+        let labels_or_types = row
+            .get::<Vec<String>>("labelsOrTypes")
+            .with_context(|| format!("read labels of Neo4j constraint {name}"))?;
+        let properties = row
+            .get::<Vec<String>>("properties")
+            .with_context(|| format!("read properties of Neo4j constraint {name}"))?;
+        if constraint_type != "UNIQUENESS"
+            || entity_type != "NODE"
+            || !same_string_members(&labels_or_types, &[label])
+            || !same_string_members(&properties, &[property])
+        {
+            return Err(anyhow!(
+                "required Neo4j constraint {name} has an incompatible definition: type={constraint_type}, entityType={entity_type}, labelsOrTypes={labels_or_types:?}, properties={properties:?}; {RESET_REQUIRED}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn ensure_model_marker(graph: &Graph) -> Result<()> {
+    let markers = fetch_all(
+        graph,
+        query("MATCH (m:MindreaderMeta {key: $key}) RETURN m.version AS version")
+            .param("key", MODEL_MARKER_KEY),
+    )
+    .await
+    .context("read Mindreader database model marker")?;
+
+    if markers.len() > 1 {
+        return Err(anyhow!(
+            "multiple Mindreader database model markers found; {RESET_REQUIRED}"
+        ));
+    }
+
+    if let Some(marker) = markers.first() {
+        let version = marker
+            .get::<i64>("version")
+            .map_err(|_| anyhow!("invalid Mindreader database model marker; {RESET_REQUIRED}"))?;
+        if version != MODEL_VERSION {
+            return Err(anyhow!(
+                "Mindreader database model version {version} is incompatible with required version {MODEL_VERSION}; {RESET_REQUIRED}"
+            ));
+        }
+        return Ok(());
+    }
+
+    let node_count = fetch_one(graph, query("MATCH (n) RETURN count(n) AS nodeCount"))
+        .await
+        .context("check whether the Neo4j database is empty")?
+        .ok_or_else(|| anyhow!("Neo4j did not return a node count"))?
+        .get::<i64>("nodeCount")
+        .context("read Neo4j node count")?;
+
+    if node_count > 0 {
+        return Err(anyhow!(
+            "found {node_count} pre-existing node(s) without a Mindreader database model marker; no data migration is supported, so {RESET_REQUIRED}"
+        ));
+    }
+
+    graph
+        .run(
+            query(
+                "MERGE (m:MindreaderMeta {key: $key}) ON CREATE SET m.version = $version, m.createdAt = datetime()",
+            )
+            .param("key", MODEL_MARKER_KEY)
+            .param("version", MODEL_VERSION),
+        )
+        .await
+        .context("create Mindreader database model marker")?;
+
+    Ok(())
+}
+
+async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
+    let rows = fetch_all(
+        graph,
+        query(
+            r#"
+            SHOW INDEXES
+            YIELD name, type, entityType, labelsOrTypes, properties, state
+            WHERE name IN ['wakeup_nodes', 'wakeup_facts']
+            RETURN name, type AS indexType, entityType, labelsOrTypes, properties, state
+            "#,
+        ),
+    )
+    .await
+    .context("inspect required Neo4j full-text indexes")?;
+
+    for (required_name, required_entity_type) in REQUIRED_FULLTEXT_INDEXES {
+        let row = rows
+            .iter()
+            .find(|row| matches!(row.get::<String>("name"), Ok(name) if name == *required_name))
+            .ok_or_else(|| anyhow!("required Neo4j full-text index {required_name} is missing"))?;
+        let index_type = row
+            .get::<String>("indexType")
+            .with_context(|| format!("read type of Neo4j index {required_name}"))?;
+        let entity_type = row
+            .get::<String>("entityType")
+            .with_context(|| format!("read entity type of Neo4j index {required_name}"))?;
+        let state = row
+            .get::<String>("state")
+            .with_context(|| format!("read state of Neo4j index {required_name}"))?;
+        let labels_or_types = row
+            .get::<Vec<String>>("labelsOrTypes")
+            .with_context(|| format!("read labels or types of Neo4j index {required_name}"))?;
+        let properties = row
+            .get::<Vec<String>>("properties")
+            .with_context(|| format!("read properties of Neo4j index {required_name}"))?;
+
+        let (expected_labels_or_types, expected_properties): (&[&str], &[&str]) =
+            match *required_name {
+                "wakeup_nodes" => (&["Entity"], WAKEUP_NODE_PROPERTIES),
+                "wakeup_facts" => (WAKEUP_RELS, &["factText"]),
+                _ => unreachable!("required full-text index catalog is exhaustive"),
+            };
+
+        if index_type != "FULLTEXT"
+            || entity_type != *required_entity_type
+            || state != "ONLINE"
+            || !same_string_members(&labels_or_types, expected_labels_or_types)
+            || !same_string_members(&properties, expected_properties)
+        {
+            return Err(anyhow!(
+                "required Neo4j index {required_name} has an incompatible definition or is not ready: type={index_type}, entityType={entity_type}, labelsOrTypes={labels_or_types:?}, properties={properties:?}, state={state}; {RESET_REQUIRED}"
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn same_string_members(actual: &[String], expected: &[&str]) -> bool {
+    actual.len() == expected.len()
+        && expected
+            .iter()
+            .all(|expected| actual.iter().any(|actual| actual == expected))
 }
 
 pub fn safe_label(label: &str) -> Result<String> {
@@ -279,6 +414,25 @@ pub async fn fetch_all(graph: &Graph, q: neo4rs::Query) -> Result<Vec<Row>> {
     let mut stream = graph.execute(q).await?;
     let mut rows = Vec::new();
     while let Some(row) = stream.next().await? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+/// Execute a query through an existing transaction and return its first row.
+///
+/// Keeping the transaction handle in the row stream is required by neo4rs; callers
+/// must not issue graph-level queries while the transaction is open.
+pub async fn fetch_one_txn(txn: &mut Txn, q: neo4rs::Query) -> Result<Option<Row>> {
+    let mut stream = txn.execute(q).await?;
+    Ok(stream.next(txn.handle()).await?)
+}
+
+/// Execute a query through an existing transaction and exhaust its row stream.
+pub async fn fetch_all_txn(txn: &mut Txn, q: neo4rs::Query) -> Result<Vec<Row>> {
+    let mut stream = txn.execute(q).await?;
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next(txn.handle()).await? {
         rows.push(row);
     }
     Ok(rows)
@@ -415,6 +569,14 @@ pub struct NodeSpec {
     pub labels: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FactLockSpec {
+    key: String,
+    subject_iri: String,
+    predicate_iri: String,
+    layer: String,
+}
+
 pub fn infer_kind(spec: &NodeSpec, fallback: &str) -> String {
     if let Some(iri) = &spec.iri {
         if let Some(k) = kind_from_iri(iri) {
@@ -429,14 +591,13 @@ pub fn infer_kind(spec: &NodeSpec, fallback: &str) -> String {
     fallback.to_string()
 }
 
-pub async fn merge_node(
-    graph: &Graph,
+fn resolved_node_parts(
     spec: &NodeSpec,
     default_kind: &str,
     extra_labels: &[String],
-) -> Result<MergedNode> {
+) -> Result<(String, String, Vec<String>)> {
     let kind = infer_kind(spec, default_kind);
-    let iri = if let Some(iri) = spec.iri.as_deref().filter(|s| !s.is_empty()) {
+    let iri = if let Some(iri) = spec.iri.as_deref().filter(|value| !value.is_empty()) {
         iri.to_string()
     } else {
         let seed = spec.name.as_deref().unwrap_or("unnamed");
@@ -444,17 +605,224 @@ pub async fn merge_node(
     };
     let name = spec.name.clone().unwrap_or_else(|| name_from_iri(&iri));
     let mut labels = Vec::new();
-    if let Some(l) = label_for_kind(&kind) {
-        labels.push(l.to_string());
+    if let Some(label) = label_for_kind(&kind) {
+        labels.push(label.to_string());
     }
     labels.extend(spec.labels.iter().cloned());
     labels.extend(extra_labels.iter().cloned());
-    labels.retain(|l| l != "Entity");
+    labels.retain(|label| label != "Entity");
     let mut seen = std::collections::HashSet::new();
-    labels.retain(|l| seen.insert(l.clone()));
-    for l in &labels {
-        safe_label(l)?;
+    labels.retain(|label| seen.insert(label.clone()));
+    for label in &labels {
+        safe_label(label)?;
     }
+    Ok((iri, name, labels))
+}
+
+/// MERGE an entity using only the supplied transaction.
+///
+/// `searchText` deliberately contains intrinsic node data only. Fact text belongs
+/// on relationships and must not accumulate on nodes when facts are replaced or
+/// retracted.
+pub async fn merge_node_in_txn(
+    txn: &mut Txn,
+    spec: &NodeSpec,
+    default_kind: &str,
+    extra_labels: &[String],
+) -> Result<MergedNode> {
+    let (iri, name, labels) = resolved_node_parts(spec, default_kind, extra_labels)?;
+    let row = fetch_one_txn(
+        txn,
+        query(
+            r#"
+            OPTIONAL MATCH (existing:Entity {iri: $iri})
+            MERGE (n:Entity {iri: $iri})
+            ON CREATE SET n.name = $name, n.createdAt = datetime()
+            ON MATCH SET n.name = coalesce(n.name, $name)
+            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
+            RETURN n, existing IS NULL AS created
+            "#,
+        )
+        .param("iri", iri.clone())
+        .param("name", name.clone()),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("failed to MERGE node {iri}"))?;
+    let created = row.get::<bool>("created").unwrap_or(false);
+
+    if !labels.is_empty() {
+        let set = labels
+            .iter()
+            .map(|label| format!("n:{}", safe_label(label).expect("labels validated above")))
+            .collect::<Vec<_>>()
+            .join(" SET ");
+        let cypher = format!("MATCH (n:Entity {{iri: $iri}}) SET {set} RETURN n");
+        fetch_one_txn(txn, query(&cypher).param("iri", iri.clone()))
+            .await?
+            .ok_or_else(|| anyhow!("missing node while applying labels to {iri}"))?;
+    }
+
+    let after = fetch_one_txn(
+        txn,
+        query("MATCH (n:Entity {iri: $iri}) RETURN n").param("iri", iri.clone()),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("missing node after MERGE {iri}"))?;
+    let node: Node = after.get("n")?;
+    let labels = node
+        .labels()
+        .into_iter()
+        .filter(|label| *label != "Entity")
+        .map(str::to_string)
+        .collect();
+    Ok(MergedNode {
+        iri,
+        name,
+        labels,
+        created,
+        json: node_json(&node),
+    })
+}
+
+/// MERGE a literal using the canonical domain-level literal IRI algorithm.
+pub async fn merge_literal_in_txn(
+    txn: &mut Txn,
+    value: &str,
+    datatype: &str,
+) -> Result<MergedNode> {
+    let iri = literal_iri(value, datatype);
+    let row = fetch_one_txn(
+        txn,
+        query(
+            r#"
+            OPTIONAL MATCH (existing:Entity {iri: $iri})
+            MERGE (n:Entity:Literal {iri: $iri})
+            ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype,
+              n.createdAt = datetime()
+            ON MATCH SET n.name = coalesce(n.name, $name),
+              n.value = coalesce(n.value, $value), n.datatype = coalesce(n.datatype, $datatype)
+            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, $value))
+            RETURN n, existing IS NULL AS created
+            "#,
+        )
+        .param("iri", iri.clone())
+        .param("name", value.to_string())
+        .param("value", value.to_string())
+        .param("datatype", datatype.to_string()),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("failed to MERGE literal {iri}"))?;
+    let node: Node = row.get("n")?;
+    let created = row.get::<bool>("created").unwrap_or(false);
+    Ok(MergedNode {
+        iri,
+        name: value.to_string(),
+        labels: vec!["Literal".into()],
+        created,
+        json: node_json(&node),
+    })
+}
+
+/// Ensure a property stub exists without leaving the caller's transaction.
+pub async fn ensure_property_in_txn(
+    txn: &mut Txn,
+    property: &str,
+) -> Result<(String, bool, Value)> {
+    let iri = property_iri(property);
+    let name = name_from_iri(&iri);
+    let row = fetch_one_txn(
+        txn,
+        query(
+            r#"
+            OPTIONAL MATCH (existing:Entity {iri: $iri})
+            MERGE (n:Entity:Property {iri: $iri})
+            ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = true
+            ON MATCH SET n.name = coalesce(n.name, $name)
+            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
+            RETURN n, existing IS NULL AS created
+            "#,
+        )
+        .param("iri", iri.clone())
+        .param("name", name),
+    )
+    .await?
+    .ok_or_else(|| anyhow!("failed to MERGE property {iri}"))?;
+    let node: Node = row.get("n")?;
+    let created = row.get::<bool>("created").unwrap_or(false);
+    Ok((iri, created, node_json(&node)))
+}
+
+fn lock_key(subject_iri: &str, predicate_iri: &str, layer: &str) -> String {
+    let mut hasher = Sha256::new();
+    for part in [subject_iri, predicate_iri, layer] {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part.as_bytes());
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn fact_lock_specs(facts: &[(String, String, String)]) -> Vec<FactLockSpec> {
+    let mut locks = Vec::with_capacity(facts.len() * 2);
+    for (subject_iri, predicate_iri, layer) in facts {
+        for predicate_iri in ["*", predicate_iri.as_str()] {
+            locks.push(FactLockSpec {
+                key: lock_key(subject_iri, predicate_iri, layer),
+                subject_iri: subject_iri.clone(),
+                predicate_iri: predicate_iri.to_string(),
+                layer: layer.clone(),
+            });
+        }
+    }
+    locks.sort_by(|left, right| left.key.cmp(&right.key));
+    locks.dedup_by(|left, right| left.key == right.key);
+    locks
+}
+
+/// Acquire deterministic subject and predicate guards for every fact tuple.
+///
+/// Each `(subject, predicate, layer)` request acquires both `(subject, "*",
+/// layer)` and `(subject, predicate, layer)`. Sorting the collision-resistant
+/// keys before updating lock nodes gives concurrent writers a consistent lock
+/// order and prevents stale precondition reads.
+pub async fn acquire_fact_locks_in_txn(
+    txn: &mut Txn,
+    facts: &[(String, String, String)],
+) -> Result<()> {
+    for lock in fact_lock_specs(facts) {
+        fetch_one_txn(
+            txn,
+            query(
+                r#"
+                MERGE (lock:FactLock {key: $key})
+                ON CREATE SET lock.subjectIri = $subjectIri,
+                  lock.predicateIri = $predicateIri, lock.layer = $layer,
+                  lock.createdAt = datetime(), lock.revision = 0
+                SET lock.revision = lock.revision + 1, lock.acquiredAt = datetime()
+                RETURN lock.key AS key
+                "#,
+            )
+            .param("key", lock.key)
+            .param("subjectIri", lock.subject_iri)
+            .param("predicateIri", lock.predicate_iri)
+            .param("layer", lock.layer),
+        )
+        .await?
+        .ok_or_else(|| anyhow!("failed to acquire fact lock"))?;
+    }
+    Ok(())
+}
+
+pub async fn merge_node(
+    graph: &Graph,
+    spec: &NodeSpec,
+    default_kind: &str,
+    extra_labels: &[String],
+) -> Result<MergedNode> {
+    let (iri, name, labels) = resolved_node_parts(spec, default_kind, extra_labels)?;
 
     let row = fetch_one(
         graph,
@@ -462,10 +830,9 @@ pub async fn merge_node(
             r#"
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime(),
-              n.searchText = trim($name + ' ' + $iri)
-            ON MATCH SET n.name = coalesce(n.name, $name),
-              n.searchText = coalesce(n.searchText, trim(coalesce(n.name, $name) + ' ' + $iri))
+            ON CREATE SET n.name = $name, n.createdAt = datetime()
+            ON MATCH SET n.name = coalesce(n.name, $name)
+            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
             RETURN n, existing IS NULL AS created
             "#,
         )
@@ -513,22 +880,18 @@ pub async fn merge_node(
 }
 
 pub async fn merge_literal(graph: &Graph, value: &str, datatype: &str) -> Result<MergedNode> {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("{datatype}:{value}").as_bytes());
-    let digest = hasher.finalize();
-    let hex: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
-    let slug = slugify(value, true);
-    let slug = if slug.len() > 40 { &slug[..40] } else { &slug };
-    let iri = format!("mindreader:literal/{slug}-{hex}");
+    let iri = literal_iri(value, datatype);
     let row = fetch_one(
         graph,
         query(
             r#"
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Literal {iri: $iri})
-            ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype, n.createdAt = datetime(),
-              n.searchText = trim($name + ' ' + $iri + ' ' + $value)
-            ON MATCH SET n.searchText = coalesce(n.searchText, trim(coalesce(n.name, $name) + ' ' + $iri + ' ' + coalesce(n.value, $value)))
+            ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype,
+              n.createdAt = datetime()
+            ON MATCH SET n.name = coalesce(n.name, $name),
+              n.value = coalesce(n.value, $value), n.datatype = coalesce(n.datatype, $datatype)
+            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, $value))
             RETURN n, existing IS NULL AS created
             "#,
         )
@@ -560,6 +923,8 @@ pub async fn ensure_property(graph: &Graph, p: &str) -> Result<(String, bool, Va
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Property {iri: $iri})
             ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = true
+            ON MATCH SET n.name = coalesce(n.name, $name)
+            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
             RETURN n, existing IS NULL AS created
             "#,
         )
@@ -643,7 +1008,7 @@ pub fn fact_text(s_name: &str, s_iri: &str, prop_iri: &str, o: &MergedNode) -> S
         .get("value")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .or_else(|| {
+        .or({
             if !o.name.is_empty() {
                 Some(o.name.as_str())
             } else {
@@ -726,7 +1091,66 @@ pub fn spike_rank(label: Option<&str>) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{safe_label, safe_rel, spike_rank};
+    use super::{fact_lock_specs, lock_key, safe_label, safe_rel, same_string_members, spike_rank};
+
+    #[test]
+    fn fact_locks_are_complete_deduplicated_and_deterministically_ordered() {
+        let facts = vec![
+            (
+                "mindreader:element/b".into(),
+                "mindreader:property/Z".into(),
+                "global".into(),
+            ),
+            (
+                "mindreader:element/a".into(),
+                "mindreader:property/A".into(),
+                "project:test".into(),
+            ),
+            (
+                "mindreader:element/b".into(),
+                "mindreader:property/Z".into(),
+                "global".into(),
+            ),
+        ];
+        let locks = fact_lock_specs(&facts);
+        assert_eq!(
+            locks.len(),
+            4,
+            "each unique fact gets a subject and predicate lock"
+        );
+        assert!(locks.windows(2).all(|pair| pair[0].key < pair[1].key));
+        assert!(locks.iter().all(|lock| lock.key.len() == 64));
+        assert_eq!(
+            locks
+                .iter()
+                .filter(|lock| lock.predicate_iri == "*")
+                .count(),
+            2
+        );
+
+        let mut reversed = facts;
+        reversed.reverse();
+        assert_eq!(locks, fact_lock_specs(&reversed));
+    }
+
+    #[test]
+    fn fact_lock_key_is_length_delimited() {
+        assert_ne!(lock_key("ab", "c", "d"), lock_key("a", "bc", "d"));
+        assert_ne!(lock_key("a", "b", "cd"), lock_key("a", "bc", "d"));
+    }
+
+    #[test]
+    fn index_definition_members_are_order_independent_and_exact() {
+        assert!(same_string_members(
+            &["iri".into(), "name".into()],
+            &["name", "iri"]
+        ));
+        assert!(!same_string_members(&["name".into()], &["name", "iri"]));
+        assert!(!same_string_members(
+            &["name".into(), "iri".into(), "legacy".into()],
+            &["name", "iri"]
+        ));
+    }
 
     #[test]
     fn spike_rank_orders() {

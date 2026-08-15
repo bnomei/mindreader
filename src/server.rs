@@ -1,9 +1,11 @@
 use crate::config::Config;
+use crate::domain::ProjectId;
 use crate::graph;
+use crate::service::MemoryService;
 use crate::tools::{
-    self, AssertArgs, GetArgs, RetractArgs, SchemaArgs, SearchArgs, StatsArgs, TraverseArgs,
+    self, AssertArgs, GetArgs, ReplaceArgs, RetractArgs, SchemaArgs, SearchArgs, StatsArgs,
+    TraverseArgs,
 };
-use neo4rs::Graph;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
@@ -62,20 +64,72 @@ fn schema_memory_stats() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+fn entity_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "An entity reference. Runtime validation requires at least one of iri or name.",
+        "properties": {
+            "kind": { "type": "string", "enum": ["entity"] },
+            "iri": { "type": "string" },
+            "name": { "type": "string" },
+            "labels": { "type": "array", "items": { "type": "string" } }
+        },
+        "required": ["kind"]
+    })
+}
+
+fn object_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "description": "A tagged entity or literal. Entity values use iri/name/labels; literal values use value and optional datatype.",
+        "properties": {
+            "kind": { "type": "string", "enum": ["entity", "literal"] },
+            "iri": { "type": "string" },
+            "name": { "type": "string" },
+            "labels": { "type": "array", "items": { "type": "string" } },
+            "value": { "type": "string" },
+            "datatype": { "type": "string", "default": "xsd:string" }
+        },
+        "required": ["kind"]
+    })
+}
+
 fn schema_memory_assert() -> Arc<rmcp::model::JsonObject> {
     // Host wrappers drop the whole server if any inputSchema uses anyOf.
-    // Runtime still accepts objects via serde Value; advertised schema is strings.
     object_schema(serde_json::json!({
         "type": "object",
         "properties": {
-            "s": { "type": "string", "description": "subject IRI or name" },
+            "s": entity_input_schema(),
             "p": { "type": "string" },
-            "o": { "type": "string", "description": "object IRI, name, or literal" },
+            "o": object_input_schema(),
             "layer": { "type": "string" },
-            "spike": { "type": "string" },
+            "spike": {
+                "type": "string",
+                "enum": ["Signal", "Pattern", "Insight", "Knowledge"]
+            },
             "contradicts": { "type": "boolean" }
         },
         "required": ["s", "p", "o"]
+    }))
+}
+
+fn schema_memory_replace() -> Arc<rmcp::model::JsonObject> {
+    object_schema(serde_json::json!({
+        "type": "object",
+        "properties": {
+            "s": entity_input_schema(),
+            "p": { "type": "string" },
+            "old": object_input_schema(),
+            "new": object_input_schema(),
+            "layer": { "type": "string" },
+            "spike": {
+                "type": "string",
+                "enum": ["Signal", "Pattern", "Insight", "Knowledge"]
+            },
+            "contradicts": { "type": "boolean" },
+            "reason": { "type": "string" }
+        },
+        "required": ["s", "p", "old", "new"]
     }))
 }
 
@@ -83,13 +137,24 @@ fn schema_memory_retract() -> Arc<rmcp::model::JsonObject> {
     object_schema(serde_json::json!({
         "type": "object",
         "properties": {
-            "iri": { "type": "string" },
-            "s": { "type": "string" },
-            "p": { "type": "string" },
-            "o": { "type": "string", "description": "object IRI, name, or literal" },
+            "target": {
+                "type": "object",
+                "description": "A tagged retract scope. fact requires p and o; predicate requires p; subject uses only s.",
+                "properties": {
+                    "kind": {
+                        "type": "string",
+                        "enum": ["fact", "predicate", "subject"]
+                    },
+                    "s": entity_input_schema(),
+                    "p": { "type": "string" },
+                    "o": object_input_schema()
+                },
+                "required": ["kind", "s"]
+            },
             "layer": { "type": "string" },
             "reason": { "type": "string" }
-        }
+        },
+        "required": ["target"]
     }))
 }
 
@@ -97,7 +162,7 @@ fn schema_memory_schema() -> Arc<rmcp::model::JsonObject> {
     object_schema(serde_json::json!({
         "type": "object",
         "properties": {
-            "kind": { "type": "string", "description": "class or property" },
+            "kind": { "type": "string", "enum": ["class", "property"] },
             "name": { "type": "string" },
             "iri": { "type": "string" },
             "subClassOf": { "type": "string" },
@@ -112,7 +177,7 @@ fn schema_memory_schema() -> Arc<rmcp::model::JsonObject> {
 #[derive(Clone)]
 pub struct Mindreader {
     pub tool_router: ToolRouter<Self>,
-    graph: Arc<OnceCell<Graph>>,
+    service: Arc<OnceCell<MemoryService>>,
     pub project: String,
     cfg: Config,
 }
@@ -121,7 +186,7 @@ impl Mindreader {
     fn from_config(cfg: Config) -> Self {
         Self {
             tool_router: Self::tool_router(),
-            graph: Arc::new(OnceCell::new()),
+            service: Arc::new(OnceCell::new()),
             project: cfg.project.clone(),
             cfg,
         }
@@ -142,19 +207,20 @@ impl Mindreader {
     }
 
     pub async fn ensure_connected(&self) -> anyhow::Result<()> {
-        self.graph
+        self.service
             .get_or_try_init(|| async {
                 let g = graph::connect(&self.cfg).await?;
                 graph::bootstrap(&g).await?;
-                Ok::<_, anyhow::Error>(g)
+                let project = ProjectId::parse(self.cfg.project.clone())?;
+                Ok::<_, anyhow::Error>(MemoryService::new(g, project))
             })
             .await?;
         Ok(())
     }
 
-    async fn graph(&self) -> Result<&Graph, McpError> {
+    async fn service(&self) -> Result<&MemoryService, McpError> {
         self.ensure_connected().await.map_err(map_err)?;
-        self.graph
+        self.service
             .get()
             .ok_or_else(|| McpError::internal_error("neo4j not connected", None))
     }
@@ -186,11 +252,8 @@ impl Mindreader {
         &self,
         Parameters(args): Parameters<GetArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let graph = self.graph().await?;
-        tools::memory_get(graph, &self.project, args)
-            .await
-            .map_err(map_err)
-            .and_then(ok)
+        let service = self.service().await?;
+        service.get(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
@@ -202,11 +265,8 @@ impl Mindreader {
         &self,
         Parameters(args): Parameters<SearchArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let graph = self.graph().await?;
-        tools::memory_search(graph, &self.project, args)
-            .await
-            .map_err(map_err)
-            .and_then(ok)
+        let service = self.service().await?;
+        service.search(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
@@ -218,11 +278,8 @@ impl Mindreader {
         &self,
         Parameters(args): Parameters<TraverseArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let graph = self.graph().await?;
-        tools::memory_traverse(graph, &self.project, args)
-            .await
-            .map_err(map_err)
-            .and_then(ok)
+        let service = self.service().await?;
+        service.traverse(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
@@ -234,43 +291,47 @@ impl Mindreader {
         &self,
         Parameters(args): Parameters<StatsArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let graph = self.graph().await?;
-        tools::memory_stats(graph, &self.project, args)
-            .await
-            .map_err(map_err)
-            .and_then(ok)
+        let service = self.service().await?;
+        service.stats(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
         name = "memory_assert",
-        description = "Use to write or update one fact as a triple (s, p, o). Same current triple is a no-op; a new o supersedes with history. Optional spike labels this as Signal, Pattern, Insight, or Knowledge ABOUT an Element. Optional contradicts=true records a fight with another visible layer's current (s,p). Encode a triple — do not dump prose or markdown. Search or schema-read first if you are unsure the property already exists.",
+        description = "Use to add one exact fact as a triple (s, p, o). Facts are set-valued: another current object for the same subject and property remains current. Reasserting the exact current triple is a no-op. Optional spike labels this as Signal, Pattern, Insight, or Knowledge ABOUT an Element. Optional contradicts=true records a fight with another visible layer's current (s,p). Encode a triple — do not dump prose or markdown.",
         input_schema = schema_memory_assert()
     )]
     async fn memory_assert(
         &self,
         Parameters(args): Parameters<AssertArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let graph = self.graph().await?;
-        tools::memory_assert(graph, &self.project, args)
-            .await
-            .map_err(map_err)
-            .and_then(ok)
+        let service = self.service().await?;
+        service.assert(args).await.map_err(map_err).and_then(ok)
+    }
+
+    #[tool(
+        name = "memory_replace",
+        description = "Use to correct one exact current fact. old must identify a current object; only that triple is closed, new is added if needed, unrelated current objects remain, and SUPERSEDES history is recorded atomically. Use memory_assert when adding another valid value instead.",
+        input_schema = schema_memory_replace()
+    )]
+    async fn memory_replace(
+        &self,
+        Parameters(args): Parameters<ReplaceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let service = self.service().await?;
+        service.replace(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
         name = "memory_retract",
-        description = "Use to withdraw a current fact you no longer stand behind. Soft-retract only (validTo); nodes are never hard-deleted. Call with iri or with (s,p,o). Omit layer to use this project's write layer. To correct a value, prefer memory_assert (it supersedes). Do not retract schema (Class/Property) unless you explicitly mean to.",
+        description = "Use to withdraw current facts you no longer stand behind. Retraction is soft (validTo); nodes and history are never deleted. target.kind=fact closes one exact triple, predicate intentionally closes all objects for one subject/property, and subject intentionally closes retractable outgoing facts for one subject. Omit layer to use this project's write layer. Use memory_replace for corrections.",
         input_schema = schema_memory_retract()
     )]
     async fn memory_retract(
         &self,
         Parameters(args): Parameters<RetractArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let graph = self.graph().await?;
-        tools::memory_retract(graph, &self.project, args)
-            .await
-            .map_err(map_err)
-            .and_then(ok)
+        let service = self.service().await?;
+        service.retract(args).await.map_err(map_err).and_then(ok)
     }
 
     #[tool(
@@ -282,8 +343,9 @@ impl Mindreader {
         &self,
         Parameters(args): Parameters<SchemaArgs>,
     ) -> Result<CallToolResult, McpError> {
-        let graph = self.graph().await?;
-        tools::memory_schema(graph, &self.project, args)
+        let service = self.service().await?;
+        service
+            .declare_schema(args)
             .await
             .map_err(map_err)
             .and_then(ok)
@@ -304,7 +366,7 @@ impl ServerHandler for Mindreader {
                 website_url: None,
             },
             instructions: Some(
-                "Mindreader: RDFS schema-as-data memory over Neo4j. Tools: memory_get, memory_search, memory_traverse, memory_stats, memory_assert, memory_retract, memory_schema. project_id is env-only (MINDREADER_PROJECT). No raw Cypher."
+                "Mindreader: RDFS schema-as-data memory over Neo4j. Tools: memory_get, memory_search, memory_traverse, memory_stats, memory_assert, memory_replace, memory_retract, memory_schema. project_id is env-only (MINDREADER_PROJECT). No raw Cypher."
                     .into(),
             ),
         }
@@ -330,13 +392,15 @@ impl ServerHandler for Mindreader {
 #[cfg(test)]
 mod tests {
     use super::Mindreader;
+    use serde_json::Value;
 
     #[test]
-    fn registers_seven_tools() {
+    fn registers_eight_tools() {
         let names = Mindreader::registered_tool_names();
         let expected = [
             "memory_assert",
             "memory_get",
+            "memory_replace",
             "memory_retract",
             "memory_schema",
             "memory_search",
@@ -348,28 +412,45 @@ mod tests {
         for name in expected {
             assert!(router.has_route(name), "missing route {name}");
         }
-        assert_eq!(router.map.len(), 7);
+        assert_eq!(router.map.len(), 8);
     }
 
     #[test]
-    fn assert_schema_has_contradicts() {
+    fn mutation_schemas_advertise_tagged_inputs() {
         let router = Mindreader::tool_router();
         let tools: Vec<_> = router.list_all();
-        let assert = tools.iter().find(|t| t.name == "memory_assert").unwrap();
-        let schema = assert.schema_as_json_value();
-        let props = schema
+        let assert_schema = tools
+            .iter()
+            .find(|tool| tool.name == "memory_assert")
+            .unwrap()
+            .schema_as_json_value();
+        let assert_props = assert_schema
             .get("properties")
             .and_then(|p| p.as_object())
             .unwrap();
-        assert!(
-            props.contains_key("contradicts"),
-            "contradicts missing: {schema}"
+        assert_eq!(
+            assert_props["s"].get("type").and_then(Value::as_str),
+            Some("object")
         );
         assert_eq!(
-            props["contradicts"].get("type").and_then(|v| v.as_str()),
+            assert_props["o"].get("type").and_then(Value::as_str),
+            Some("object")
+        );
+        assert_eq!(
+            assert_props["contradicts"]
+                .get("type")
+                .and_then(Value::as_str),
             Some("boolean")
         );
-        let required = schema
+        assert_eq!(
+            assert_props["s"]["properties"]["kind"]["enum"],
+            serde_json::json!(["entity"])
+        );
+        assert_eq!(
+            assert_props["o"]["properties"]["kind"]["enum"],
+            serde_json::json!(["entity", "literal"])
+        );
+        let required = assert_schema
             .get("required")
             .and_then(|r| r.as_array())
             .cloned()
@@ -379,14 +460,63 @@ mod tests {
         assert!(required.iter().any(|v| v.as_str() == Some("o")));
         assert!(!required.iter().any(|v| v.as_str() == Some("contradicts")));
 
-        // Schema catalog / memory_schema list is NOT in this pass.
+        let replace_schema = tools
+            .iter()
+            .find(|tool| tool.name == "memory_replace")
+            .unwrap()
+            .schema_as_json_value();
+        let replace_required = replace_schema["required"].as_array().unwrap();
+        for name in ["s", "p", "old", "new"] {
+            assert!(replace_required.iter().any(|value| value == name));
+        }
+        assert_eq!(replace_schema["properties"]["old"]["type"], "object");
+        assert_eq!(replace_schema["properties"]["new"]["type"], "object");
+
+        let retract_schema = tools
+            .iter()
+            .find(|tool| tool.name == "memory_retract")
+            .unwrap()
+            .schema_as_json_value();
+        let target = &retract_schema["properties"]["target"];
+        assert_eq!(target["type"], "object");
+        assert_eq!(
+            target["properties"]["kind"]["enum"],
+            serde_json::json!(["fact", "predicate", "subject"])
+        );
+        assert_eq!(target["properties"]["s"]["type"], "object");
+        assert_eq!(target["properties"]["o"]["type"], "object");
     }
 
     #[test]
     fn tool_input_schemas_are_objects() {
+        fn assert_no_union_keywords(value: &Value, tool: &str) {
+            match value {
+                Value::Object(map) => {
+                    assert!(
+                        !map.contains_key("anyOf"),
+                        "tool {tool} contains anyOf: {value}"
+                    );
+                    assert!(
+                        !map.contains_key("oneOf"),
+                        "tool {tool} contains oneOf: {value}"
+                    );
+                    for child in map.values() {
+                        assert_no_union_keywords(child, tool);
+                    }
+                }
+                Value::Array(values) => {
+                    for child in values {
+                        assert_no_union_keywords(child, tool);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         let router = Mindreader::tool_router();
         for tool in router.list_all() {
             let schema = tool.schema_as_json_value();
+            assert_no_union_keywords(&schema, &tool.name);
             assert_eq!(
                 schema.get("type").and_then(|v| v.as_str()),
                 Some("object"),

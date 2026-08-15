@@ -19,6 +19,7 @@
     "memory_traverse",
     "memory_stats",
     "memory_assert",
+    "memory_replace",
     "memory_retract",
     "memory_schema"
   ]
