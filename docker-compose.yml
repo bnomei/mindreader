@@ -6,7 +6,7 @@ services:
       NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-change-me}
       NEO4J_PLUGINS: '["apoc", "apoc-extended"]'
       NEO4J_apoc_ttl_enabled: "true"
-      NEO4J_dbms_security_procedures_allowlist: "apoc.config.list,apoc.text.*,apoc.refactor.mergeNodes,apoc.ttl.*"
+      NEO4J_dbms_security_procedures_allowlist: "apoc.config.list,apoc.merge.node,apoc.text.*,apoc.refactor.mergeNodes,apoc.ttl.*"
       NEO4J_dbms_security_procedures_unrestricted: "apoc.config.list,apoc.refactor.mergeNodes,apoc.ttl.*"
     ports:
       - "7474:7474"

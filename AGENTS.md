@@ -6,7 +6,7 @@ These instructions apply to the entire repository.
 
 ## Project contract
 
-Mindreader is a Rust stdio MCP server backed by Neo4j. It exposes exactly ten memory tools and stores explicit graph triples with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, and explicit supersession history. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/writing-to-mindreader/SKILL.md` aligned with it.
+Mindreader is a Rust stdio MCP server backed by Neo4j. It exposes exactly twelve memory tools and stores explicit graph triples with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, explicit supersession history, semantic recall, and intentional same-kind entity merging. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/writing-to-mindreader/SKILL.md` aligned with it.
 
 Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward compatibility, or add abstraction for hypothetical future requirements. Choose the simplest implementation that fully satisfies the current contract.
 
@@ -15,10 +15,13 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - `src/main.rs`: process startup and stdio transport. Stdout is protocol-only.
 - `src/server.rs`: MCP tool registration, advertised JSON schemas, protocol negotiation, and lazy Neo4j access.
 - `src/service.rs`: typed application boundary shared by MCP and other adapters.
+- `src/error.rs`: typed application errors, preserved source context, and retry classification.
 - `src/domain.rs`: validated layer, entity, literal, target, replacement, and retraction concepts.
 - `src/tools.rs`: public tool arguments and graph behavior.
 - `src/graph.rs`: Neo4j connection/bootstrap, query helpers, serialization, safe labels/relationships, and persistence primitives.
-- `src/config.rs`: `.env` loading and environment defaults.
+- `src/merge.rs`: advisory duplicate suggestions and permanent same-kind node merging.
+- `src/semantic.rs`: direct/vector rank fusion and expiring semantic activations.
+- `src/config.rs`: native configuration and colocated secret loading.
 - `src/layers.rs`: layer validation and visibility-union policy.
 - `src/iri.rs`: deterministic IRI minting and kind/label mapping.
 - `src/bin/mindreader-smoke.rs`: live Neo4j integration coverage.
@@ -33,7 +36,7 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - Parameterize user-provided Cypher values. Validate any identifier that must be interpolated, such as labels or relationship types.
 - Every scoped tool requires a validated `layers` array. `[]` means global-only; named layers form an OR union, and visible relationships require visible endpoints. Layer IDs use lowercase kebab-case colon namespaces.
 - Empty record memberships mean global. An exact relationship has one identity across memberships; assertions merge memberships rather than duplicate the relationship.
-- `memory_schema` writes global schema-as-data and is the only tool without a `layers` input.
+- `memory_schema` writes global schema-as-data. It and database-wide `memory_merge` are the only tools without a `layers` input.
 - `memory_feedback` changes a visible node or current relationship's shared signed weight by exactly `+1` or `-1`. Retrieval never changes weight automatically, weights do not decay, and search uses weight only within the same Spike category.
 - `memory_layers` records state-changing membership audits and must preserve relationship endpoint closure.
 - Retraction is soft: set `validTo`; do not hard-delete nodes or history.
@@ -74,7 +77,7 @@ cargo run --bin mindreader-smoke
 
 The smoke test mutates the configured database and does not clean up its fixtures. Use a development or disposable database, never an unreviewed production target.
 
-For MCP registration, input-schema, startup, or protocol changes, verify that initialization and `tools/list` complete with all ten tools even when Neo4j is unavailable. Use the existing unit tests and, when the workspace paths match the script, the probe:
+For MCP registration, input-schema, startup, or protocol changes, verify that initialization and `tools/list` complete with all twelve tools even when Neo4j is unavailable. Use the existing unit tests and, when the workspace paths match the script, the probe:
 
 ```bash
 cargo build

@@ -1,4 +1,7 @@
-use anyhow::{anyhow, Context, Result};
+use crate::{
+    config_error,
+    error::{Context, Result},
+};
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -89,17 +92,19 @@ impl Default for SemanticConfig {
 impl SemanticConfig {
     fn validate(&self) -> Result<()> {
         if self.ttl_days == 0 {
-            return Err(anyhow!("semantic.ttl_days must be greater than zero"));
+            return Err(config_error!("semantic.ttl_days must be greater than zero"));
         }
         if self
             .ttl_days
             .checked_mul(86_400_000)
             .is_none_or(|milliseconds| milliseconds > i64::MAX as u64)
         {
-            return Err(anyhow!("semantic.ttl_days is too large"));
+            return Err(config_error!("semantic.ttl_days is too large"));
         }
         if !(1..=100).contains(&self.neighbor_limit) {
-            return Err(anyhow!("semantic.neighbor_limit must be between 1 and 100"));
+            return Err(config_error!(
+                "semantic.neighbor_limit must be between 1 and 100"
+            ));
         }
         for (name, value) in [
             (
@@ -116,14 +121,18 @@ impl SemanticConfig {
             ),
         ] {
             if !(0.0..=1.0).contains(&value) || !value.is_finite() {
-                return Err(anyhow!("{name} must be a finite value between 0 and 1"));
+                return Err(config_error!(
+                    "{name} must be a finite value between 0 and 1"
+                ));
             }
         }
         if !self.rrf_k.is_finite() || self.rrf_k <= 0.0 {
-            return Err(anyhow!("semantic.rrf_k must be greater than zero"));
+            return Err(config_error!("semantic.rrf_k must be greater than zero"));
         }
         if !self.direct_weight.is_finite() || self.direct_weight <= 0.0 {
-            return Err(anyhow!("semantic.direct_weight must be greater than zero"));
+            return Err(config_error!(
+                "semantic.direct_weight must be greater than zero"
+            ));
         }
         Ok(())
     }
@@ -188,7 +197,8 @@ pub struct Config {
 }
 
 pub fn config_dir() -> Result<PathBuf> {
-    let base = BaseDirs::new().ok_or_else(|| anyhow!("cannot resolve the OS config directory"))?;
+    let base =
+        BaseDirs::new().ok_or_else(|| config_error!("cannot resolve the OS config directory"))?;
     Ok(base.config_dir().join("mindreader"))
 }
 
@@ -248,6 +258,14 @@ impl Config {
         Self::from_dir(config_dir()?)
     }
 
+    /// Load a complete native configuration from an explicit directory.
+    ///
+    /// This is intended for diagnostics and isolated integration tests that
+    /// must not reuse the operator's normal configuration directory.
+    pub fn from_directory(config_dir: impl Into<PathBuf>) -> Result<Self> {
+        Self::from_dir(config_dir.into())
+    }
+
     fn from_dir(config_dir: PathBuf) -> Result<Self> {
         initialize_directory(&config_dir)?;
         let secrets_path = config_dir.join(SECRETS_FILE);
@@ -297,7 +315,7 @@ impl Config {
 
     pub fn neo4j_password(&self) -> Result<&str> {
         self.password.as_deref().ok_or_else(|| {
-            anyhow!(
+            config_error!(
                 "NEO4J_PASSWORD is not set; add it to {} or the process environment",
                 self.secrets_path().display()
             )
@@ -313,12 +331,14 @@ fn selected_embedding(
 ) -> Result<SelectedEmbedding> {
     let model = config.model.trim();
     if model.is_empty() {
-        return Err(anyhow!(
+        return Err(config_error!(
             "{section}.model must be configured when its API key is set"
         ));
     }
     if !(1..=4096).contains(&config.dimensions) {
-        return Err(anyhow!("{section}.dimensions must be between 1 and 4096"));
+        return Err(config_error!(
+            "{section}.dimensions must be between 1 and 4096"
+        ));
     }
     Ok(SelectedEmbedding {
         provider,

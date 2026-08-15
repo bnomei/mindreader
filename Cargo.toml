@@ -23,20 +23,20 @@ name = "mindreader-smoke"
 path = "src/bin/mindreader-smoke.rs"
 
 [dependencies]
-anyhow = "1.0.104"
-async-trait = "0.1.89"
+async-trait = "0.1.92"
 directories = "6.0.0"
 dotenvy = "0.15.7"
 neo4rs = "0.8.0"
-reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls"] }
-rmcp = { version = "0.8.3", features = ["server", "transport-io", "macros", "schemars"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
+rmcp = { version = "3.1.2", default-features = false, features = ["server", "transport-io", "macros", "schemars"] }
 schemars = "1.2.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
+thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-toml = "0.9.8"
+toml = "1.1.4"
 uuid = { version = "1.24.1", features = ["v4"] }
 
 [dev-dependencies]
-tempfile = "3.24.0"
+tempfile = "3.27.0"

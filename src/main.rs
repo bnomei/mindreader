@@ -1,4 +1,5 @@
-use anyhow::Context;
+use mindreader::error::{Context, Result};
+use mindreader::operation_error;
 use mindreader::Mindreader;
 use rmcp::{transport::io::stdio, ServiceExt};
 use serde_json::json;
@@ -12,7 +13,7 @@ Options:
   -V, --version  Print version";
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<()> {
     match std::env::args().skip(1).collect::<Vec<_>>().as_slice() {
         [] => {}
         [arg] if arg == "-h" || arg == "--help" => {
@@ -23,13 +24,15 @@ async fn main() -> anyhow::Result<()> {
             println!("mindreader {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
-        args => anyhow::bail!(
-            "unknown arguments: {}\n\n{HELP}",
-            args.iter()
-                .map(|arg| format!("'{arg}'"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
+        args => {
+            return Err(operation_error!(
+                "unknown arguments: {}\n\n{HELP}",
+                args.iter()
+                    .map(|arg| format!("'{arg}'"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
     }
 
     // MCP stdio: never write protocol-breaking bytes to stdout.
@@ -65,6 +68,6 @@ async fn main() -> anyhow::Result<()> {
         }
     });
     let service = server.serve(stdio()).await.context("serve stdio")?;
-    service.waiting().await?;
+    service.waiting().await.context("wait for stdio service")?;
     Ok(())
 }

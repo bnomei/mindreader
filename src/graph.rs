@@ -4,7 +4,10 @@ use crate::iri::{
     default_lower_for_kind, kind_for_label, kind_from_iri, label_for_kind, mint_iri, name_from_iri,
     property_iri,
 };
-use anyhow::{anyhow, Context, Result};
+use crate::{
+    error::{Context, Error, Result},
+    graph_error,
+};
 use neo4rs::{query, Graph, Node, Path, Relation, Row, Txn, UnboundedRelation};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -82,6 +85,7 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
     }
 
     let mut errors = Vec::new();
+    let mut last_error = None;
     for attempt in 1..=3 {
         for endpoint in &endpoints {
             match Graph::new(endpoint.as_str(), cfg.user.as_str(), password).await {
@@ -100,7 +104,8 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
                     return Ok(g);
                 }
                 Err(err) => {
-                    errors.push(format!("attempt={attempt} endpoint={endpoint} error={err}"))
+                    errors.push(format!("attempt={attempt} endpoint={endpoint} error={err}"));
+                    last_error = Some(err);
                 }
             }
         }
@@ -109,10 +114,11 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
         }
     }
 
-    Err(anyhow!(
-        "neo4j connect failed after retries: {}",
-        errors.join(" | ")
-    ))
+    let message = format!("neo4j connect failed after retries: {}", errors.join(" | "));
+    match last_error {
+        Some(error) => Err(Error::from(error).context(message)),
+        None => Err(graph_error!("{message}")),
+    }
 }
 
 pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Result<()> {
@@ -221,7 +227,7 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     .unwrap_or_default();
     for name in ["apoc.text.fuzzyMatch", "apoc.text.levenshteinSimilarity"] {
         if !functions.iter().any(|actual| actual == name) {
-            return Err(anyhow!(
+            return Err(graph_error!(
                 "required APOC function {name} is unavailable; install matching APOC Core"
             ));
         }
@@ -231,7 +237,8 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
         graph,
         query(
             "SHOW PROCEDURES YIELD name WHERE name IN [\
-             'apoc.config.list', 'apoc.refactor.mergeNodes', 'apoc.ttl.expireIn'] \
+             'apoc.config.list', 'apoc.merge.node', 'apoc.refactor.mergeNodes', \
+             'apoc.ttl.expireIn'] \
              RETURN collect(name) AS names",
         ),
     )
@@ -243,11 +250,12 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     .unwrap_or_default();
     for name in [
         "apoc.config.list",
+        "apoc.merge.node",
         "apoc.refactor.mergeNodes",
         "apoc.ttl.expireIn",
     ] {
         if !procedures.iter().any(|actual| actual == name) {
-            return Err(anyhow!(
+            return Err(graph_error!(
                 "required APOC procedure {name} is unavailable; install matching APOC Core and APOC Extended"
             ));
         }
@@ -265,7 +273,7 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     .and_then(|row| row.get::<String>("value").ok())
     .is_some_and(|value| value.eq_ignore_ascii_case("true"));
     if !ttl_enabled {
-        return Err(anyhow!(
+        return Err(graph_error!(
             "APOC TTL is disabled; set apoc.ttl.enabled=true before starting Mindreader"
         ));
     }
@@ -274,7 +282,9 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
 
 async fn ensure_semantic_index(graph: &Graph, embedding: &EmbeddingSpace) -> Result<()> {
     if !(1..=4096).contains(&embedding.dimensions) {
-        return Err(anyhow!("embedding dimensions must be between 1 and 4096"));
+        return Err(graph_error!(
+            "embedding dimensions must be between 1 and 4096"
+        ));
     }
     let marker = fetch_one(
         graph,
@@ -340,7 +350,7 @@ async fn verify_semantic_index(graph: &Graph) -> Result<()> {
     )
     .await
     .context("inspect semantic activation vector index")?
-    .ok_or_else(|| anyhow!("required vector index {SEMANTIC_INDEX} is missing"))?;
+    .ok_or_else(|| graph_error!("required vector index {SEMANTIC_INDEX} is missing"))?;
     let state = row.get::<String>("state")?;
     let entity_type = row.get::<String>("entityType")?;
     let labels = row.get::<Vec<String>>("labelsOrTypes")?;
@@ -350,7 +360,7 @@ async fn verify_semantic_index(graph: &Graph) -> Result<()> {
         || !same_string_members(&labels, &["SemanticActivation"])
         || !same_string_members(&properties, &["embedding"])
     {
-        return Err(anyhow!(
+        return Err(graph_error!(
             "required vector index {SEMANTIC_INDEX} is incompatible or not online"
         ));
     }
@@ -380,7 +390,7 @@ async fn verify_required_constraints(graph: &Graph) -> Result<()> {
         let row = rows
             .iter()
             .find(|row| matches!(row.get::<String>("name"), Ok(actual) if actual == name))
-            .ok_or_else(|| anyhow!("required Neo4j constraint {name} is missing"))?;
+            .ok_or_else(|| graph_error!("required Neo4j constraint {name} is missing"))?;
         let constraint_type = row
             .get::<String>("constraintType")
             .with_context(|| format!("read type of Neo4j constraint {name}"))?;
@@ -398,7 +408,7 @@ async fn verify_required_constraints(graph: &Graph) -> Result<()> {
             || !same_string_members(&labels_or_types, &[label])
             || !same_string_members(&properties, &[property])
         {
-            return Err(anyhow!(
+            return Err(graph_error!(
                 "required Neo4j constraint {name} has an incompatible definition: type={constraint_type}, entityType={entity_type}, labelsOrTypes={labels_or_types:?}, properties={properties:?}; {RESET_REQUIRED}"
             ));
         }
@@ -416,15 +426,15 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
     .context("read Mindreader database model marker")?;
 
     if markers.len() > 1 {
-        return Err(anyhow!(
+        return Err(graph_error!(
             "multiple Mindreader database model markers found; {RESET_REQUIRED}"
         ));
     }
 
     if let Some(marker) = markers.first() {
-        let version = marker
-            .get::<i64>("version")
-            .map_err(|_| anyhow!("invalid Mindreader database model marker; {RESET_REQUIRED}"))?;
+        let version = marker.get::<i64>("version").map_err(|_| {
+            graph_error!("invalid Mindreader database model marker; {RESET_REQUIRED}")
+        })?;
         validate_model_version(version)?;
         ensure_model_marker_constraint(graph).await?;
         return Ok(());
@@ -433,7 +443,7 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
     let node_count = fetch_one(graph, query("MATCH (n) RETURN count(n) AS nodeCount"))
         .await
         .context("check whether the Neo4j database is empty")?
-        .ok_or_else(|| anyhow!("Neo4j did not return a node count"))?
+        .ok_or_else(|| graph_error!("Neo4j did not return a node count"))?
         .get::<i64>("nodeCount")
         .context("read Neo4j node count")?;
 
@@ -451,7 +461,7 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
             ensure_model_marker_constraint(graph).await?;
             return Ok(());
         }
-        return Err(anyhow!(
+        return Err(graph_error!(
             "found {node_count} pre-existing node(s) without a Mindreader database model marker; no data migration is supported, so {RESET_REQUIRED}"
         ));
     }
@@ -476,7 +486,7 @@ fn validate_model_version(version: i64) -> Result<()> {
     if version == MODEL_VERSION {
         return Ok(());
     }
-    Err(anyhow!(
+    Err(graph_error!(
         "Mindreader database model version {version} is incompatible with required version {MODEL_VERSION}; {RESET_REQUIRED}"
     ))
 }
@@ -510,7 +520,9 @@ async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
         let row = rows
             .iter()
             .find(|row| matches!(row.get::<String>("name"), Ok(name) if name == *required_name))
-            .ok_or_else(|| anyhow!("required Neo4j full-text index {required_name} is missing"))?;
+            .ok_or_else(|| {
+                graph_error!("required Neo4j full-text index {required_name} is missing")
+            })?;
         let index_type = row
             .get::<String>("indexType")
             .with_context(|| format!("read type of Neo4j index {required_name}"))?;
@@ -540,7 +552,7 @@ async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
             || !same_string_members(&labels_or_types, expected_labels_or_types)
             || !same_string_members(&properties, expected_properties)
         {
-            return Err(anyhow!(
+            return Err(graph_error!(
                 "required Neo4j index {required_name} has an incompatible definition or is not ready: type={index_type}, entityType={entity_type}, labelsOrTypes={labels_or_types:?}, properties={properties:?}, state={state}; {RESET_REQUIRED}"
             ));
         }
@@ -558,11 +570,11 @@ fn same_string_members(actual: &[String], expected: &[&str]) -> bool {
 
 pub fn safe_label(label: &str) -> Result<String> {
     let Some(first) = label.chars().next() else {
-        return Err(anyhow!("invalid label: {label}"));
+        return Err(graph_error!("invalid label: {label}"));
     };
     if !first.is_ascii_alphabetic() || !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return Err(anyhow!("invalid label: {label}"));
+        return Err(graph_error!("invalid label: {label}"));
     }
     let _ = LABEL_OK;
     Ok(label.to_string())
@@ -571,14 +583,14 @@ pub fn safe_label(label: &str) -> Result<String> {
 pub fn safe_rel(rel: &str) -> Result<String> {
     let up = rel.to_ascii_uppercase();
     let Some(first) = up.chars().next() else {
-        return Err(anyhow!("invalid relationship type: {rel}"));
+        return Err(graph_error!("invalid relationship type: {rel}"));
     };
     if !first.is_ascii_uppercase()
         || !up
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
     {
-        return Err(anyhow!("invalid relationship type: {rel}"));
+        return Err(graph_error!("invalid relationship type: {rel}"));
     }
     Ok(up)
 }
@@ -859,45 +871,36 @@ pub async fn merge_node_in_txn(
     extra_labels: &[String],
 ) -> Result<MergedNode> {
     let (iri, name, labels) = resolved_node_parts(spec, default_kind, extra_labels)?;
+    let creation_marker = Uuid::new_v4().to_string();
     let row = fetch_one_txn(
         txn,
         query(
             r#"
-            OPTIONAL MATCH (existing:Entity {iri: $iri})
-            MERGE (n:Entity {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime(),
-              n.weight = 0, n.weightText = '0', n.layers = []
-            ON MATCH SET n.name = coalesce(n.name, $name)
-            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
-            RETURN n, existing IS NULL AS created
+            CALL apoc.merge.node(
+              ['Entity'],
+              {iri: $iri},
+              {name: $name, createdAt: datetime(), weight: 0, weightText: '0', layers: [],
+               mindreaderCreateMarker: $creationMarker},
+              {}
+            ) YIELD node
+            WITH node, node.mindreaderCreateMarker = $creationMarker AS created
+            REMOVE node.mindreaderCreateMarker
+            SET node:$($labels)
+            SET node.name = coalesce(node.name, $name),
+                node.searchText = trim(coalesce(node.name, $name) + ' ' + node.iri + ' ' + coalesce(node.value, ''))
+            RETURN node, created
             "#,
         )
         .param("iri", iri.clone())
-        .param("name", name.clone()),
+        .param("name", name.clone())
+        .param("labels", labels)
+        .param("creationMarker", creation_marker),
     )
     .await?
-    .ok_or_else(|| anyhow!("failed to MERGE node {iri}"))?;
+    .ok_or_else(|| graph_error!("failed to MERGE node {iri}"))?;
     let created = row.get::<bool>("created").unwrap_or(false);
 
-    if !labels.is_empty() {
-        let set = labels
-            .iter()
-            .map(|label| format!("n:{}", safe_label(label).expect("labels validated above")))
-            .collect::<Vec<_>>()
-            .join(" SET ");
-        let cypher = format!("MATCH (n:Entity {{iri: $iri}}) SET {set} RETURN n");
-        fetch_one_txn(txn, query(&cypher).param("iri", iri.clone()))
-            .await?
-            .ok_or_else(|| anyhow!("missing node while applying labels to {iri}"))?;
-    }
-
-    let after = fetch_one_txn(
-        txn,
-        query("MATCH (n:Entity {iri: $iri}) RETURN n").param("iri", iri.clone()),
-    )
-    .await?
-    .ok_or_else(|| anyhow!("missing node after MERGE {iri}"))?;
-    let node: Node = after.get("n")?;
+    let node: Node = row.get("node")?;
     let labels = node
         .labels()
         .into_iter()
@@ -940,7 +943,7 @@ pub async fn merge_literal_in_txn(
         .param("datatype", datatype.to_string()),
     )
     .await?
-    .ok_or_else(|| anyhow!("failed to MERGE literal {iri}"))?;
+    .ok_or_else(|| graph_error!("failed to MERGE literal {iri}"))?;
     let node: Node = row.get("n")?;
     let created = row.get::<bool>("created").unwrap_or(false);
     Ok(MergedNode {
@@ -976,7 +979,7 @@ pub async fn ensure_property_in_txn(
         .param("name", name),
     )
     .await?
-    .ok_or_else(|| anyhow!("failed to MERGE property {iri}"))?;
+    .ok_or_else(|| graph_error!("failed to MERGE property {iri}"))?;
     let node: Node = row.get("n")?;
     let created = row.get::<bool>("created").unwrap_or(false);
     Ok((iri, created, node_json(&node)))
@@ -1041,7 +1044,7 @@ pub async fn acquire_fact_locks_in_txn(
             .param("layer", lock.layer),
         )
         .await?
-        .ok_or_else(|| anyhow!("failed to acquire fact lock"))?;
+        .ok_or_else(|| graph_error!("failed to acquire fact lock"))?;
     }
     Ok(())
 }
@@ -1092,7 +1095,7 @@ pub async fn create_episode_in_txn(
     let row = stream
         .next(txn.handle())
         .await?
-        .ok_or_else(|| anyhow!("failed to create episode"))?;
+        .ok_or_else(|| graph_error!("failed to create episode"))?;
     episode_from_row(&row, tool)
 }
 

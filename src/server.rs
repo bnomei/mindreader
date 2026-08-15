@@ -1,4 +1,5 @@
 use crate::config::Config;
+use crate::error::{Error, Result as AppResult};
 use crate::graph;
 use crate::merge::MergeArgs;
 use crate::semantic::SemanticSearchArgs;
@@ -10,10 +11,9 @@ use crate::tools::{
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ErrorData as McpError, Implementation, InitializeRequestParam,
-        ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, ErrorData as McpError, Implementation, ProtocolVersion, ServerCapabilities,
+        ServerInfo,
     },
-    service::{RequestContext, RoleServer},
     tool, tool_handler, tool_router, ServerHandler,
 };
 use std::sync::Arc;
@@ -270,18 +270,18 @@ impl Mindreader {
 
     /// Build the server without talking to Neo4j so MCP initialize/list_tools
     /// can run immediately.
-    pub fn from_env() -> anyhow::Result<Self> {
+    pub fn from_env() -> AppResult<Self> {
         Ok(Self::from_config(Config::from_env()?))
     }
 
     /// Eager connect (tests / smoke). Prefer `from_env` + serve for MCP.
-    pub async fn connect() -> anyhow::Result<Self> {
+    pub async fn connect() -> AppResult<Self> {
         let this = Self::from_env()?;
         this.ensure_connected().await?;
         Ok(this)
     }
 
-    pub async fn ensure_connected(&self) -> anyhow::Result<()> {
+    pub async fn ensure_connected(&self) -> AppResult<()> {
         self.service
             .get_or_try_init(|| async {
                 let g = graph::connect(&self.cfg).await?;
@@ -312,7 +312,7 @@ fn ok(v: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::structured(v))
 }
 
-fn map_err(e: anyhow::Error) -> McpError {
+fn map_err(e: Error) -> McpError {
     tools::map_tool_error(e)
 }
 
@@ -486,37 +486,20 @@ impl Mindreader {
 #[tool_handler]
 impl ServerHandler for Mindreader {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2024_11_05,
-            capabilities: ServerCapabilities::builder().enable_tools().enable_tool_list_changed().build(),
-            server_info: Implementation {
-                name: "mindreader".into(),
-                title: None,
-                version: env!("CARGO_PKG_VERSION").into(),
-                icons: None,
-                website_url: None,
-            },
-            instructions: Some(
+        ServerInfo::new(
+            ServerCapabilities::builder()
+                .enable_tools()
+                .enable_tool_list_changed()
+                .build(),
+        )
+        .with_protocol_version(ProtocolVersion::V_2024_11_05)
+        .with_server_info(Implementation::new(
+            "mindreader",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(
                 "Mindreader: RDFS schema-as-data memory over Neo4j. Twelve tools provide scoped direct and semantic retrieval, fact writes, advisory entity deduplication, explicit merging, feedback, layer auditing, and global schema. @layers uses [] for global-only and lowercase kebab-case colon namespaces for named OR-union visibility. No raw Cypher."
-                    .into(),
-            ),
-        }
-    }
-
-    async fn initialize(
-        &self,
-        request: InitializeRequestParam,
-        context: RequestContext<RoleServer>,
-    ) -> Result<ServerInfo, McpError> {
-        let requested = request.protocol_version.clone();
-        if context.peer.peer_info().is_none() {
-            context.peer.set_peer_info(request);
-        }
-        let mut info = self.get_info();
-        // Echo a protocol the client asked for so hosts on 2025-03-26 / 2025-06-18
-        // do not treat a pinned 2024-11-05 reply as "connected, no tools".
-        info.protocol_version = requested;
-        Ok(info)
+        )
     }
 }
 

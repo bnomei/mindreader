@@ -3,8 +3,11 @@ use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, fetch_all_txn, fetch_one_txn, node_json,
     structural_rel_for, Episode,
 };
-use anyhow::{anyhow, Context, Result};
-use neo4rs::{query, Error as Neo4jDriverError, Graph, Neo4jErrorKind, Node, Relation, Txn};
+use crate::{
+    error::{Context, Error, Result},
+    operation_error,
+};
+use neo4rs::{query, Graph, Node, Relation, Txn};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -68,14 +71,8 @@ pub async fn memory_merge(graph: &Graph, args: MergeArgs) -> Result<Value> {
     unreachable!("bounded retry loop always returns")
 }
 
-fn is_transient(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<Neo4jDriverError>()
-            .is_some_and(|driver| {
-                matches!(driver, Neo4jDriverError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
-            })
-    })
+fn is_transient(error: &Error) -> bool {
+    error.is_transient_neo4j()
 }
 
 async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
@@ -192,7 +189,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     .await?
     .into_iter()
     .map(|row| {
-        Ok::<_, anyhow::Error>((
+        Ok::<_, Error>((
             row.get::<String>("subject")?,
             row.get::<String>("property")?,
             "@fact".into(),
@@ -259,7 +256,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
         .param("episode", episode.iri.clone()),
     )
     .await?
-    .ok_or_else(|| anyhow!("APOC did not return the merged target node"))?;
+    .ok_or_else(|| operation_error!("APOC did not return the merged target node"))?;
     let merged_node: Node = merged.get("node")?;
 
     if !source_relationships.is_empty() {

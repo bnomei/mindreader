@@ -15,7 +15,7 @@
 
 Mindreader supports only a fresh database for the current graph model. It records a model marker and rejects an unversioned non-empty database or a mismatched marker.
 
-The current graph model is version 3. It stores dynamic layer membership arrays and shared feedback weights on nodes and relationships. There is no migration from versions 1 or 2; recreate the Neo4j database or volume.
+The current graph model is version 4. It stores dynamic layer membership arrays and shared feedback weights on nodes and relationships, stable relationship IRIs, and expiring semantic activations backed by a vector index. There is no migration from earlier versions; recreate the Neo4j database or volume.
 
 When introducing an incompatible model change, bump the model version, keep fresh bootstrap idempotent, document that operators must recreate the Neo4j database or volume, and do not add data backfills or compatibility migrations.
 

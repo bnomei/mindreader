@@ -1,10 +1,11 @@
-use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use mindreader::config::{Config, EmbeddingSpace, SemanticConfig};
 use mindreader::domain::{EntityInput, ObjectInput};
 use mindreader::embeddings::{normalize_vector, EmbeddingProvider};
-use mindreader::graph::{self, fetch_one};
+use mindreader::error::{Context, Result};
+use mindreader::graph::{self, fetch_one, merge_node_in_txn, MergedNode, NodeSpec};
 use mindreader::merge::{memory_merge, MergeArgs};
+use mindreader::operation_error;
 use mindreader::semantic::{memory_semantic_search, SemanticRuntime, SemanticSearchArgs};
 use mindreader::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs,
@@ -116,7 +117,7 @@ fn relationship_iri(value: &Value) -> Result<String> {
         .pointer("/relationship/iri")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("response has no relationship IRI: {value}"))
+        .ok_or_else(|| operation_error!("response has no relationship IRI: {value}"))
 }
 
 fn subject_iri(value: &Value) -> Result<String> {
@@ -124,7 +125,7 @@ fn subject_iri(value: &Value) -> Result<String> {
         .pointer("/s/iri")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("response has no subject IRI: {value}"))
+        .ok_or_else(|| operation_error!("response has no subject IRI: {value}"))
 }
 
 fn object_result_iri(value: &Value) -> Result<String> {
@@ -133,7 +134,7 @@ fn object_result_iri(value: &Value) -> Result<String> {
         .or_else(|| value.pointer("/new/iri"))
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| anyhow!("response has no object IRI: {value}"))
+        .ok_or_else(|| operation_error!("response has no object IRI: {value}"))
 }
 
 fn fact_relationships(value: &Value) -> Vec<String> {
@@ -168,6 +169,13 @@ async fn search(graph: &neo4rs::Graph, scope: Vec<String>, text: &str) -> Result
         },
     )
     .await
+}
+
+async fn merge_node_once(graph: neo4rs::Graph, spec: NodeSpec) -> Result<MergedNode> {
+    let mut txn = graph.start_txn().await?;
+    let node = merge_node_in_txn(&mut txn, &spec, "Element", &[]).await?;
+    txn.commit().await.context("commit smoke node upsert")?;
+    Ok(node)
 }
 
 async fn relation_state(
@@ -216,7 +224,16 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<u32> {
-    let cfg = Config::from_env()?;
+    let mut args = std::env::args().skip(1);
+    let cfg = match (args.next().as_deref(), args.next(), args.next()) {
+        (None, None, None) => Config::from_env()?,
+        (Some("--config-dir"), Some(path), None) => Config::from_directory(path)?,
+        _ => {
+            return Err(operation_error!(
+                "usage: mindreader-smoke [--config-dir PATH]"
+            ));
+        }
+    };
     println!("mindreader-smoke: uri={}", cfg.uri);
     println!(
         "registered tools: {}",
@@ -262,6 +279,49 @@ async fn run() -> Result<u32> {
     let layer_b = format!("project:smoke-b-{tag}");
     let layer_c = format!("project:smoke-c-{tag}");
     let property = format!("smokeProperty{tag}");
+
+    let relabeled_iri = format!("mindreader:element/apoc-label-{tag}");
+    let initial = merge_node_once(
+        graph.clone(),
+        NodeSpec {
+            iri: Some(relabeled_iri.clone()),
+            name: Some(format!("apoc-label-{tag}")),
+            labels: Vec::new(),
+        },
+    )
+    .await?;
+    let relabeled = merge_node_once(
+        graph.clone(),
+        NodeSpec {
+            iri: Some(relabeled_iri),
+            name: Some(format!("replacement-name-{tag}")),
+            labels: vec!["Knowledge".into()],
+        },
+    )
+    .await?;
+    let concurrent_iri = format!("mindreader:element/apoc-concurrent-{tag}");
+    let concurrent_spec = NodeSpec {
+        iri: Some(concurrent_iri),
+        name: Some(format!("apoc-concurrent-{tag}")),
+        labels: vec!["Pattern".into()],
+    };
+    let (left, right) = tokio::try_join!(
+        merge_node_once(graph.clone(), concurrent_spec.clone()),
+        merge_node_once(graph.clone(), concurrent_spec),
+    )?;
+    report.check(
+        "APOC entity upserts add labels and report one concurrent creator",
+        initial.created
+            && !relabeled.created
+            && relabeled
+                .json
+                .get("labels")
+                .and_then(Value::as_array)
+                .is_some_and(|labels| labels.iter().any(|label| label == "Knowledge"))
+            && relabeled.json.get("name") == initial.json.get("name")
+            && left.created as usize + right.created as usize == 1,
+        format!("initial={initial:?} relabeled={relabeled:?} concurrent=({left:?}, {right:?})"),
+    );
 
     let schema = tools::memory_schema(
         &graph,
@@ -806,12 +866,12 @@ async fn run() -> Result<u32> {
     let target_property_iri = target_property
         .pointer("/node/iri")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("target property has no IRI: {target_property}"))?
+        .ok_or_else(|| operation_error!("target property has no IRI: {target_property}"))?
         .to_string();
     let source_property_iri = source_property
         .pointer("/node/iri")
         .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("source property has no IRI: {source_property}"))?
+        .ok_or_else(|| operation_error!("source property has no IRI: {source_property}"))?
         .to_string();
     let property_fact = tools::memory_assert(
         &graph,
@@ -857,7 +917,7 @@ async fn run() -> Result<u32> {
         .param("object", object_result_iri(&property_fact)?),
     )
     .await?
-    .ok_or_else(|| anyhow!("property merge aggregate returned no row"))?;
+    .ok_or_else(|| operation_error!("property merge aggregate returned no row"))?;
     let wrong_kind = memory_merge(
         &graph,
         MergeArgs {
@@ -932,7 +992,7 @@ async fn run() -> Result<u32> {
         ),
     )
     .await?
-    .ok_or_else(|| anyhow!("semantic activation aggregate returned no row"))?;
+    .ok_or_else(|| operation_error!("semantic activation aggregate returned no row"))?;
     report.check(
         "semantic search ranks facts and stores a live reusable activation",
         semantic_first

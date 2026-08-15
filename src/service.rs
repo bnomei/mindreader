@@ -4,13 +4,13 @@
 //! transactions or project-layer policy themselves.
 
 use crate::config::Config;
+use crate::error::Result;
 use crate::merge::{self, MergeArgs};
 use crate::semantic::{self, SemanticRuntime, SemanticSearchArgs};
 use crate::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs, SchemaArgs,
     SearchArgs, StatsArgs, TraverseArgs,
 };
-use anyhow::Result;
 use neo4rs::Graph;
 use serde_json::Value;
 use std::path::PathBuf;

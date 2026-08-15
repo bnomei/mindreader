@@ -3,22 +3,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use thiserror::Error;
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum DomainError {
+    #[error("{0}")]
     InvalidInput(String),
+    #[error("{0}")]
     Precondition(String),
 }
-
-impl fmt::Display for DomainError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidInput(message) | Self::Precondition(message) => f.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for DomainError {}
 
 /// A validated graph visibility layer identifier.
 ///

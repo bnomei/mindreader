@@ -13,7 +13,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PROTOCOLS = ["2024-11-05", "2025-03-26", "2025-06-18"]
+PROTOCOLS = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+UNKNOWN_PROTOCOL = "2099-01-01"
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -148,6 +149,24 @@ def main() -> int:
             print(names)
             if init is None or len(names) != 12:
                 succeeded = False
+
+        print("=" * 72)
+        print(f"UNKNOWN PROTOCOL {UNKNOWN_PROTOCOL}")
+        init, tools, stderr, elapsed = handshake(
+            binary, UNKNOWN_PROTOCOL, env, args.timeout
+        )
+        negotiated = (init or {}).get("result", {}).get("protocolVersion")
+        print(f"elapsed_s={elapsed:.3f}")
+        print(f"negotiated={negotiated}")
+        print("--- stderr ---")
+        print(stderr)
+        names = []
+        if tools and isinstance(tools.get("result"), dict):
+            names = [t.get("name") for t in tools["result"].get("tools") or []]
+        print("--- tool names ---")
+        print(names)
+        if init is None or negotiated == UNKNOWN_PROTOCOL or len(names) != 12:
+            succeeded = False
         return 0 if succeeded else 1
 
 

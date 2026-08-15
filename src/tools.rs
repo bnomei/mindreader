@@ -11,8 +11,11 @@ use crate::graph::{
 use crate::iri::{class_iri, name_from_iri, property_iri};
 use crate::layers::validate_layer_ids;
 use crate::merge::merge_suggestions_in_txn;
-use anyhow::{anyhow, Result};
-use neo4rs::{query, Error as Neo4jDriverError, Graph, Neo4jErrorKind, Node, Path, Relation, Txn};
+use crate::{
+    error::{Context, Error, Result},
+    operation_error,
+};
+use neo4rs::{query, Graph, Node, Path, Relation, Txn};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -45,14 +48,8 @@ fn reject_system_owned_predicate(predicate: &str) -> Result<()> {
     Ok(())
 }
 
-fn is_transient_neo4j_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<Neo4jDriverError>()
-            .is_some_and(|driver| {
-                matches!(driver, Neo4jDriverError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
-            })
-    })
+fn is_transient_neo4j_error(error: &Error) -> bool {
+    error.is_transient_neo4j()
 }
 
 fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
@@ -280,7 +277,7 @@ async fn apply_node_memberships_txn(
         .param("created", node.created),
     )
     .await?
-    .ok_or_else(|| anyhow!("missing node while applying layers: {}", node.iri))?;
+    .ok_or_else(|| operation_error!("missing node while applying layers: {}", node.iri))?;
     let before = row.get::<Vec<String>>("before").unwrap_or_default();
     let after = row.get::<Vec<String>>("after").unwrap_or_default();
     Ok(before != after)
@@ -360,7 +357,7 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
     )
     .await?;
     if current.len() > 1 {
-        return Err(anyhow!(
+        return Err(operation_error!(
             "multiple current relationship identities for ({}, {}, {})",
             write.s,
             write.prop_iri,
@@ -384,7 +381,7 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
             .param("episode", write.episode.iri.clone()),
         )
         .await?
-        .ok_or_else(|| anyhow!("relationship disappeared while merging layers"))?;
+        .ok_or_else(|| operation_error!("relationship disappeared while merging layers"))?;
         return Ok((current.iri.clone(), true));
     }
 
@@ -420,7 +417,7 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
             .param("factText", write.fact_text.to_string()),
     )
     .await?
-    .ok_or_else(|| anyhow!("failed to create relationship {iri}"))?;
+    .ok_or_else(|| operation_error!("failed to create relationship {iri}"))?;
     Ok((iri, true))
 }
 
@@ -430,7 +427,7 @@ async fn refreshed_node_json_txn(txn: &mut Txn, iri: &str) -> Result<Value> {
         query("MATCH (n:Entity {iri: $iri}) RETURN n").param("iri", iri.to_string()),
     )
     .await?
-    .ok_or_else(|| anyhow!("missing node {iri}"))?;
+    .ok_or_else(|| operation_error!("missing node {iri}"))?;
     Ok(node_json(&row.get::<Node>("n")?))
 }
 
@@ -1298,7 +1295,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
             created_iris.push(prop_iri.clone());
         }
         let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris, &layers).await?;
-        Ok::<_, anyhow::Error>((
+        Ok::<_, Error>((
             changed,
             episode,
             subject_json,
@@ -1326,7 +1323,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
             if value.0 {
                 txn.commit()
                     .await
-                    .map_err(|error| anyhow!("commit memory_assert transaction failed: {error}"))?;
+                    .context("commit memory_assert transaction failed")?;
             } else {
                 txn.rollback().await?;
             }
@@ -1574,7 +1571,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
             created_iris.push(prop_iri.clone());
         }
         let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris, &layers).await?;
-        Ok::<_, anyhow::Error>((
+        Ok::<_, Error>((
             episode,
             subject_json,
             new_json,
@@ -1599,7 +1596,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
         Ok(value) => {
             txn.commit()
                 .await
-                .map_err(|error| anyhow!("commit memory_replace transaction failed: {error}"))?;
+                .context("commit memory_replace transaction failed")?;
             value
         }
         Err(error) => {
@@ -1784,7 +1781,7 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
     }
     txn.commit()
         .await
-        .map_err(|error| anyhow!("commit memory_retract transaction failed: {error}"))?;
+        .context("commit memory_retract transaction failed")?;
     Ok(json!({
         "retracted": selected.len(),
         "soft": true,
@@ -1937,7 +1934,7 @@ async fn memory_feedback_once(graph: &Graph, args: FeedbackArgs) -> Result<Value
     .await?;
     txn.commit()
         .await
-        .map_err(|error| anyhow!("commit memory_feedback transaction failed: {error}"))?;
+        .context("commit memory_feedback transaction failed")?;
     Ok(json!({
         "target": args.target,
         "mode": args.mode,
@@ -1999,7 +1996,7 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
             )
             .await?
             .map(|row| {
-                Ok::<_, anyhow::Error>((
+                Ok::<_, Error>((
                     row.get::<String>("subject")?,
                     row.get::<String>("property")?,
                 ))
@@ -2177,7 +2174,7 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
     .ok_or_else(|| DomainError::Precondition("layer target changed concurrently".into()))?;
     txn.commit()
         .await
-        .map_err(|error| anyhow!("commit memory_layers transaction failed: {error}"))?;
+        .context("commit memory_layers transaction failed")?;
     Ok(json!({
         "noop": false,
         "target": args.target,
@@ -2385,7 +2382,7 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
                 find_current_pairs_txn(&mut txn, &node.iri, property, Some(rel), &target.iri)
                     .await?;
             if current.len() > 1 {
-                return Err(anyhow!(
+                return Err(operation_error!(
                     "multiple current schema relationship identities for ({}, {}, {})",
                     node.iri,
                     property,
@@ -2402,12 +2399,7 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
             resolved.push((rel, property, target));
         }
         if !changed {
-            return Ok::<_, anyhow::Error>((
-                None,
-                node_json_from_merged(&node),
-                Vec::new(),
-                Vec::new(),
-            ));
+            return Ok::<_, Error>((None, node_json_from_merged(&node), Vec::new(), Vec::new()));
         }
         let episode = create_episode_in_txn(&mut txn, "memory_schema", None).await?;
         txn.run(
@@ -2435,7 +2427,7 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
         }
         let refreshed = refreshed_node_json_txn(&mut txn, &node.iri).await?;
         let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris, &[]).await?;
-        Ok::<_, anyhow::Error>((Some(episode), refreshed, links, merge_suggestions))
+        Ok::<_, Error>((Some(episode), refreshed, links, merge_suggestions))
     }
     .await;
     let (episode, node, links, merge_suggestions) = match write {
@@ -2443,7 +2435,7 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
             if value.0.is_some() {
                 txn.commit()
                     .await
-                    .map_err(|error| anyhow!("commit memory_schema transaction failed: {error}"))?;
+                    .context("commit memory_schema transaction failed")?;
             } else {
                 txn.rollback().await?;
             }
@@ -2538,9 +2530,9 @@ pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> R
     Ok(row.and_then(|row| row.get::<i64>("n").ok()).unwrap_or(0))
 }
 
-pub fn map_tool_error(err: anyhow::Error) -> rmcp::model::ErrorData {
+pub fn map_tool_error(err: Error) -> rmcp::model::ErrorData {
     use rmcp::model::ErrorData as McpError;
-    if let Some(domain) = err.downcast_ref::<DomainError>() {
+    if let Error::Domain(domain) = &err {
         let reason = match domain {
             DomainError::InvalidInput(_) => "invalid_input",
             DomainError::Precondition(_) => "precondition_failed",

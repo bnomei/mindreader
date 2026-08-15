@@ -445,7 +445,7 @@ Run the live integration smoke test when Neo4j is available:
 cargo run --bin mindreader-smoke
 ```
 
-The smoke test writes persistent fixtures to the configured Neo4j database and does not clean them up. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for graph model versioning and release expectations.
+Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and `.env` instead of the operator's normal configuration directory. The smoke test writes persistent fixtures to the configured Neo4j database and does not clean them up. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for graph model versioning and release expectations.
 
 ## Repository map
 
@@ -453,6 +453,7 @@ The smoke test writes persistent fixtures to the configured Neo4j database and d
 | --- | --- |
 | [`src/server.rs`](src/server.rs) | MCP tool registration, advertised input schemas, protocol negotiation, and lazy database access. |
 | [`src/service.rs`](src/service.rs) | Typed application boundary used by transport adapters. |
+| [`src/error.rs`](src/error.rs) | Typed application errors, retained source context, and Neo4j retry classification. |
 | [`src/domain.rs`](src/domain.rs) | Validated layer IDs and tagged entity, literal, target, replacement, and retraction concepts. |
 | [`src/tools.rs`](src/tools.rs) | Tool arguments, scoped graph behavior, advisory merge suggestions, feedback, membership auditing, supersession, contradiction, and retraction. |
 | [`src/merge.rs`](src/merge.rs) | Permanent entity merging and APOC-backed fuzzy suggestions. |

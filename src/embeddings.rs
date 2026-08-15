@@ -1,5 +1,8 @@
 use crate::config::{EmbeddingProviderKind, SelectedEmbedding};
-use anyhow::{anyhow, Context, Result};
+use crate::{
+    embedding_error,
+    error::{Context, Error, Result},
+};
 use async_trait::async_trait;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
@@ -58,7 +61,7 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
     async fn embed(&self, text: &str) -> Result<Vec<f64>> {
         let text = text.trim();
         if text.is_empty() {
-            return Err(anyhow!("embedding input must not be empty"));
+            return Err(embedding_error!("embedding input must not be empty"));
         }
         let body = json!({
             "input": text,
@@ -83,7 +86,7 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
                         .with_context(|| format!("decode {} embedding response", self.provider))?;
                     payload.data.sort_by_key(|item| item.index);
                     if payload.data.len() != 1 {
-                        return Err(anyhow!(
+                        return Err(embedding_error!(
                             "{} embedding response contained {} vectors for one input",
                             self.provider,
                             payload.data.len()
@@ -100,7 +103,7 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
                     let retry = status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error();
                     let body = response.text().await.unwrap_or_default();
                     let body: String = body.chars().take(512).collect();
-                    last_error = Some(anyhow!(
+                    last_error = Some(embedding_error!(
                         "{} embedding request failed with HTTP {}: {}",
                         self.provider,
                         status,
@@ -111,17 +114,18 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
                     }
                 }
                 Err(error) => {
-                    last_error = Some(anyhow!(
-                        "{} embedding request failed: {error}",
-                        self.provider
-                    ));
+                    last_error = Some(
+                        Error::from(error)
+                            .context(format!("{} embedding request failed", self.provider)),
+                    );
                 }
             }
             if attempt < 2 {
                 sleep(Duration::from_millis(200 * (1 << attempt))).await;
             }
         }
-        Err(last_error.unwrap_or_else(|| anyhow!("{} embedding request failed", self.provider)))
+        Err(last_error
+            .unwrap_or_else(|| embedding_error!("{} embedding request failed", self.provider)))
     }
 
     fn provider(&self) -> &'static str {
@@ -143,17 +147,21 @@ pub fn normalize_vector(
     provider: &str,
 ) -> Result<Vec<f64>> {
     if vector.len() != dimensions {
-        return Err(anyhow!(
+        return Err(embedding_error!(
             "{provider} returned embedding dimension {}, expected {dimensions}",
             vector.len()
         ));
     }
     if vector.iter().any(|value| !value.is_finite()) {
-        return Err(anyhow!("{provider} returned a non-finite embedding value"));
+        return Err(embedding_error!(
+            "{provider} returned a non-finite embedding value"
+        ));
     }
     let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
     if !norm.is_finite() || norm == 0.0 {
-        return Err(anyhow!("{provider} returned a zero-norm embedding"));
+        return Err(embedding_error!(
+            "{provider} returned a zero-norm embedding"
+        ));
     }
     for value in &mut vector {
         *value /= norm;

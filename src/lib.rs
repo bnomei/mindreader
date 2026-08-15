@@ -6,6 +6,7 @@
 pub mod config;
 pub mod domain;
 pub mod embeddings;
+pub mod error;
 pub mod graph;
 pub mod iri;
 pub mod layers;

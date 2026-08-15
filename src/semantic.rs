@@ -3,7 +3,10 @@ use crate::embeddings::{build_provider, normalize_vector, EmbeddingProvider};
 use crate::graph::{endpoint_json, fetch_all, rel_json, spike_label, SEMANTIC_INDEX};
 use crate::layers::validate_layer_ids;
 use crate::tools::{memory_search, SearchArgs};
-use anyhow::{anyhow, Context, Result};
+use crate::{
+    error::{Context, Result},
+    operation_error,
+};
 use neo4rs::{query, Graph, Node, Relation};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -71,14 +74,16 @@ pub async fn memory_semantic_search(
     args: SemanticSearchArgs,
 ) -> Result<Value> {
     let runtime = runtime.ok_or_else(|| {
-        anyhow!(
+        operation_error!(
             "semantic search requires OPENAI_API_KEY or XAI_API_KEY in {} or the process environment",
             secrets_path.display()
         )
     })?;
     let text = args.text.trim().to_string();
     if text.is_empty() {
-        return Err(anyhow!("memory_semantic_search text must not be empty"));
+        return Err(operation_error!(
+            "memory_semantic_search text must not be empty"
+        ));
     }
     let layers = validate_layer_ids(args.layers)?
         .into_iter()
@@ -88,17 +93,16 @@ pub async fn memory_semantic_search(
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as usize;
     let embedding = runtime.provider.embed(&text).await?;
 
-    let activations = query_activations(graph, runtime, &embedding).await?;
-    let direct = memory_search(
-        graph,
-        SearchArgs {
-            layers: layers.clone(),
-            text: Some(text.clone()),
-            labels: Some(labels.clone()),
-            limit: Some(100),
-        },
-    )
-    .await?;
+    let direct_args = SearchArgs {
+        layers: layers.clone(),
+        text: Some(text.clone()),
+        labels: Some(labels.clone()),
+        limit: Some(100),
+    };
+    let (activations, direct) = tokio::try_join!(
+        query_activations(graph, runtime, &embedding),
+        memory_search(graph, direct_args),
+    )?;
     let direct_facts = direct
         .get("facts")
         .and_then(Value::as_array)
@@ -323,7 +327,7 @@ async fn persist_activation(
         .ttl_days
         .checked_mul(86_400_000)
         .and_then(|milliseconds| i64::try_from(milliseconds).ok())
-        .ok_or_else(|| anyhow!("semantic TTL is too large"))?;
+        .ok_or_else(|| operation_error!("semantic TTL is too large"))?;
     if let Some(existing) = convergence {
         let midpoint = existing
             .embedding
