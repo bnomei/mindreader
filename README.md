@@ -1,17 +1,33 @@
 # mindreader
 
-[![CI](https://github.com/bnomei/mindreader/actions/workflows/ci.yml/badge.svg)](https://github.com/bnomei/mindreader/actions/workflows/ci.yml)
+[![Crates.io Version](https://img.shields.io/crates/v/mindreader)](https://crates.io/crates/mindreader)
+[![Build Status](https://github.com/bnomei/mindreader/actions/workflows/ci.yml/badge.svg)](https://github.com/bnomei/mindreader/actions/workflows/ci.yml)
 [![npm](https://img.shields.io/npm/v/@bnomei/mindreader)](https://www.npmjs.com/package/@bnomei/mindreader)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+[![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
+[![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It stores explicit graph triples (`subject -predicate-> object`) and serves twelve tools over stdio for scoped retrieval, semantic recall, traversal, feedback, layer auditing, entity merging, schema management, and durable writes.
+Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It stores explicit graph triples (`subject -predicate-> object`) and serves exactly twelve tools over stdio for scoped retrieval, semantic recall, traversal, feedback, layer auditing, entity merging, schema management, and durable writes.
 
 Mindreader does not extract facts with a hidden language model or expose raw Cypher. Ordinary memory writes preserve history and record an `Episode`; explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`. Semantic search is optional and sends its query text to the selected OpenAI or xAI embedding API.
+
+## Start here
+
+| Goal | Read |
+| --- | --- |
+| Install a packaged binary | [Install a release](#install-a-release) |
+| Build and verify Mindreader with a disposable Neo4j database | [Quickstart from source](#quickstart-from-source) |
+| Add Mindreader to an MCP host | [Connect an MCP client](#connect-an-mcp-client) |
+| Teach an agent when and how to write memory | [Recommended agent workflow](#recommended-agent-workflow) |
+| Look up exact inputs, defaults, and limits | [MCP tool reference](#mcp-tool-reference) |
+| Understand layers, ranking, semantic recall, and history | [Memory model](#memory-model) |
+| Configure Neo4j, embeddings, and semantic recall | [Configuration reference](#configuration-reference) |
+| Develop or validate the project | [Development](#development) |
 
 ## What mindreader provides
 
 - A shared, inspectable memory graph for local agents and multi-agent teams.
-- Deterministic IRI minting for entities, schema, literals, and provenance episodes.
+- Deterministic IRI minting for named entities, schema, and literals, plus stable UUID identities for provenance episodes and relationships.
 - Request-scoped visibility across one or many named layers, with global memory available in every scope.
 - Wakeup-oriented retrieval that returns current facts and ranked `Signal`, `Pattern`, `Insight`, and `Knowledge` context.
 - Semantic recall that blends direct results with nearby, expiring result bundles stored in Neo4j.
@@ -19,32 +35,79 @@ Mindreader does not extract facts with a hidden language model or expose raw Cyp
 - Idempotent assertions, advisory duplicate suggestions, explicit node merging, transactional supersession, contradiction links, and soft retraction.
 - A stdio MCP server that completes the MCP handshake before Neo4j is ready and connects to the database lazily.
 
-## Install a release
+## Architecture and data boundary
 
-The npm launcher supports x64 and arm64 GNU/glibc Linux and macOS, plus x64 Windows. On first use it
-downloads the matching GitHub Release binary, verifies its SHA-256 checksum, and stores it in a
-versioned cache:
-
-```bash
-npx -y @bnomei/mindreader@0.1.0 --version
+```mermaid
+flowchart LR
+    Host["MCP host or agent"] <-->|"JSON-RPC over stdio"| Server["Mindreader"]
+    Server <-->|"Bolt"| Graph["Neo4j"]
+    Server -.->|"query text for semantic search only"| Provider["OpenAI or xAI embeddings"]
 ```
 
-GNU Linux and macOS users can install the latest release directly:
+The MCP host owns process access and authentication. Mindreader owns tool validation, graph behavior, and provenance. Neo4j stores durable graph records and expiring semantic activations. The embedding provider receives query text only when an agent calls `memory_semantic_search`; it does not receive stored result bundles.
+
+## Install a release
+
+Choose one installation method. GitHub Release assets cover x64 and arm64 GNU/glibc and musl Linux, x64 and arm64 macOS, and x64 Windows. The npm launcher supports the GNU/glibc, macOS, and Windows assets and requires Node.js 18 or newer. On first use it downloads the matching binary, verifies its SHA-256 checksum, and stores it in a versioned cache.
+
+### npm launcher
+
+```bash
+npx -y @bnomei/mindreader@latest --version
+```
+
+Pin the package version in MCP configuration so the host starts the same Mindreader release each time. The launcher honors `MINDREADER_VERSION`, `MINDREADER_REPOSITORY`, and `MINDREADER_NPM_CACHE` for version, mirror, and cache overrides.
+
+### Direct installer
+
+GNU Linux and macOS users can install the latest release:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/bnomei/mindreader/main/scripts/install.sh | sh
 ```
 
-Checksummed archives are available from [GitHub Releases](https://github.com/bnomei/mindreader/releases),
-and the release container is published to GHCR:
+### Cargo
+
+With [cargo-binstall](https://github.com/cargo-bins/cargo-binstall), install the matching prebuilt GitHub Release binary without compiling Mindreader:
 
 ```bash
-docker run --rm ghcr.io/bnomei/mindreader:0.1.0 --version
+cargo binstall mindreader
 ```
 
-The npm launcher honors `MINDREADER_VERSION`, `MINDREADER_REPOSITORY`, and
-`MINDREADER_NPM_CACHE` for version, mirror, and cache overrides.
-Static musl archives for x64 and arm64 Linux are available as manual release downloads.
+If `cargo binstall` is not available yet, install it first:
+
+```bash
+cargo install cargo-binstall --locked
+cargo binstall mindreader
+```
+
+To build the published crate from source with Rust 1.89 or newer:
+
+```bash
+cargo install mindreader --locked
+```
+
+Both Cargo paths install the `mindreader` executable into Cargo's binary directory, normally `$HOME/.cargo/bin`.
+
+Verify a native installation:
+
+```bash
+mindreader --version
+```
+
+Expected output for this release:
+
+```text
+mindreader <version>
+```
+
+### Release artifacts
+
+Checksummed archives are available from [GitHub Releases](https://github.com/bnomei/mindreader/releases). Static musl archives for x64 and arm64 Linux are available as manual downloads. The release container is published to GHCR:
+
+```bash
+docker run --rm ghcr.io/bnomei/mindreader:latest --version
+```
 
 ## Quickstart from source
 
@@ -71,12 +134,12 @@ docker compose up -d neo4j
 ```
 
 Neo4j listens on `bolt://127.0.0.1:7687`; its browser UI is available at `http://127.0.0.1:7474`.
-Mindreader does not migrate older graph models. For an existing local development volume, recreate it with `docker compose down --volumes` before starting Neo4j.
+Mindreader does not migrate older graph models. Recreate a disposable local volume with `docker compose down --volumes` only when Mindreader reports that the database is unversioned, non-empty, or incompatible. This command permanently deletes that Compose volume.
 
 ### 3. Verify the memory behavior
 
 ```bash
-NEO4J_PASSWORD='<same-password-as-repository-.env>' cargo run --bin mindreader-smoke
+NEO4J_PASSWORD='<same-password-as-repository-.env>' cargo run --features developer-tools --bin mindreader-smoke
 ```
 
 The smoke process reads secrets from the native Mindreader `.env`, or from its process environment as shown above.
@@ -101,7 +164,7 @@ Run the binary without arguments to serve MCP. It also accepts `-h`/`--help` and
 
 ## Connect an MCP client
 
-Mindreader uses stdio transport. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output.
+Mindreader uses stdio transport. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all twelve tools in the [MCP tool reference](#mcp-tool-reference).
 
 ### Local binary
 
@@ -121,7 +184,7 @@ Use absolute paths because desktop MCP clients do not necessarily inherit your s
 }
 ```
 
-Configure the Neo4j URI, username, provider models, and semantic-search policy in `config.toml`, not in MCP environment variables. Restart the MCP client after changing its configuration. A successful connection exposes the twelve tools listed in [MCP tool reference](#mcp-tool-reference).
+Configure the Neo4j URI, username, provider models, and semantic-search policy in the native [`config.toml`](#configuration-reference), not in MCP environment variables. Keep only secrets in the `env` block or native `.env` file.
 
 ### npm launcher
 
@@ -185,7 +248,9 @@ Do not store task chatter, acknowledgements, markdown dumps, or transient status
 
 ## Minimal assert, search, and traverse example
 
-Call `memory_assert`:
+### Assert one durable fact
+
+Call `memory_assert` with one triple and an explicit visibility scope:
 
 ```json
 {
@@ -196,7 +261,11 @@ Call `memory_assert`:
 }
 ```
 
-The response includes subject, object, and stable relationship IRIs. Use the returned subject IRI in later calls:
+The response includes subject, object, and stable relationship IRIs.
+
+### Search by text
+
+Call `memory_search` with the same layer, or a broader OR union:
 
 ```json
 {
@@ -204,6 +273,12 @@ The response includes subject, object, and stable relationship IRIs. Use the ret
   "layers": ["project:graph-memory", "project:agent-runtime"]
 }
 ```
+
+The response's `facts` array contains current visible `ASSERTS` and `ABOUT` triples. Each fact includes stable endpoint and relationship IRIs that you can pass to `memory_get`, `memory_feedback`, or `memory_layers`.
+
+### Traverse from a returned IRI
+
+Call `memory_traverse` with a returned endpoint IRI:
 
 ```json
 {
@@ -232,12 +307,12 @@ To audit its memberships independently of the fact value, use `memory_layers` wi
 
 ## MCP tool reference
 
-All tools return structured JSON. Every scoped tool requires a `layers` array; the global `memory_schema` and permanent `memory_merge` operations do not. In the table, `@layers` is short for that request field.
+All tools return structured JSON. Every scoped tool requires a `layers` array; the global `memory_schema` and permanent `memory_merge` operations do not. In the table, `@layers` is short for that request field. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
-| `memory_search` | `layers` | `text`, `labels`, `limit` (`20`, clamped to `1..100`) | Find current visible facts and ranked `ABOUT` context for the returned fact endpoints. The result limit is applied only after Spike, weight, relevance, and deterministic tie-break ranking. |
-| `memory_semantic_search` | non-empty `text` (at most 32 KiB UTF-8), `layers` | `labels`, `limit` (`20`, clamped to `1..100`) | Embed the query, blend direct matches with nearby remembered result bundles, and return current visible facts with a 1-based `rank`. |
+| `memory_search` | `layers` | `text`, `labels`, `limit` (`20`, clamped to `1..100`) | Find current visible `ASSERTS` and `ABOUT` facts and ranked `ABOUT` context for their endpoints. The result limit is applied only after Spike, weight, relevance, and deterministic tie-break ranking. |
+| `memory_semantic_search` | non-empty `text` (at most 32 KiB UTF-8), `layers` | `labels`, `limit` (`20`, clamped to `1..100`) | Embed the query, blend direct matches with nearby remembered `ASSERTS` and `ABOUT` result bundles, and return current visible facts with a 1-based `rank`. |
 | `memory_get` | `iri`, `layers` | `hops` (`0`; only `1` includes neighbors) | Fetch a visible node and, optionally, its current visible one-hop relationships. |
 | `memory_traverse` | `from`, `layers` | `rels` (all fixed relationships), `depth` (`1`, clamped to `1..3`), `limit` (`50`, clamped to `1..200`) | Walk current visible typed relationships in either direction. |
 | `memory_stats` | `layers` | None | Report graph-model readiness, visible node/edge counts, database-wide episode count, and per-membership active edge totals. |
@@ -246,10 +321,12 @@ All tools return structured JSON. Every scoped tool requires a `layers` array; t
 | `memory_retract` | tagged `target`, `layers` | `reason` | Remove selected memberships and soft-close a fact when its last membership is removed. |
 | `memory_feedback` | `layers`, tagged `target`, `mode` | None | Apply exactly `+1` (`strengthen`) or `-1` (`weaken`) to a visible node or current relationship's shared weight. |
 | `memory_layers` | `layers`, tagged `target` | `add`, `remove` (at least one entry across them) | Audit and atomically edit one node or current relationship's memberships. |
-| `memory_schema` | `kind`, plus `name` or `iri` | `subClassOf`, `subPropertyOf`, `domain`, `range` | Declare a Class or Property and its structural links as global records. |
+| `memory_schema` | `kind`, plus `name` or `iri` | Class: `subClassOf`; Property: `subPropertyOf`, `domain`, `range` | Declare a Class or Property and its valid structural links as global records. |
 | `memory_merge` | same-kind `source`, `target` IRIs | None | Permanently merge two user-visible non-literal entities across every membership and historical relationship; the target IRI and name survive. Property merges also rewrite facts to the surviving predicate and consolidate exact duplicates. |
 
 `memory_assert`, `memory_replace`, and `memory_schema` return `mergeSuggestions` when they create a user-visible entity with a fuzzy same-kind name match. Each suggestion includes the two names, its similarity, and a directly callable `merge: {source, target}` payload. The shorter name is recommended as the target; ties keep the pre-existing candidate. This direction is only a recommendation: inspect identity carefully and reverse or ignore it when appropriate. Names such as `007` and `007s` can be similar while still naming different entities.
+
+`memory_search` returns empty `facts` and `spike` arrays when both `text` and `labels` are absent or empty. A `labels` filter matches when any requested label occurs on either fact endpoint; semantic search applies the same endpoint-label rule to direct and recalled results.
 
 ### Assertion values
 
@@ -284,7 +361,7 @@ An exact replacement identifies both values explicitly:
 }
 ```
 
-Retraction uses `target.kind`: `fact` requires `s`, `p`, and `o`; `predicate` requires `s` and `p`; `subject` accepts only `s`. Predicate and subject scopes are intentionally broad.
+Retraction uses `target.kind`: `fact` requires `s`, `p`, and `o`; `predicate` requires `s` and `p`; `subject` accepts only `s`. Predicate and subject scopes are intentionally broad. Subject-wide retraction still protects structural and system-owned relationships and does not retract relationships whose endpoints are Classes or Properties.
 
 `spike` must be one of `Signal`, `Pattern`, `Insight`, or `Knowledge`. When a spike subject points to an `Element`, Mindreader also maintains an `ABOUT` relationship. Search ranks categories from `Knowledge` down to `Signal`, then uses the sum of subject, relationship, and object weights within the same Spike category, then text relevance.
 
@@ -301,6 +378,8 @@ CONTRADICTS, SUPERSEDES
 Properties outside the structural set are stored as `ASSERTS` relationships with a `propertyIri`.
 
 ## Memory model
+
+Use this section to understand behavior and invariants. For exact request fields and limits, use the [MCP tool reference](#mcp-tool-reference). The implementation lives primarily in [`src/tools.rs`](src/tools.rs), [`src/search.rs`](src/search.rs), [`src/semantic.rs`](src/semantic.rs), and [`src/merge.rs`](src/merge.rs).
 
 ### Layers
 
@@ -342,13 +421,13 @@ Ordinary assertions are set-valued: the same `(subject, property, object)` relat
 
 Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because their outcome may be ambiguous.
 
-`CONTRADICTS` is multi-valued. Setting `contradicts: true` on an assertion records explicit links to conflicting visible current objects.
+`CONTRADICTS` is multi-valued. Setting `contradicts: true` on an assertion or replacement records explicit links to conflicting visible current objects.
 
 `memory_merge` is the intentional destructive exception to soft history: it requires matching canonical kinds and removes the source node after moving its memberships and current and historical relationships onto the target. Bootstrap-seeded Class and Property IRIs are permanent targets and cannot be sources. It records exactly one merge `Episode`, preserves the target IRI and name, combines memberships and weights, marks moved relationships with merge provenance, and soft-closes merge-created self-relations and duplicate facts. Merging Properties rewrites their predicate references and refreshed search text transactionally, but both Properties must use the same structural relationship representation; system-owned `CONTRADICTS` and `SUPERSEDES` Properties cannot be merged. It creates no alias. Review the direction before calling it.
 
-### Deterministic IRIs
+### IRI and record identity
 
-Mindreader accepts explicit IRIs or derives them from names:
+Mindreader accepts explicit IRIs or deterministically derives the following IRIs from names and literal values:
 
 | Kind | Pattern | Slug case |
 | --- | --- | --- |
@@ -356,24 +435,25 @@ Mindreader accepts explicit IRIs or derives them from names:
 | Property | `mindreader:property/<slug>` | Preserved |
 | Element | `mindreader:element/<slug>` | Lowercase |
 | Literal | `mindreader:literal/<slug>-<hash>` | Lowercase |
-| Episode | `mindreader:episode/<uuid>` | Lowercase |
 | Signal, Pattern, Insight, Knowledge | `mindreader:<kind>/<slug>` | Lowercase |
 
 Slug normalization keeps ASCII letters, numbers, `.`, `_`, and `-`; replaces other runs with `-`; trims surrounding dashes; and falls back to `unnamed`. Literal identity includes its datatype and value.
 
+Episodes use generated `mindreader:episode/<uuid>` IRIs. Relationships use generated `mindreader:relationship/<uuid>` IRIs. These UUID-based identities are not name-derived, but they remain stable after creation and appear in retrieval results and provenance.
+
 ## Security and trust boundary
 
-Mindreader does not add an application authentication layer in front of MCP or Neo4j, and layers are a relationship filter rather than a security boundary. Anyone who can start or control the MCP process can use its configured Neo4j credential and embedding provider key. Ordinary graph operations remain local, but every `memory_semantic_search` sends its query text to OpenAI or xAI for embedding. It does not send the stored result bundle. Secure the client configuration, native `.env`, host process, network path, Neo4j deployment, and provider accounts accordingly.
+Mindreader does not add an application authentication layer in front of MCP or Neo4j, and layers are a relationship filter rather than a security boundary. Anyone who can start or control the MCP process can use its configured Neo4j credential and embedding provider key. Graph operations go only to the configured Neo4j endpoint, but every `memory_semantic_search` also sends its query text to OpenAI or xAI for embedding. It does not send the stored result bundle. Secure the client configuration, native `.env`, host process, network path, Neo4j deployment, and provider accounts accordingly.
 
 ## Configuration reference
 
-On first MCP startup, Mindreader creates `config.toml` and `.env` without overwriting existing files in the OS-native configuration directory:
+When the server starts in MCP mode, Mindreader creates `config.toml` and `.env` without overwriting existing files in the OS-native configuration directory:
 
 - Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/mindreader`
 - macOS: `~/Library/Application Support/mindreader`
 - Windows: `%APPDATA%\mindreader`
 
-The directory is user-only on Unix and the generated `.env` is mode `0600`. Put non-secret settings in `config.toml`:
+The directory is mode `0700` on Unix and the generated `.env` is mode `0600`. Mindreader does not read non-secret settings from process environment variables. Put them in `config.toml`:
 
 ```toml
 [neo4j]
@@ -398,7 +478,27 @@ rrf_k = 60.0
 direct_weight = 2.0
 ```
 
-The TOML parser rejects unknown fields. Dimensions must be `1..4096`; semantic similarity thresholds must be finite values from `0` through `1`; TTL, neighbor limit (`1..100`), `rrf_k`, and `direct_weight` must be positive.
+### Non-secret settings
+
+| Setting | Type | Default | Constraint or effect |
+| --- | --- | --- | --- |
+| `neo4j.uri` | string | `bolt://127.0.0.1:7687` | Neo4j Bolt endpoint. |
+| `neo4j.user` | string | `neo4j` | Neo4j username. |
+| `embeddings.openai.model` | string | `text-embedding-3-small` | Must be non-empty when `OPENAI_API_KEY` selects OpenAI. |
+| `embeddings.openai.dimensions` | integer | `1536` | Must be `1..4096` for the selected provider and match returned vectors. |
+| `embeddings.xai.model` | string | empty | Must be set when `XAI_API_KEY` selects xAI. |
+| `embeddings.xai.dimensions` | integer | `1536` | Must be `1..4096` for the selected provider and match returned vectors. |
+| `semantic.ttl_days` | integer | `30` | Must be positive; controls semantic activation expiry. |
+| `semantic.neighbor_limit` | integer | `10` | Must be `1..100`; bounds vector neighbors considered for recall. |
+| `semantic.recall_similarity_threshold` | number | `0.70` | Finite value in `0..1`. |
+| `semantic.convergence_similarity_threshold` | number | `0.90` | Finite value in `0..1`. |
+| `semantic.convergence_result_overlap_threshold` | number | `0.60` | Finite value in `0..1`. |
+| `semantic.rrf_k` | number | `60.0` | Must be finite and positive. |
+| `semantic.direct_weight` | number | `2.0` | Must be finite and positive. |
+
+The TOML parser rejects unknown fields. See [`src/config.rs`](src/config.rs) for the defaults, validation, and provider-selection contract.
+
+### Secrets and precedence
 
 The colocated `.env` contains only secrets:
 
@@ -408,11 +508,19 @@ OPENAI_API_KEY=
 XAI_API_KEY=
 ```
 
-Non-empty process environment secrets take precedence over that file. `NEO4J_PASSWORD` is required for database-backed calls. If `OPENAI_API_KEY` is set, Mindreader uses the configured OpenAI model. Otherwise, if `XAI_API_KEY` is set, it uses the configured xAI model. OpenAI therefore wins when both keys exist. The selected provider's model must be non-empty and its configured dimension must match the returned vectors. Non-secret `NEO4J_URI`, `NEO4J_USER`, model, dimension, and semantic settings are not read from environment variables.
+| Secret | Required | Behavior |
+| --- | --- | --- |
+| `NEO4J_PASSWORD` | Yes, for database-backed calls | Authenticates the configured Neo4j user. MCP initialization and `tools/list` remain available without a successful database connection. |
+| `OPENAI_API_KEY` | No | Enables semantic search with `[embeddings.openai]`. Takes precedence when both provider keys are set. |
+| `XAI_API_KEY` | No | Enables semantic search with `[embeddings.xai]` when no OpenAI key is set. |
+
+A non-empty process environment secret takes precedence over the colocated `.env` value. Empty process values fall back to non-empty file values. Provider failures do not fall through to another provider because the configured vector spaces may differ.
+
+### Database bootstrap
 
 At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 5, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. The merge-candidate index uses a synchronous keyword-analyzed lowercase whole-name property so APOC can rerank a small indexed candidate set without scanning every entity. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
 
-Version 5 requires a fresh database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
+Initializing model version 5 requires an empty database. Subsequent starts accept a compatible model-v5 database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
 
 ## Run entirely with Docker
 
@@ -429,7 +537,7 @@ docker compose up -d neo4j
 docker compose run --rm -T mindreader
 ```
 
-The second command waits for MCP input on stdin without allocating a pseudo-TTY. All diagnostics go to stderr so stdout remains reserved for MCP messages; startup messages use structured JSON, while some database bootstrap warnings are plain text.
+The second command waits for MCP input on stdin without allocating a pseudo-TTY. All serving-mode diagnostics are structured JSON on stderr so stdout remains reserved for MCP messages.
 
 ## Development
 
@@ -438,13 +546,13 @@ Format, lint, and run the unit tests:
 ```bash
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test --all-targets --all-features
 ```
 
 Run the live integration smoke test when Neo4j is available:
 
 ```bash
-cargo run --bin mindreader-smoke
+cargo run --features developer-tools --bin mindreader-smoke
 ```
 
 Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and `.env` instead of the operator's normal configuration directory. The smoke test writes persistent fixtures to the configured Neo4j database and does not clean them up. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for graph model versioning and release expectations.
@@ -452,7 +560,7 @@ Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and 
 Run the release-mode graph benchmark against a disposable database before changing search, logical locks, or merge-candidate generation:
 
 ```bash
-cargo run --release --bin mindreader-bench -- --config-dir PATH --entities 10000 --samples 30
+cargo run --release --features developer-tools --bin mindreader-bench -- --config-dir PATH --entities 10000 --samples 30
 ```
 
 The benchmark refuses any database that is not pristine after model-v5 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions. Never point it at production or a database whose contents must be preserved.
