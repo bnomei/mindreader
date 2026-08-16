@@ -266,6 +266,17 @@ struct RevisionPlan {
     pub reason: Option<String>,
 }
 
+struct RevisionResult {
+    noop: bool,
+    scope: Vec<String>,
+    episode: Option<Episode>,
+    current_target: Value,
+    previous_target: Value,
+    fact: Option<Value>,
+    alternatives: Vec<Value>,
+    unify: Vec<Value>,
+}
+
 /// Resolved withdrawal selector used internally by `memory_withdraw`.
 #[derive(Debug, Clone)]
 struct WithdrawalSelector {
@@ -385,7 +396,7 @@ async fn apply_node_memberships_txn(
         query(
             r#"
             MATCH (n:Entity {iri: $iri})
-            WITH n, coalesce(n.layers, []) AS before
+            WITH n, n.layers AS before
             SET n.layers = CASE
               WHEN size($layers) = 0 THEN []
               WHEN $created THEN $layers
@@ -460,7 +471,7 @@ async fn find_current_pairs_txn(
         let cypher = format!(
             "MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity {{iri: $o}}) \
              WHERE r.validTo IS NULL RETURN id(r) AS rid, r.iri AS iri, \
-             coalesce(r.layers, []) AS layers"
+             r.layers AS layers"
         );
         fetch_all_txn(
             txn,
@@ -475,7 +486,7 @@ async fn find_current_pairs_txn(
             query(
                 "MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity {iri: $o}) \
                  WHERE r.validTo IS NULL AND r.propertyIri = $p \
-                 RETURN id(r) AS rid, r.iri AS iri, coalesce(r.layers, []) AS layers",
+                 RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers",
             )
             .param("s", s.to_string())
             .param("o", o.to_string())
@@ -604,9 +615,9 @@ async fn find_conflicts_txn(
             r#"
             MATCH (s:Entity {iri: $s})-[r]->(o:Entity)
             WHERE r.validTo IS NULL AND o.iri <> $o
-              AND (size(coalesce(s.layers, [])) = 0 OR any(layer IN coalesce(s.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(r.layers, [])) = 0 OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(o.layers, [])) = 0 OR any(layer IN coalesce(o.layers, []) WHERE layer IN $layers))
+              AND (size(s.layers) = 0 OR any(layer IN s.layers WHERE layer IN $layers))
+              AND (size(r.layers) = 0 OR any(layer IN r.layers WHERE layer IN $layers))
+              AND (size(o.layers) = 0 OR any(layer IN o.layers WHERE layer IN $layers))
               AND (($isStructural AND type(r) = $relType)
                 OR (NOT $isStructural AND type(r) = 'ASSERTS' AND r.propertyIri = $p))
             RETURN r, o, r.propertyIri AS p
@@ -717,10 +728,15 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
             let item = assert_prepared_fact_txn(&mut txn, fact, &layers, &episode).await?;
             any_changed |= !item.noop;
             created_iris.extend(item.created_iris);
-            if !item.siblings.is_empty() {
+            if !item.alternatives.is_empty() {
+                let target = item
+                    .json
+                    .get("target")
+                    .cloned()
+                    .ok_or_else(|| operation_error!("memory_write fact is missing target"))?;
                 alternatives.push(json!({
-                    "target": item.json.get("target").cloned().unwrap_or(Value::Null),
-                    "conflicts": item.siblings,
+                    "target": target,
+                    "conflicts": item.alternatives,
                 }));
             }
             items.push(item.json);
@@ -784,7 +800,7 @@ mod review_tests {
     use serde_json::json;
 
     #[test]
-    fn review_payloads_keeps_siblings_when_conflicts_are_empty() {
+    fn review_payloads_keeps_alternatives_when_conflicts_are_empty() {
         let alternatives = vec![json!({
             "target": {"kind":"fact","iri":"mindreader:relationship/a"},
             "conflicts": [{"p":"observed"}]
@@ -799,7 +815,7 @@ struct PreparedFactResult {
     noop: bool,
     json: Value,
     created_iris: Vec<String>,
-    siblings: Vec<Value>,
+    alternatives: Vec<Value>,
 }
 
 async fn assert_prepared_fact_txn(
@@ -816,7 +832,7 @@ async fn assert_prepared_fact_txn(
     )
     .await?;
     let (object, object_is_literal) = merge_object_in_txn(txn, fact.object_value).await?;
-    let (_, property_created, property) = ensure_property_in_txn(txn, &fact.prop_iri).await?;
+    let (_, property_created, _) = ensure_property_in_txn(txn, &fact.prop_iri).await?;
     let mut changed = property_created;
     let subject_scope = schema_node_scope(&subject.labels, layers);
     let object_scope = schema_node_scope(&object.labels, layers);
@@ -907,8 +923,6 @@ async fn assert_prepared_fact_txn(
                 fact.spike.clone().map(Value::String),
             )?;
             item["noop"] = json!(!changed);
-            item["propertyStub"] = json!(property_created);
-            item["property"] = property;
             item["conflicts"] = if fact.contradicts {
                 json!(conflicts)
             } else {
@@ -917,7 +931,7 @@ async fn assert_prepared_fact_txn(
             item
         },
         created_iris,
-        siblings: conflicts,
+        alternatives: conflicts,
     })
 }
 
@@ -1019,7 +1033,7 @@ async fn apply_revision(
     graph: &Graph,
     args: RevisionPlan,
     expected_fact_iri: Option<&str>,
-) -> Result<Value> {
+) -> Result<RevisionResult> {
     for attempt in 0..3_u64 {
         match apply_revision_once(graph, args.clone(), expected_fact_iri).await {
             Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
@@ -1035,7 +1049,7 @@ async fn apply_revision_once(
     graph: &Graph,
     args: RevisionPlan,
     expected_fact_iri: Option<&str>,
-) -> Result<Value> {
+) -> Result<RevisionResult> {
     let layers = normalize_layers(args.layers)?;
     let predicate = PredicateRef::parse(&args.p)?;
     reject_system_owned_predicate(predicate.iri())?;
@@ -1090,16 +1104,17 @@ async fn apply_revision_once(
     if old_iri == new_iri {
         txn.rollback().await?;
         let target_iri = expected_fact_iri.unwrap_or(&old_current.iri);
-        return Ok(json!({
-            "noop": true,
-            "scope": layers,
-            "episode": Value::Null,
-            "target": { "kind": "fact", "iri": target_iri },
-            "previousTarget": { "kind": "fact", "iri": target_iri },
-            "fact": Value::Null,
-            "siblings": [],
-            "unifySuggestions": [],
-        }));
+        let target = json!({ "kind": "fact", "iri": target_iri });
+        return Ok(RevisionResult {
+            noop: true,
+            scope: layers,
+            episode: None,
+            current_target: target.clone(),
+            previous_target: target,
+            fact: None,
+            alternatives: Vec::new(),
+            unify: Vec::new(),
+        });
     }
     let result = async {
         let subject = merge_node_in_txn(
@@ -1110,7 +1125,7 @@ async fn apply_revision_once(
         )
         .await?;
         let (new_object, new_object_is_literal) = merge_object_in_txn(&mut txn, new_value).await?;
-        let (_, property_created, property) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
+        let (_, property_created, _) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
         let episode =
             create_episode_in_txn(&mut txn, "memory_revise", args.reason.as_deref()).await?;
         apply_node_memberships_txn(&mut txn, &subject, &layers).await?;
@@ -1184,69 +1199,57 @@ async fn apply_revision_once(
             subject_json,
             new_json,
             new_relationship_iri,
-            property_created,
-            property,
             conflicts,
             args.contradicts,
             merge_suggestions,
         ))
     }
     .await;
-    let (
-        episode,
-        subject,
-        new,
-        relationship_iri,
-        property_created,
-        property,
-        siblings,
-        contradicts,
-        merge_suggestions,
-    ) = match result {
-        Ok(value) => {
-            txn.commit()
-                .await
-                .map_err(|source| Error::AmbiguousCommit {
-                    operation: "memory_revise",
-                    source,
-                })?;
-            value
-        }
-        Err(error) => {
-            let _ = txn.rollback().await;
-            return Err(error);
-        }
-    };
+    let (episode, subject, new, relationship_iri, alternatives, contradicts, merge_suggestions) =
+        match result {
+            Ok(value) => {
+                txn.commit()
+                    .await
+                    .map_err(|source| Error::AmbiguousCommit {
+                        operation: "memory_revise",
+                        source,
+                    })?;
+                value
+            }
+            Err(error) => {
+                let _ = txn.rollback().await;
+                return Err(error);
+            }
+        };
     let current_target = json!({ "kind": "fact", "iri": relationship_iri });
     let previous_target = json!({
         "kind": "fact",
         "iri": expected_fact_iri.unwrap_or(&old_current.iri),
     });
     let conflicts = if contradicts {
-        Value::Array(siblings.clone())
+        Value::Array(alternatives.clone())
     } else {
         json!([])
     };
-    Ok(json!({
-        "noop": false,
-        "scope": layers,
-        "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
-        "target": current_target,
-        "previousTarget": previous_target,
-        "fact": {
-            "target": current_target,
+    let fact = json!({
+            "target": current_target.clone(),
             "s": subject,
             "p": prop_iri,
             "o": new,
-            "scope": layers,
+            "scope": layers.clone(),
             "spike": spike,
             "conflicts": conflicts,
-        },
-        "siblings": siblings.clone(),
-        "unifySuggestions": merge_suggestions,
-        "propertyCreated": property_created,
-        "property": property,
-    }))
+    });
+    Ok(RevisionResult {
+        noop: false,
+        scope: layers,
+        episode: Some(episode),
+        current_target,
+        previous_target,
+        fact: Some(fact),
+        alternatives,
+        unify: merge_suggestions,
+    })
 }
 
 async fn apply_withdrawal(
@@ -1329,7 +1332,7 @@ async fn apply_withdrawal_once(
                       AND NOT type(r) IN $protected
                       AND NOT s:Class AND NOT s:Property
                       AND NOT o:Class AND NOT o:Property
-                    RETURN id(r) AS rid, r.iri AS iri, coalesce(r.layers, []) AS layers
+                    RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers
                     "#,
                 )
                 .param("s", subject_iri.clone())
@@ -1356,13 +1359,13 @@ async fn apply_withdrawal_once(
                 format!(
                     "MATCH (s:Entity {{iri: $s}})-[r{rel}]->(o:Entity) \
                      WHERE r.validTo IS NULL {object_clause} {target_clause} \
-                     RETURN id(r) AS rid, r.iri AS iri, coalesce(r.layers, []) AS layers"
+                     RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers"
                 )
             } else {
                 format!(
                     "MATCH (s:Entity {{iri: $s}})-[r:ASSERTS]->(o:Entity) \
                      WHERE r.validTo IS NULL AND r.propertyIri = $p {object_clause} {target_clause} \
-                     RETURN id(r) AS rid, r.iri AS iri, coalesce(r.layers, []) AS layers"
+                     RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers"
                 )
             };
             let mut q = query(&cypher)
@@ -1487,8 +1490,8 @@ const RECALL_IRI_NODES_QUERY: &str = r#"
 UNWIND range(0, size($iris) - 1) AS inputIndex
 WITH inputIndex, $iris[inputIndex] AS iri
 OPTIONAL MATCH (n:Entity {iri: iri})
-WHERE size(coalesce(n.layers, [])) = 0
-   OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers)
+WHERE size(n.layers) = 0
+   OR any(layer IN n.layers WHERE layer IN $layers)
 RETURN inputIndex, iri, n IS NOT NULL AS found, n
 ORDER BY inputIndex ASC
 "#;
@@ -1497,16 +1500,16 @@ const RECALL_IRI_FACTS_QUERY: &str = r#"
 UNWIND range(0, size($iris) - 1) AS inputIndex
 WITH inputIndex, $iris[inputIndex] AS iri
 MATCH (root:Entity {iri: iri})
-WHERE size(coalesce(root.layers, [])) = 0
-   OR any(layer IN coalesce(root.layers, []) WHERE layer IN $layers)
+WHERE size(root.layers) = 0
+   OR any(layer IN root.layers WHERE layer IN $layers)
 CALL {
   WITH root
   MATCH (root)-[r]-(other:Entity)
   WHERE r.validTo IS NULL
-    AND (size(coalesce(r.layers, [])) = 0
-         OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-    AND (size(coalesce(other.layers, [])) = 0
-         OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
+    AND (size(r.layers) = 0
+         OR any(layer IN r.layers WHERE layer IN $layers))
+    AND (size(other.layers) = 0
+         OR any(layer IN other.layers WHERE layer IN $layers))
   WITH r, startNode(r) AS s, endNode(r) AS o,
        r.propertyIri AS property
   ORDER BY s.iri ASC, property ASC, o.iri ASC, r.iri ASC
@@ -1647,12 +1650,12 @@ fn recall_around_query(depth: u32) -> String {
         r#"
         MATCH path = (start:Entity {{iri: $from}})-[pathRels*1..{depth}]-(x:Entity)
         WHERE all(n IN nodes(path) WHERE
-          size(coalesce(n.layers, [])) = 0
-          OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers))
+          size(n.layers) = 0
+          OR any(layer IN n.layers WHERE layer IN $layers))
           AND all(pathRel IN relationships(path) WHERE
             type(pathRel) IN $rels AND pathRel.validTo IS NULL
-            AND (size(coalesce(pathRel.layers, [])) = 0
-                 OR any(layer IN coalesce(pathRel.layers, []) WHERE layer IN $layers)))
+            AND (size(pathRel.layers) = 0
+                 OR any(layer IN pathRel.layers WHERE layer IN $layers)))
         UNWIND relationships(path) AS r
         WITH path, r,
              r.propertyIri AS property,
@@ -1699,8 +1702,8 @@ pub async fn memory_recall_around(
         graph,
         query(
             "MATCH (n:Entity {iri: $iri}) \
-             WHERE size(coalesce(n.layers, [])) = 0 \
-                OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers) \
+             WHERE size(n.layers) = 0 \
+                OR any(layer IN n.layers WHERE layer IN $layers) \
              RETURN n",
         )
         .param("iri", from.to_string())
@@ -1802,20 +1805,20 @@ pub async fn memory_recall_around(
 const RECALL_HISTORY_FACT_QUERY: &str = r#"
 MATCH (s:Entity)-[anchor]->(o:Entity)
 WHERE anchor.iri = $iri
-  AND (size(coalesce(s.layers, [])) = 0
-       OR any(layer IN coalesce(s.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(anchor.layers, [])) = 0
-       OR any(layer IN coalesce(anchor.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(o.layers, [])) = 0
-       OR any(layer IN coalesce(o.layers, []) WHERE layer IN $layers))
+  AND (size(s.layers) = 0
+       OR any(layer IN s.layers WHERE layer IN $layers))
+  AND (size(anchor.layers) = 0
+       OR any(layer IN anchor.layers WHERE layer IN $layers))
+  AND (size(o.layers) = 0
+       OR any(layer IN o.layers WHERE layer IN $layers))
 WITH s, anchor.propertyIri AS property
 MATCH (s)-[r]->(other:Entity)
 WHERE r.propertyIri = property
   AND NOT type(r) IN $protected
-  AND (size(coalesce(r.layers, [])) = 0
-       OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(other.layers, [])) = 0
-       OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
+  AND (size(r.layers) = 0
+       OR any(layer IN r.layers WHERE layer IN $layers))
+  AND (size(other.layers) = 0
+       OR any(layer IN other.layers WHERE layer IN $layers))
 WITH s, r, other, property, r.validTo IS NULL AS current, toString(r.validTo) AS validTo
 ORDER BY current DESC, validTo DESC, r.iri ASC
 LIMIT $limit
@@ -1824,14 +1827,14 @@ RETURN s, r, other AS o, property, current, validTo
 
 const RECALL_HISTORY_NODE_QUERY: &str = r#"
 MATCH (n:Entity {iri: $iri})
-WHERE size(coalesce(n.layers, [])) = 0
-   OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers)
+WHERE size(n.layers) = 0
+   OR any(layer IN n.layers WHERE layer IN $layers)
 MATCH (n)-[r]-(other:Entity)
 WHERE NOT type(r) IN $protected
-  AND (size(coalesce(r.layers, [])) = 0
-       OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(other.layers, [])) = 0
-       OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
+  AND (size(r.layers) = 0
+       OR any(layer IN r.layers WHERE layer IN $layers))
+  AND (size(other.layers) = 0
+       OR any(layer IN other.layers WHERE layer IN $layers))
 WITH startNode(r) AS s, r, endNode(r) AS o,
      r.propertyIri AS property,
      r.validTo IS NULL AS current, toString(r.validTo) AS validTo
@@ -1858,13 +1861,13 @@ pub async fn memory_recall_history(
     let fact_iri = iri.starts_with("mindreader:relationship/");
     let found_query = if fact_iri {
         "MATCH ()-[r]->() WHERE r.iri = $iri \
-         AND (size(coalesce(r.layers, [])) = 0 \
-              OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers)) \
+         AND (size(r.layers) = 0 \
+              OR any(layer IN r.layers WHERE layer IN $layers)) \
          RETURN count(r) AS n"
     } else {
         "MATCH (n:Entity {iri: $iri}) \
-         WHERE size(coalesce(n.layers, [])) = 0 \
-            OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers) \
+         WHERE size(n.layers) = 0 \
+            OR any(layer IN n.layers WHERE layer IN $layers) \
          RETURN count(n) AS n"
     };
     let found = fetch_one(
@@ -1913,8 +1916,8 @@ pub async fn memory_recall_history(
             graph,
             query(
                 "MATCH (n:Entity {iri: $iri}) \
-                 WHERE size(coalesce(n.layers, [])) = 0 \
-                    OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers) \
+                 WHERE size(n.layers) = 0 \
+                    OR any(layer IN n.layers WHERE layer IN $layers) \
                  RETURN n",
             )
             .param("iri", iri.to_string())
@@ -1993,12 +1996,12 @@ async fn load_current_fact(
             r#"
             MATCH (s:Entity)-[r]->(o:Entity)
             WHERE r.iri = $iri AND r.validTo IS NULL
-              AND (size(coalesce(s.layers, [])) = 0
-                   OR any(layer IN coalesce(s.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(r.layers, [])) = 0
-                   OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(o.layers, [])) = 0
-                   OR any(layer IN coalesce(o.layers, []) WHERE layer IN $layers))
+              AND (size(s.layers) = 0
+                   OR any(layer IN s.layers WHERE layer IN $layers))
+              AND (size(r.layers) = 0
+                   OR any(layer IN r.layers WHERE layer IN $layers))
+              AND (size(o.layers) = 0
+                   OR any(layer IN o.layers WHERE layer IN $layers))
             RETURN s, r, o, r.propertyIri AS p
             "#,
         )
@@ -2013,7 +2016,7 @@ async fn load_current_fact(
                 graph,
                 query(
                     "MATCH ()-[r]->() WHERE r.iri = $iri AND r.validTo IS NULL \
-                     RETURN coalesce(r.layers, []) AS layers",
+                     RETURN r.layers AS layers",
                 )
                 .param("iri", iri.to_string()),
             )
@@ -2105,62 +2108,34 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
         Some(&args.target.iri),
     )
     .await?;
-    let noop = result
-        .get("noop")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| operation_error!("memory_revise result is missing boolean noop"))?;
-    let current_target = result
-        .get("target")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_revise result is missing target"))?;
-    let previous_target = result
-        .get("previousTarget")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_revise result is missing previousTarget"))?;
-    let siblings = result
-        .get("siblings")
-        .and_then(Value::as_array)
-        .cloned()
-        .map(Value::Array)
-        .ok_or_else(|| operation_error!("memory_revise result is missing siblings"))?;
-    let merge_suggestions = result
-        .get("unifySuggestions")
-        .and_then(Value::as_array)
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_revise result is missing unify suggestions"))?;
-    let fact = result
-        .get("fact")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_revise result is missing fact"))?;
-    let scope = result
-        .get("scope")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_revise result is missing scope"))?;
-    let episode = result
-        .get("episode")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_revise result is missing episode"))?;
-    let facts = if fact.is_null() {
+    let current_target = result.current_target;
+    let previous_target = result.previous_target;
+    let facts = result.fact.clone().into_iter().collect::<Vec<_>>();
+    let fact = result.fact.unwrap_or(Value::Null);
+    let alternatives = if result.alternatives.is_empty() {
         Vec::new()
     } else {
-        vec![fact.clone()]
+        vec![json!({
+            "target": current_target.clone(),
+            "conflicts": result.alternatives,
+        })]
     };
+    let episode = result.episode.map_or(
+        Value::Null,
+        |episode| json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool }),
+    );
     Ok(finish_mutation(
         json!({
             "ok": true,
-            "scope": scope,
-            "noop": noop,
+            "scope": result.scope,
+            "noop": result.noop,
             "episode": episode,
             "target": current_target.clone(),
             "previousTarget": previous_target.clone(),
             "fact": fact,
             "review": {
-                "unify": merge_suggestions,
-                "alternatives": if siblings.as_array().is_some_and(|values| !values.is_empty()) {
-                    json!([{ "target": current_target.clone(), "conflicts": siblings }])
-                } else {
-                    json!([])
-                },
+                "unify": result.unify,
+                "alternatives": alternatives,
             },
         }),
         &facts,
@@ -2313,9 +2288,9 @@ async fn apply_judge_rating_txn(
             query(
                 r#"
                 MATCH (target:Entity {iri: $iri})
-                WHERE size(coalesce(target.layers, [])) = 0
-                   OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope)
-                WITH target, coalesce(target.weight, 0) AS before
+                WHERE size(target.layers) = 0
+                   OR any(layer IN target.layers WHERE layer IN $scope)
+                WITH target, target.weight AS before
                 WHERE ($strengthen AND before < $max) OR (NOT $strengthen AND before > $min)
                 SET target.weight = CASE WHEN $strengthen THEN before + 1 ELSE before - 1 END
                 RETURN before, target.weight AS after
@@ -2335,10 +2310,10 @@ async fn apply_judge_rating_txn(
                 r#"
                 MATCH (s:Entity)-[target]->(o:Entity)
                 WHERE target.iri = $iri AND target.validTo IS NULL
-                  AND (size(coalesce(s.layers, [])) = 0 OR any(layer IN coalesce(s.layers, []) WHERE layer IN $scope))
-                  AND (size(coalesce(target.layers, [])) = 0 OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope))
-                  AND (size(coalesce(o.layers, [])) = 0 OR any(layer IN coalesce(o.layers, []) WHERE layer IN $scope))
-                WITH target, coalesce(target.weight, 0) AS before
+                  AND (size(s.layers) = 0 OR any(layer IN s.layers WHERE layer IN $scope))
+                  AND (size(target.layers) = 0 OR any(layer IN target.layers WHERE layer IN $scope))
+                  AND (size(o.layers) = 0 OR any(layer IN o.layers WHERE layer IN $scope))
+                WITH target, target.weight AS before
                 WHERE ($strengthen AND before < $max) OR (NOT $strengthen AND before > $min)
                 SET target.weight = CASE WHEN $strengthen THEN before + 1 ELSE before - 1 END
                 RETURN before, target.weight AS after
@@ -2430,7 +2405,7 @@ async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
             txn.run(
                 query(&format!(
                     "{target_match} SET target.weightUpdatedAt = datetime(), \
-                     target.feedbackEpisodeId = $episode"
+                     target.judgmentEpisodeId = $episode"
                 ))
                 .param("iri", rating.target.iri.clone())
                 .param("episode", episode.iri.clone()),
@@ -2566,11 +2541,11 @@ async fn load_place_memberships_txn(
             query(
                 r#"
                 MATCH (target:Entity {iri: $iri})
-                WHERE size(coalesce(target.layers, [])) = 0
-                   OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope)
+                WHERE size(target.layers) = 0
+                   OR any(layer IN target.layers WHERE layer IN $scope)
                 WITH target
                 WHERE NOT target:Class AND NOT target:Property
-                RETURN coalesce(target.layers, []) AS memberships
+                RETURN target.layers AS memberships
                 "#,
             )
             .param("iri", target.iri.clone())
@@ -2586,10 +2561,10 @@ async fn load_place_memberships_txn(
                 WHERE target.iri = $iri AND target.validTo IS NULL
                   AND NOT s:Class AND NOT s:Property
                   AND NOT o:Class AND NOT o:Property
-                  AND (size(coalesce(s.layers, [])) = 0 OR any(layer IN coalesce(s.layers, []) WHERE layer IN $scope))
-                  AND (size(coalesce(target.layers, [])) = 0 OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope))
-                  AND (size(coalesce(o.layers, [])) = 0 OR any(layer IN coalesce(o.layers, []) WHERE layer IN $scope))
-                RETURN coalesce(target.layers, []) AS memberships
+                  AND (size(s.layers) = 0 OR any(layer IN s.layers WHERE layer IN $scope))
+                  AND (size(target.layers) = 0 OR any(layer IN target.layers WHERE layer IN $scope))
+                  AND (size(o.layers) = 0 OR any(layer IN o.layers WHERE layer IN $scope))
+                RETURN target.layers AS memberships
                 "#,
             )
             .param("iri", target.iri.clone())
@@ -2713,9 +2688,9 @@ async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit])
             MATCH (s:Entity)-[r]->(o:Entity)
             WHERE r.validTo IS NULL
               AND (s.iri IN $nodeIris OR o.iri IN $nodeIris OR r.iri IN $factIris)
-            RETURN s.iri AS sIri, coalesce(s.layers, []) AS sLayers, labels(s) AS sLabels,
-                   r.iri AS rIri, coalesce(r.layers, []) AS rLayers,
-                   o.iri AS oIri, coalesce(o.layers, []) AS oLayers, labels(o) AS oLabels
+            RETURN s.iri AS sIri, s.layers AS sLayers, labels(s) AS sLabels,
+                   r.iri AS rIri, r.layers AS rLayers,
+                   o.iri AS oIri, o.layers AS oLayers, labels(o) AS oLabels
             "#,
         )
         .param("nodeIris", node_iris)
@@ -2966,7 +2941,8 @@ pub async fn list_schema_catalog(graph: &Graph, kind: &str) -> Result<Value> {
         graph,
         query(&format!(
             "MATCH (n:Entity:{label}) \
-             RETURN n.iri AS iri, n.name AS name, coalesce(n.stub, false) AS stub \
+             RETURN n.iri AS iri, n.name AS name, n.stub AS stub, \
+                    n.layers AS layers, n.weight AS weight \
              ORDER BY n.name, n.iri LIMIT 101"
         )),
     )
@@ -2974,11 +2950,21 @@ pub async fn list_schema_catalog(graph: &Graph, kind: &str) -> Result<Value> {
     let items = rows
         .into_iter()
         .map(|row| {
+            let iri = row.get::<String>("iri")?;
+            let name = row.get::<String>("name")?;
+            let stub = row.get::<bool>("stub")?;
+            let layers = row.get::<Vec<String>>("layers")?;
+            let _weight = row.get::<i64>("weight")?;
+            if stub || !layers.is_empty() {
+                return Err(operation_error!(
+                    "schema catalog node {iri} must have stub=false and global scope"
+                ));
+            }
             Ok(json!({
                 "kind": kind,
-                "iri": row.get::<String>("iri")?,
-                "name": row.get::<String>("name").ok(),
-                "stub": row.get::<bool>("stub")?,
+                "iri": iri,
+                "name": name,
+                "stub": stub,
             }))
         })
         .collect::<Result<Vec<_>>>()?;

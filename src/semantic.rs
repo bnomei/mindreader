@@ -384,12 +384,12 @@ async fn resolve_facts(
             MATCH (s:Entity)-[r]->(o:Entity)
             WHERE r.iri IN $iris AND r.validTo IS NULL
               AND (type(r) = 'ASSERTS' OR type(r) = 'ABOUT')
-              AND (size(coalesce(s.layers, [])) = 0
-                   OR any(layer IN coalesce(s.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(r.layers, [])) = 0
-                   OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(o.layers, [])) = 0
-                   OR any(layer IN coalesce(o.layers, []) WHERE layer IN $layers))
+              AND (size(s.layers) = 0
+                   OR any(layer IN s.layers WHERE layer IN $layers))
+              AND (size(r.layers) = 0
+                   OR any(layer IN r.layers WHERE layer IN $layers))
+              AND (size(o.layers) = 0
+                   OR any(layer IN o.layers WHERE layer IN $layers))
               AND ($labelCount = 0
                    OR any(label IN $labels WHERE label IN labels(s) OR label IN labels(o)))
             RETURN s, r, o

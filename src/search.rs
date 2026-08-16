@@ -299,12 +299,12 @@ WITH s, r, o, 1.0 AS indexScore
 const RANK_AND_LIMIT: &str = r#"
 WHERE r.validTo IS NULL
   AND (type(r) = 'ASSERTS' OR type(r) = 'ABOUT')
-  AND (size(coalesce(s.layers, [])) = 0
-       OR any(layer IN coalesce(s.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(r.layers, [])) = 0
-       OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(o.layers, [])) = 0
-       OR any(layer IN coalesce(o.layers, []) WHERE layer IN $layers))
+  AND (size(s.layers) = 0
+       OR any(layer IN s.layers WHERE layer IN $layers))
+  AND (size(r.layers) = 0
+       OR any(layer IN r.layers WHERE layer IN $layers))
+  AND (size(o.layers) = 0
+       OR any(layer IN o.layers WHERE layer IN $layers))
   AND ($labelCount = 0
        OR any(label IN $labels WHERE label IN labels(s) OR label IN labels(o)))
 WITH s, r, o, indexScore,
@@ -318,12 +318,12 @@ WITH s, r, o, indexScore,
 OPTIONAL MATCH (sp:Entity)-[a:ABOUT]->(s)
 WHERE a.validTo IS NULL
   AND (sp:Knowledge OR sp:Insight OR sp:Pattern OR sp:Signal)
-  AND (size(coalesce(sp.layers, [])) = 0
-       OR any(layer IN coalesce(sp.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(a.layers, [])) = 0
-       OR any(layer IN coalesce(a.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(s.layers, [])) = 0
-       OR any(layer IN coalesce(s.layers, []) WHERE layer IN $layers))
+  AND (size(sp.layers) = 0
+       OR any(layer IN sp.layers WHERE layer IN $layers))
+  AND (size(a.layers) = 0
+       OR any(layer IN a.layers WHERE layer IN $layers))
+  AND (size(s.layers) = 0
+       OR any(layer IN s.layers WHERE layer IN $layers))
 WITH s, r, o, indexScore, ownSpikeRank,
      max(CASE
        WHEN sp:Knowledge THEN 4
@@ -386,12 +386,12 @@ async fn spike_context(
             MATCH (sp:Entity)-[a:ABOUT]->(el:Entity)
             WHERE a.validTo IS NULL AND el.iri IN $iris
               AND (sp:Knowledge OR sp:Insight OR sp:Pattern OR sp:Signal)
-              AND (size(coalesce(sp.layers, [])) = 0
-                   OR any(layer IN coalesce(sp.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(a.layers, [])) = 0
-                   OR any(layer IN coalesce(a.layers, []) WHERE layer IN $layers))
-              AND (size(coalesce(el.layers, [])) = 0
-                   OR any(layer IN coalesce(el.layers, []) WHERE layer IN $layers))
+              AND (size(sp.layers) = 0
+                   OR any(layer IN sp.layers WHERE layer IN $layers))
+              AND (size(a.layers) = 0
+                   OR any(layer IN a.layers WHERE layer IN $layers))
+              AND (size(el.layers) = 0
+                   OR any(layer IN el.layers WHERE layer IN $layers))
             WITH sp, a, el,
                  CASE
                    WHEN sp:Knowledge THEN 4

@@ -68,6 +68,7 @@ fn lucene_fuzzy_term(name: &str) -> String {
 
 /// MCP `memory_unify` arguments: surviving `target` node absorbs `source`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UnifyArgs {
     pub source: NodeHandle,
     pub target: NodeHandle,
@@ -698,8 +699,8 @@ pub async fn merge_suggestions_in_txn(
             WITH created, candidate
             WHERE candidate <> created
               AND candidate.name IS NOT NULL
-              AND (size(coalesce(candidate.layers, [])) = 0
-                   OR any(layer IN coalesce(candidate.layers, []) WHERE layer IN $layers))
+              AND (size(candidate.layers) = 0
+                   OR any(layer IN candidate.layers WHERE layer IN $layers))
               AND none(label IN labels(created) WHERE label IN $forbidden)
               AND none(label IN labels(candidate) WHERE label IN $forbidden)
               AND apoc.text.fuzzyMatch(toLower(created.name), toLower(candidate.name))
@@ -824,7 +825,7 @@ mod tests {
     use super::{
         duplicate_consolidation_plan, is_bootstrap_seeded, is_transient, lucene_fuzzy_term,
         merge_memberships, merge_similarity_accepted, require_compatible_property_merge,
-        DuplicateFact, DuplicateRetirement, SurvivorUpdate,
+        DuplicateFact, DuplicateRetirement, SurvivorUpdate, UnifyArgs,
     };
     use crate::error::Error;
     use std::collections::BTreeMap;
@@ -836,6 +837,16 @@ mod tests {
             merge_memberships(&["project:b".into()], &["project:a".into()]),
             vec!["project:a", "project:b"]
         );
+    }
+
+    #[test]
+    fn unify_args_reject_decorated_or_unknown_fields() {
+        assert!(serde_json::from_value::<UnifyArgs>(serde_json::json!({
+            "source": {"kind": "node", "iri": "mindreader:element/a"},
+            "target": {"kind": "node", "iri": "mindreader:element/b"},
+            "scope": []
+        }))
+        .is_err());
     }
 
     #[test]

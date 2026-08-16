@@ -160,7 +160,7 @@ pub async fn bootstrap(
             ] AS row
             MERGE (c:Entity:Class {iri: row.iri})
             ON CREATE SET c.name = row.name, c.createdAt = datetime(),
-              c.weight = 0, c.layers = []
+              c.weight = 0, c.layers = [], c.stub = false
             SET c.searchText = trim(coalesce(c.name, row.name) + ' ' + c.iri),
                 c.mergeName = toLower(coalesce(c.name, row.name))
             "#,
@@ -186,7 +186,7 @@ pub async fn bootstrap(
             ] AS row
             MERGE (p:Entity:Property {iri: row.iri})
             ON CREATE SET p.name = row.name, p.createdAt = datetime(),
-              p.weight = 0, p.layers = []
+              p.weight = 0, p.layers = [], p.stub = false
             SET p.searchText = trim(coalesce(p.name, row.name) + ' ' + p.iri),
                 p.mergeName = toLower(coalesce(p.name, row.name))
             "#,
@@ -797,8 +797,13 @@ pub fn node_json(node: &Node) -> Result<Value> {
         obj["value"] = json!(node.get::<String>("value")?);
         obj["datatype"] = json!(node.get::<String>("datatype")?);
     }
-    if let Ok(v) = node.get::<bool>("stub") {
-        obj["stub"] = json!(v);
+    if labels
+        .iter()
+        .any(|label| label == "Class" || label == "Property")
+    {
+        obj["stub"] = json!(node.get::<bool>("stub")?);
+    } else if let Ok(stub) = node.get::<bool>("stub") {
+        obj["stub"] = json!(stub);
     }
     if let Ok(v) = node.get::<String>("tool") {
         obj["tool"] = json!(v);
@@ -1006,6 +1011,8 @@ pub async fn merge_node_in_txn(
             WITH node, coalesce(node.mindreaderCreateMarker = $creationMarker, false) AS created
             REMOVE node.mindreaderCreateMarker
             SET node:$($labels)
+            FOREACH (_ IN CASE WHEN 'Class' IN $labels OR 'Property' IN $labels THEN [1] ELSE [] END |
+              SET node.stub = false, node.layers = [])
             SET node.name = coalesce(node.name, $name),
                 node.mergeName = toLower(coalesce(node.name, $name)),
                 node.searchText = trim(coalesce(node.name, $name) + ' ' + node.iri + ' ' + coalesce(node.value, ''))

@@ -141,6 +141,7 @@ impl PredicateRef {
 
 /// Pasteable node handle used by `memory_unify`.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct NodeHandle {
     pub kind: String,
     pub iri: String,
@@ -175,6 +176,7 @@ impl NodeHandle {
 
 /// Wire-shape subject for writes: `kind` must be `"node"`, plus `iri` or `name`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EntityInput {
     pub kind: String,
     #[serde(default)]
@@ -187,6 +189,7 @@ pub struct EntityInput {
 
 /// Wire-shape object: one tagged bag (`node` or `literal`) without schema unions.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ObjectInput {
     pub kind: String,
     #[serde(default)]
@@ -404,7 +407,8 @@ impl WithdrawalScope {
 #[cfg(test)]
 mod tests {
     use super::{
-        literal_iri, EntityInput, EntityRef, LayerId, ObjectInput, ObjectValue, PredicateRef,
+        literal_iri, EntityInput, EntityRef, LayerId, NodeHandle, ObjectInput, ObjectValue,
+        PredicateRef,
     };
 
     #[test]
@@ -453,6 +457,24 @@ mod tests {
             name: Some("x".into()),
             labels: vec![],
         })
+        .is_err());
+        assert!(serde_json::from_value::<EntityInput>(serde_json::json!({
+            "kind": "node",
+            "name": "x",
+            "weight": 0
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<ObjectInput>(serde_json::json!({
+            "kind": "literal",
+            "value": "x",
+            "relationship": {"iri": "legacy"}
+        }))
+        .is_err());
+        assert!(serde_json::from_value::<NodeHandle>(serde_json::json!({
+            "kind": "node",
+            "iri": "mindreader:element/x",
+            "name": "x"
+        }))
         .is_err());
         assert!(ObjectValue::from_input(ObjectInput {
             kind: "literal".into(),

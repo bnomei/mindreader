@@ -29,7 +29,7 @@ versions follow Semantic Versioning.
 
 ### Removed
 
-- Removed the obsolete in-process memory API, legacy search implementation, permissive legacy target payloads, relationship-handle fallbacks, and alternate Neo4j URI attempts. This release has no compatibility aliases or database migration.
+- Removed the obsolete in-process memory API, legacy search implementation, permissive legacy target payloads, relationship-handle fallbacks, `memory_withdraw.retracted` response field, and alternate Neo4j URI attempts. `memory_withdraw` now reports `withdrawn`; this release has no compatibility aliases or database migration.
 
 ## [0.4.0] - 2026-08-16
 

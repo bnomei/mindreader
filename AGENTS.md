@@ -50,7 +50,7 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - Every state-changing mutation records exactly one `Episode` and associates provenance with the changed records. No-op mutations record none.
 - Preserve the MCP host compatibility rule in `src/server.rs`: advertised input and output schemas remain plain tagged object schemas and contain no `anyOf`, `oneOf`, or `allOf`.
 - Recoverable tool failures return MCP `isError` structured results (`{ok:false,reason,message,retryable,outcome}`). Domain validation is not JSON-RPC `-32602`. Protocol errors stay for unknown-tool, unusable-server, and serde of required fields. Every successful tool result includes `ok:true`.
-- The 120/min burst-40 token bucket and 45s invoke timeout apply only to MCP `#[tool]` handlers via `Mindreader::invoke`. Never wrap `tools::*` or smoke in the limiter/timeout.
+- The 120/min burst-20 token bucket and 45s invoke timeout apply only to MCP `#[tool]` handlers via `Mindreader::invoke`. Never wrap `tools::*` or smoke in the limiter/timeout.
 - Keep the registered tool list synchronized across `src/server.rs`, its tests, `mcp.json`, and the README (exactly eight `memory_*` names).
 
 ## Working conventions

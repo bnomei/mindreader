@@ -229,6 +229,19 @@ def main() -> int:
         print([tool.get("name") for tool in listed])
         succeeded = contamination is None and discovery_contract_ok(discovery, tools)
 
+        print("=" * 72)
+        print(f"INITIALIZE {PROTOCOL}")
+        response, _, stderr, contamination, elapsed = initialize(
+            binary, PROTOCOL, env, args.timeout
+        )
+        print(f"elapsed_s={elapsed:.3f}")
+        print(json.dumps(response, indent=2) if response is not None else "TIMEOUT/NONE")
+        print("--- stderr ---")
+        print(stderr)
+        print(f"stdout_contamination={contamination or 'none'}")
+        if contamination is not None or not initialized_current_protocol(response):
+            succeeded = False
+
         for protocol in [*LEGACY_PROTOCOLS, UNKNOWN_PROTOCOL]:
             print("=" * 72)
             print(f"REJECT INITIALIZE {protocol}")
@@ -305,6 +318,14 @@ def rejected_protocol(response: dict | None) -> bool:
         and "result" not in response
         and isinstance(response.get("error"), dict)
         and response["error"].get("code") == -32022
+    )
+
+
+def initialized_current_protocol(response: dict | None) -> bool:
+    return (
+        isinstance(response, dict)
+        and "error" not in response
+        and ((response.get("result") or {}).get("protocolVersion") == PROTOCOL)
     )
 
 

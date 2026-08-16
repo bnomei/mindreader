@@ -389,7 +389,7 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 | `memory_recall_semantic` | `scope`, non-empty `text` | `labels[]`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall with expiring semantic activations. Sends only query text to the configured embedding provider. |
 | `memory_write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships. One Episode if any fact changed. |
 | `memory_revise` | `scope`, fact `target`, `new` | `spike`, `contradicts`, `reason` | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
-| `memory_withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return `withdrawnTargets`. |
+| `memory_withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return a `withdrawn` count plus `withdrawnTargets`. |
 | `memory_judge` | `scope`, `ratings[]` (1–20 unique targets) | None | Apply exactly `+1` or `-1` per visible node/current fact in one transaction and one Episode. |
 | `memory_place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
 | `memory_unify` | same-kind `source` and `target` node handles | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |

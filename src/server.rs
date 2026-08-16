@@ -219,6 +219,7 @@ fn props(value: Value) -> serde_json::Map<String, Value> {
 fn node_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node", "literal"] },
             "iri": { "type": "string" },
@@ -241,6 +242,7 @@ fn node_schema() -> Value {
 fn relationship_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["fact"] },
             "type": { "type": "string" },
@@ -260,6 +262,7 @@ fn relationship_schema() -> Value {
 fn conflict_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
             "relationship": relationship_schema(),
             "o": node_schema(),
@@ -272,6 +275,7 @@ fn conflict_schema() -> Value {
 fn fact_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
             "target": fact_target_schema(),
             "s": node_schema(),
@@ -303,6 +307,7 @@ fn nullable_fact_schema() -> Value {
 fn about_schema() -> Value {
     json!({
         "type": "object",
+        "additionalProperties": false,
         "properties": {
             "node": node_schema(),
             "about": { "type": "string" },
@@ -1622,10 +1627,7 @@ mod tests {
     fn output_schemas_use_only_current_field_names() {
         for tool in Mindreader::tool_router().list_all() {
             let output = tool.output_schema.as_ref().expect("output schema");
-            let properties = output
-                .get("properties")
-                .and_then(Value::as_object)
-                .expect("output properties");
+            let rendered = serde_json::to_string(output).expect("serialize output schema");
             for legacy in [
                 "layers",
                 "mergeSuggestions",
@@ -1633,9 +1635,13 @@ mod tests {
                 "targets",
                 "ratings",
                 "retracted",
+                "propertyStub",
+                "propertyCreated",
+                "unifySuggestions",
+                "siblings",
             ] {
                 assert!(
-                    !properties.contains_key(legacy),
+                    !rendered.contains(&format!("\"{legacy}\":")),
                     "{} advertises legacy output field {legacy}",
                     tool.name
                 );

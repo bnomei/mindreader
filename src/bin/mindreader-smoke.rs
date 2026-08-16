@@ -273,7 +273,7 @@ async fn relation_state(
         graph,
         query(
             "MATCH ()-[r]->() WHERE r.iri = $iri \
-             RETURN coalesce(r.layers, []) AS layers, r.validTo IS NULL AS current, \
+             RETURN r.layers AS layers, r.validTo IS NULL AS current, \
                     r.weight AS weight",
         )
         .param("iri", iri.to_string()),
@@ -292,7 +292,7 @@ async fn relation_state(
 async fn node_layers(graph: &Graph, iri: &str) -> Result<Option<Vec<String>>> {
     fetch_one(
         graph,
-        query("MATCH (n:Entity {iri: $iri}) RETURN coalesce(n.layers, []) AS layers")
+        query("MATCH (n:Entity {iri: $iri}) RETURN n.layers AS layers")
             .param("iri", iri.to_string()),
     )
     .await?
@@ -545,7 +545,8 @@ async fn run() -> Result<u32> {
         &graph,
         query(
             "MATCH (property:Entity:Property {iri: $iri}) \
-             RETURN property.iri AS iri, property.layers AS layers",
+             RETURN property.iri AS iri, property.layers AS layers, \
+                    property.stub AS stub, property.weight AS weight",
         )
         .param("iri", format!("mindreader:property/{property}")),
     )
@@ -556,10 +557,16 @@ async fn run() -> Result<u32> {
         schema_property
             .get::<Vec<String>>("layers")
             .is_ok_and(|layers| layers.is_empty())
+            && schema_property.get::<bool>("stub").is_ok_and(|stub| !stub)
+            && schema_property
+                .get::<i64>("weight")
+                .is_ok_and(|weight| weight == 0)
             && schema
                 .pointer("/episode/iri")
                 .and_then(Value::as_str)
-                .is_some(),
+                .is_some()
+            && schema.pointer("/facts/0/property").is_none()
+            && schema.pointer("/facts/0/propertyStub").is_none(),
         format!("write={schema} property={schema_property:?}"),
     );
 
@@ -1003,12 +1010,12 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    let mut concurrent_feedback = tokio::task::JoinSet::new();
+    let mut concurrent_judgments = tokio::task::JoinSet::new();
     for _ in 0..8 {
         let service = service.clone();
         let layer = layer_a.clone();
         let relationship = high_rel.clone();
-        concurrent_feedback.spawn(async move {
+        concurrent_judgments.spawn(async move {
             service
                 .judge(JudgeArgs {
                     scope: vec![layer],
@@ -1024,8 +1031,8 @@ async fn run() -> Result<u32> {
         });
     }
     let mut concurrent_successes = 0;
-    while let Some(result) = concurrent_feedback.join_next().await {
-        result.context("join concurrent feedback task")??;
+    while let Some(result) = concurrent_judgments.join_next().await {
+        result.context("join concurrent judgment task")??;
         concurrent_successes += 1;
     }
     report.check(
@@ -1325,11 +1332,11 @@ async fn run() -> Result<u32> {
         usize::from(fact_edit_result.is_ok()) + usize::from(endpoint_edit_result.is_ok());
     let concurrent_fact_layers = relation_state(&graph, &concurrent_fact)
         .await?
-        .map(|state| state.0)
-        .unwrap_or_default();
+        .ok_or_else(|| operation_error!("concurrent placement fact disappeared"))?
+        .0;
     let concurrent_subject_layers = node_layers(&graph, &concurrent_subject)
         .await?
-        .unwrap_or_default();
+        .ok_or_else(|| operation_error!("concurrent placement subject disappeared"))?;
     report.check(
         "concurrent fact and endpoint placement serializes closure decisions",
         concurrent_successes == 1
@@ -1793,7 +1800,7 @@ async fn run() -> Result<u32> {
                         == Some(short_iri.as_str())
             })
         });
-    let (survivor, merge_feedback) = tokio::try_join!(
+    let (survivor, merge_judgment) = tokio::try_join!(
         service.unify(UnifyArgs::from_iris(long_iri.clone(), short_iri.clone())),
         service.judge(JudgeArgs {
             scope: vec![layer_a.clone()],
@@ -1830,7 +1837,7 @@ async fn run() -> Result<u32> {
                 .await?
                 .is_some_and(|(_, current, weight)| current && weight == 1),
         format!(
-            "suggestions={} survivor={survivor} feedback={merge_feedback} removed={removed}",
+            "suggestions={} survivor={survivor} judgment={merge_judgment} removed={removed}",
             merge_long["review"]["unify"],
         ),
     );
@@ -1920,14 +1927,11 @@ async fn run() -> Result<u32> {
         .await;
     report.check(
         "property merges preserve predicate representation and reject incompatible or system-owned kinds",
-        property_state.get::<i64>("count").unwrap_or(0) == 1
-            && property_state
-                .get::<Vec<String>>("properties")
-                .unwrap_or_default()
-                == vec![target_property_iri]
+        property_state.get::<i64>("count")? == 1
+            && property_state.get::<Vec<String>>("properties")? == vec![target_property_iri]
             && property_state
                 .get::<Vec<String>>("factTexts")
-                .unwrap_or_default()
+                .context("property merge state is missing factTexts")?
                 .iter()
                 .all(|text| !text.contains(&source_property_name))
             && wrong_kind.is_err()
