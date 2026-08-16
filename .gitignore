@@ -1,3 +1,7 @@
 /target
 /dist
 .env
+.orchid
+.frigg
+.devana
+/docs
