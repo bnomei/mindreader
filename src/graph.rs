@@ -11,6 +11,7 @@ use crate::{
 use neo4rs::{query, Graph, Node, Path, Relation, Row, Txn, UnboundedRelation};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -61,13 +62,17 @@ pub const WAKEUP_RELS: &[&str] = &[
 const LABEL_OK: &str = "label";
 
 pub const MODEL_MARKER_KEY: &str = "model";
-pub const MODEL_VERSION: i64 = 4;
+pub const MODEL_VERSION: i64 = 5;
 pub const SEMANTIC_INDEX: &str = "semantic_activation_embeddings";
+pub const MERGE_CANDIDATE_INDEX: &str = "merge_candidate_names";
 const EMBEDDING_MARKER_KEY: &str = "embedding";
 
 const RESET_REQUIRED: &str = "recreate the Neo4j database or volume before starting Mindreader";
-const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] =
-    &[("wakeup_nodes", "NODE"), ("wakeup_facts", "RELATIONSHIP")];
+const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] = &[
+    ("wakeup_nodes", "NODE"),
+    ("wakeup_facts", "RELATIONSHIP"),
+    (MERGE_CANDIDATE_INDEX, "NODE"),
+];
 const WAKEUP_NODE_PROPERTIES: &[&str] = &["name", "iri", "searchText", "value"];
 
 pub async fn connect(cfg: &Config) -> Result<Graph> {
@@ -150,6 +155,12 @@ pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Res
         ))
         .await
         .context("create required wakeup_facts full-text index")?;
+    graph
+        .run(query(
+            "CREATE FULLTEXT INDEX merge_candidate_names IF NOT EXISTS FOR (n:Entity) ON EACH [n.mergeName] OPTIONS {indexConfig: {`fulltext.analyzer`: 'keyword', `fulltext.eventually_consistent`: false}}",
+        ))
+        .await
+        .context("create required merge_candidate_names full-text index")?;
 
     if let Some(embedding) = embedding {
         ensure_semantic_index(graph, embedding).await?;
@@ -166,7 +177,8 @@ pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Res
             MERGE (c:Entity:Class {iri: row.iri})
             ON CREATE SET c.name = row.name, c.createdAt = datetime(),
               c.weight = 0, c.weightText = '0', c.layers = []
-            SET c.searchText = trim(coalesce(c.name, row.name) + ' ' + c.iri)
+            SET c.searchText = trim(coalesce(c.name, row.name) + ' ' + c.iri),
+                c.mergeName = toLower(coalesce(c.name, row.name))
             "#,
         ))
         .await
@@ -191,7 +203,8 @@ pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Res
             MERGE (p:Entity:Property {iri: row.iri})
             ON CREATE SET p.name = row.name, p.createdAt = datetime(),
               p.weight = 0, p.weightText = '0', p.layers = []
-            SET p.searchText = trim(coalesce(p.name, row.name) + ' ' + p.iri)
+            SET p.searchText = trim(coalesce(p.name, row.name) + ' ' + p.iri),
+                p.mergeName = toLower(coalesce(p.name, row.name))
             "#,
         ))
         .await
@@ -507,9 +520,11 @@ async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
         query(
             r#"
             SHOW INDEXES
-            YIELD name, type, entityType, labelsOrTypes, properties, state
-            WHERE name IN ['wakeup_nodes', 'wakeup_facts']
-            RETURN name, type AS indexType, entityType, labelsOrTypes, properties, state
+            YIELD name, type, entityType, labelsOrTypes, properties, state, options
+            WHERE name IN ['wakeup_nodes', 'wakeup_facts', 'merge_candidate_names']
+            RETURN name, type AS indexType, entityType, labelsOrTypes, properties, state,
+                   coalesce(toString(options.indexConfig['fulltext.analyzer']), '') AS analyzer,
+                   coalesce(toString(options.indexConfig['fulltext.eventually_consistent']), 'false') AS eventuallyConsistent
             "#,
         ),
     )
@@ -543,14 +558,26 @@ async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
             match *required_name {
                 "wakeup_nodes" => (&["Entity"], WAKEUP_NODE_PROPERTIES),
                 "wakeup_facts" => (WAKEUP_RELS, &["factText"]),
+                MERGE_CANDIDATE_INDEX => (&["Entity"], &["mergeName"]),
                 _ => unreachable!("required full-text index catalog is exhaustive"),
             };
+
+        let merge_options_valid = if *required_name == MERGE_CANDIDATE_INDEX {
+            row.get::<String>("analyzer").ok().as_deref() == Some("keyword")
+                && row
+                    .get::<String>("eventuallyConsistent")
+                    .ok()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("false"))
+        } else {
+            true
+        };
 
         if index_type != "FULLTEXT"
             || entity_type != *required_entity_type
             || state != "ONLINE"
             || !same_string_members(&labels_or_types, expected_labels_or_types)
             || !same_string_members(&properties, expected_properties)
+            || !merge_options_valid
         {
             return Err(graph_error!(
                 "required Neo4j index {required_name} has an incompatible definition or is not ready: type={index_type}, entityType={entity_type}, labelsOrTypes={labels_or_types:?}, properties={properties:?}, state={state}; {RESET_REQUIRED}"
@@ -887,6 +914,7 @@ pub async fn merge_node_in_txn(
             REMOVE node.mindreaderCreateMarker
             SET node:$($labels)
             SET node.name = coalesce(node.name, $name),
+                node.mergeName = toLower(coalesce(node.name, $name)),
                 node.searchText = trim(coalesce(node.name, $name) + ' ' + node.iri + ' ' + coalesce(node.value, ''))
             RETURN node, created
             "#,
@@ -971,7 +999,8 @@ pub async fn ensure_property_in_txn(
             ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = true,
               n.weight = 0, n.weightText = '0', n.layers = []
             ON MATCH SET n.name = coalesce(n.name, $name)
-            SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
+            SET n.mergeName = toLower(coalesce(n.name, $name)),
+                n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
             RETURN n, existing IS NULL AS created
             "#,
         )
@@ -1015,6 +1044,20 @@ fn fact_lock_specs(facts: &[(String, String, String)]) -> Vec<FactLockSpec> {
     locks
 }
 
+fn fact_lock_params(locks: &[FactLockSpec]) -> Vec<HashMap<String, String>> {
+    locks
+        .iter()
+        .map(|lock| {
+            HashMap::from([
+                ("key".into(), lock.key.clone()),
+                ("subjectIri".into(), lock.subject_iri.clone()),
+                ("predicateIri".into(), lock.predicate_iri.clone()),
+                ("layer".into(), lock.layer.clone()),
+            ])
+        })
+        .collect()
+}
+
 /// Acquire deterministic subject and predicate guards for every fact tuple.
 ///
 /// Each `(subject, predicate, layer)` request acquires both `(subject, "*",
@@ -1025,26 +1068,35 @@ pub async fn acquire_fact_locks_in_txn(
     txn: &mut Txn,
     facts: &[(String, String, String)],
 ) -> Result<()> {
-    for lock in fact_lock_specs(facts) {
-        fetch_one_txn(
-            txn,
-            query(
-                r#"
-                MERGE (lock:FactLock {key: $key})
-                ON CREATE SET lock.subjectIri = $subjectIri,
-                  lock.predicateIri = $predicateIri, lock.layer = $layer,
-                  lock.createdAt = datetime(), lock.revision = 0
-                SET lock.revision = lock.revision + 1, lock.acquiredAt = datetime()
-                RETURN lock.key AS key
-                "#,
-            )
-            .param("key", lock.key)
-            .param("subjectIri", lock.subject_iri)
-            .param("predicateIri", lock.predicate_iri)
-            .param("layer", lock.layer),
+    let locks = fact_lock_specs(facts);
+    if locks.is_empty() {
+        return Ok(());
+    }
+    let expected = locks.len() as i64;
+    let row = fetch_one_txn(
+        txn,
+        query(
+            r#"
+            UNWIND $locks AS requested
+            WITH requested
+            ORDER BY requested.key
+            MERGE (lock:FactLock {key: requested.key})
+            ON CREATE SET lock.subjectIri = requested.subjectIri,
+              lock.predicateIri = requested.predicateIri, lock.layer = requested.layer,
+              lock.createdAt = datetime(), lock.revision = 0
+            SET lock.revision = lock.revision + 1, lock.acquiredAt = datetime()
+            RETURN count(lock) AS acquired
+            "#,
         )
-        .await?
-        .ok_or_else(|| graph_error!("failed to acquire fact lock"))?;
+        .param("locks", fact_lock_params(&locks)),
+    )
+    .await?
+    .ok_or_else(|| graph_error!("failed to acquire fact locks"))?;
+    let acquired = row.get::<i64>("acquired")?;
+    if acquired != expected {
+        return Err(graph_error!(
+            "acquired {acquired} fact locks, expected {expected}"
+        ));
     }
     Ok(())
 }
@@ -1186,17 +1238,17 @@ pub fn spike_rank(label: Option<&str>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        fact_lock_specs, lock_key, safe_label, safe_rel, same_string_members, spike_rank,
-        validate_model_version, MODEL_VERSION,
+        fact_lock_params, fact_lock_specs, lock_key, safe_label, safe_rel, same_string_members,
+        spike_rank, validate_model_version, MODEL_VERSION,
     };
 
     #[test]
-    fn model_v4_requires_recreating_older_databases() {
-        assert_eq!(MODEL_VERSION, 4);
-        assert!(validate_model_version(4).is_ok());
+    fn model_v5_requires_recreating_older_databases() {
+        assert_eq!(MODEL_VERSION, 5);
+        assert!(validate_model_version(5).is_ok());
         assert_eq!(
-            validate_model_version(3).unwrap_err().to_string(),
-            "Mindreader database model version 3 is incompatible with required version 4; recreate the Neo4j database or volume before starting Mindreader"
+            validate_model_version(4).unwrap_err().to_string(),
+            "Mindreader database model version 4 is incompatible with required version 5; recreate the Neo4j database or volume before starting Mindreader"
         );
     }
 
@@ -1238,6 +1290,14 @@ mod tests {
         let mut reversed = facts;
         reversed.reverse();
         assert_eq!(locks, fact_lock_specs(&reversed));
+
+        let params = fact_lock_params(&locks);
+        for (lock, param) in locks.iter().zip(params) {
+            assert_eq!(param.get("key"), Some(&lock.key));
+            assert_eq!(param.get("subjectIri"), Some(&lock.subject_iri));
+            assert_eq!(param.get("predicateIri"), Some(&lock.predicate_iri));
+            assert_eq!(param.get("layer"), Some(&lock.layer));
+        }
     }
 
     #[test]

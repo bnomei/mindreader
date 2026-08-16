@@ -6,10 +6,11 @@
 use crate::config::Config;
 use crate::error::Result;
 use crate::merge::{self, MergeArgs};
+use crate::search::{self, SearchArgs};
 use crate::semantic::{self, SemanticRuntime, SemanticSearchArgs};
 use crate::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs, SchemaArgs,
-    SearchArgs, StatsArgs, TraverseArgs,
+    StatsArgs, TraverseArgs,
 };
 use neo4rs::Graph;
 use serde_json::Value;
@@ -40,7 +41,7 @@ impl MemoryService {
     }
 
     pub async fn search(&self, args: SearchArgs) -> Result<Value> {
-        tools::memory_search(&self.graph, args).await
+        search::memory_search(&self.graph, args).await
     }
 
     pub async fn semantic_search(&self, args: SemanticSearchArgs) -> Result<Value> {

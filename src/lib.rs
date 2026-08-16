@@ -11,6 +11,7 @@ pub mod graph;
 pub mod iri;
 pub mod layers;
 pub mod merge;
+pub mod search;
 pub mod semantic;
 pub mod server;
 pub mod service;

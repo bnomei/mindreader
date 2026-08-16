@@ -12,6 +12,8 @@ versions follow Semantic Versioning.
 - Replaced opaque application errors with typed `thiserror` variants and retained source context.
 - Updated every direct Rust dependency to its newest compatible release, including RMCP 3, reqwest 0.13, and TOML 1.1.
 - Moved dynamic entity upserts to the least-privilege `apoc.merge.node` procedure and overlapped independent semantic lookup work.
+- Moved complete search ranking and limiting into Neo4j, batched deterministic fact-lock acquisition, and replaced exhaustive merge-suggestion scans with an indexed candidate stage plus APOC reranking.
+- Reduced semantic activation recall to metadata plus the selected convergence vector and bounded embedding-provider retries, latency, and response-body memory.
 
 ### Added
 

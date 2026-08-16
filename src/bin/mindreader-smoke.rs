@@ -3,16 +3,19 @@ use mindreader::config::{Config, EmbeddingSpace, SemanticConfig};
 use mindreader::domain::{EntityInput, ObjectInput};
 use mindreader::embeddings::{normalize_vector, EmbeddingProvider};
 use mindreader::error::{Context, Result};
-use mindreader::graph::{self, fetch_one, merge_node_in_txn, MergedNode, NodeSpec};
+use mindreader::graph::{
+    self, acquire_fact_locks_in_txn, fetch_one, merge_node_in_txn, MergedNode, NodeSpec,
+};
 use mindreader::merge::{memory_merge, MergeArgs};
 use mindreader::operation_error;
+use mindreader::search::SearchArgs;
 use mindreader::semantic::{memory_semantic_search, SemanticRuntime, SemanticSearchArgs};
 use mindreader::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs,
-    RetractTargetArgs, SchemaArgs, SearchArgs, StatsArgs, TargetArgs,
+    RetractTargetArgs, SchemaArgs, StatsArgs, TargetArgs,
 };
 use mindreader::Mindreader;
-use neo4rs::query;
+use neo4rs::{query, Graph};
 use serde_json::Value;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -148,6 +151,46 @@ fn fact_relationships(value: &Value) -> Vec<String> {
         .collect()
 }
 
+async fn seed_semantic_activation(
+    graph: &Graph,
+    embedding: &[f64],
+    result_refs: &[String],
+    ttl_ms: i64,
+) -> Result<(String, i64)> {
+    let row = fetch_one(
+        graph,
+        query(
+            r#"
+            CREATE (a:SemanticActivation:TTL {resultRefs: $resultRefs})
+            WITH a
+            CALL db.create.setNodeVectorProperty(a, 'embedding', $embedding)
+            WITH a
+            CALL apoc.ttl.expireIn(a, $ttl, 'ms')
+            RETURN elementId(a) AS elementId, a.ttl AS ttl
+            "#,
+        )
+        .param("embedding", embedding.to_vec())
+        .param("resultRefs", result_refs.to_vec())
+        .param("ttl", ttl_ms),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("semantic activation seed returned no row"))?;
+    Ok((row.get("elementId")?, row.get("ttl")?))
+}
+
+async fn semantic_activation_ttl(graph: &Graph, element_id: &str) -> Result<Option<i64>> {
+    fetch_one(
+        graph,
+        query(
+            "MATCH (a:SemanticActivation:TTL) WHERE elementId(a) = $elementId RETURN a.ttl AS ttl",
+        )
+        .param("elementId", element_id.to_string()),
+    )
+    .await?
+    .map(|row| row.get("ttl").map_err(Into::into))
+    .transpose()
+}
+
 fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
     value
         .get("facts")
@@ -159,7 +202,7 @@ fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
 }
 
 async fn search(graph: &neo4rs::Graph, scope: Vec<String>, text: &str) -> Result<Value> {
-    tools::memory_search(
+    mindreader::search::memory_search(
         graph,
         SearchArgs {
             layers: scope,
@@ -279,6 +322,52 @@ async fn run() -> Result<u32> {
     let layer_b = format!("project:smoke-b-{tag}");
     let layer_c = format!("project:smoke-c-{tag}");
     let property = format!("smokeProperty{tag}");
+
+    let lock_subjects = vec![
+        format!("mindreader:element/lock-a-{tag}"),
+        format!("mindreader:element/lock-b-{tag}"),
+    ];
+    let mut lock_facts = vec![
+        (
+            lock_subjects[0].clone(),
+            format!("mindreader:property/lock-a-{tag}"),
+            layer_a.clone(),
+        ),
+        (
+            lock_subjects[1].clone(),
+            format!("mindreader:property/lock-b-{tag}"),
+            layer_a.clone(),
+        ),
+    ];
+    lock_facts.push(lock_facts[0].clone());
+    for iteration in 0..2 {
+        if iteration == 1 {
+            lock_facts.reverse();
+        }
+        let mut txn = graph.start_txn().await?;
+        acquire_fact_locks_in_txn(&mut txn, &lock_facts).await?;
+        txn.commit().await.context("commit smoke fact-lock batch")?;
+    }
+    let lock_state = fetch_one(
+        &graph,
+        query(
+            "MATCH (lock:FactLock) \
+             WHERE lock.subjectIri IN $subjects AND lock.layer = $layer \
+             RETURN count(lock) AS count, min(lock.revision) AS minRevision, \
+                    max(lock.revision) AS maxRevision",
+        )
+        .param("subjects", lock_subjects)
+        .param("layer", layer_a.clone()),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("fact-lock smoke query returned no row"))?;
+    report.check(
+        "logical fact locks batch, deduplicate, and preserve deterministic revisions",
+        lock_state.get::<i64>("count").unwrap_or(0) == 4
+            && lock_state.get::<i64>("minRevision").unwrap_or(0) == 2
+            && lock_state.get::<i64>("maxRevision").unwrap_or(0) == 2,
+        format!("state={lock_state:?}"),
+    );
 
     let relabeled_iri = format!("mindreader:element/apoc-label-{tag}");
     let initial = merge_node_once(
@@ -484,6 +573,69 @@ async fn run() -> Result<u32> {
         &global_wins_2,
     );
 
+    let contradiction_old_left = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("contradiction-left-{tag}")),
+            p: format!("contradictionLeft{tag}"),
+            o: object(format!("contradiction-old-{tag}")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let contradiction_old_iri = object_result_iri(&contradiction_old_left)?;
+    let contradiction_old_right = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(format!("contradiction-right-{tag}")),
+            p: format!("contradictionRight{tag}"),
+            o: object_iri(contradiction_old_iri.clone()),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let contradiction_new_name = format!("contradiction-new-{tag}");
+    let (contradiction_left, contradiction_right) = tokio::try_join!(
+        tools::memory_assert(
+            &graph,
+            AssertArgs {
+                s: entity_iri(subject_iri(&contradiction_old_left)?),
+                p: format!("contradictionLeft{tag}"),
+                o: object(contradiction_new_name.clone()),
+                layers: vec![layer_a.clone()],
+                spike: None,
+                contradicts: true,
+            },
+        ),
+        tools::memory_assert(
+            &graph,
+            AssertArgs {
+                s: entity_iri(subject_iri(&contradiction_old_right)?),
+                p: format!("contradictionRight{tag}"),
+                o: object(contradiction_new_name),
+                layers: vec![layer_a.clone()],
+                spike: None,
+                contradicts: true,
+            },
+        ),
+    )?;
+    let contradiction_new_iri = object_result_iri(&contradiction_left)?;
+    let contradiction_count =
+        tools::count_current_contradicts(&graph, &contradiction_new_iri, &contradiction_old_iri)
+            .await?;
+    report.check(
+        "concurrent contradiction writes preserve one exact current relationship",
+        object_result_iri(&contradiction_right)? == contradiction_new_iri
+            && contradiction_count == 1,
+        format!(
+            "left={contradiction_left} right={contradiction_right} count={contradiction_count}"
+        ),
+    );
+
     let merged_subject = subject_iri(&merged_a)?;
     let merged_old = object_result_iri(&merged_a)?;
     let replacement = tools::memory_replace(
@@ -541,6 +693,89 @@ async fn run() -> Result<u32> {
         format!(
             "response={retracted} state={:?}",
             relation_state(&graph, &merged_rel).await?
+        ),
+    );
+
+    let broad_subject_name = format!("broad-retract-{tag}");
+    let broad_a = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(broad_subject_name.clone()),
+            p: property.clone(),
+            o: object(format!("broad-a-{tag}")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let broad_ab = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(broad_subject_name.clone()),
+            p: property.clone(),
+            o: object(format!("broad-ab-{tag}")),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(broad_subject_name.clone()),
+            p: property.clone(),
+            o: object_iri(object_result_iri(&broad_ab)?),
+            layers: vec![layer_b.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let broad_b = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(broad_subject_name),
+            p: property.clone(),
+            o: object(format!("broad-b-{tag}")),
+            layers: vec![layer_b.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    let broad_a_rel = relationship_iri(&broad_a)?;
+    let broad_ab_rel = relationship_iri(&broad_ab)?;
+    let broad_b_rel = relationship_iri(&broad_b)?;
+    let broad_retract = tools::memory_retract(
+        &graph,
+        RetractArgs {
+            target: RetractTargetArgs {
+                kind: "subject".into(),
+                s: entity_iri(subject_iri(&broad_a)?),
+                p: None,
+                o: None,
+            },
+            layers: vec![layer_a.clone()],
+            reason: Some("smoke broad retract batch".into()),
+        },
+    )
+    .await?;
+    report.check(
+        "broad retract batches retirement and surviving membership updates",
+        broad_retract.get("retracted").and_then(Value::as_u64) == Some(2)
+            && relation_state(&graph, &broad_a_rel).await?
+                == Some((vec![layer_a.clone()], false, 0))
+            && relation_state(&graph, &broad_ab_rel).await?
+                == Some((vec![layer_b.clone()], true, 0))
+            && relation_state(&graph, &broad_b_rel).await?
+                == Some((vec![layer_b.clone()], true, 0)),
+        format!(
+            "response={broad_retract} a={:?} ab={:?} b={:?}",
+            relation_state(&graph, &broad_a_rel).await?,
+            relation_state(&graph, &broad_ab_rel).await?,
+            relation_state(&graph, &broad_b_rel).await?
         ),
     );
 
@@ -797,6 +1032,10 @@ async fn run() -> Result<u32> {
     .await?;
     let short_iri = subject_iri(&merge_short)?;
     let long_iri = subject_iri(&merge_long)?;
+    let merge_survivor_relationship = std::cmp::min(
+        relationship_iri(&merge_short)?,
+        relationship_iri(&merge_long)?,
+    );
     let suggested = merge_long
         .get("mergeSuggestions")
         .and_then(Value::as_array)
@@ -807,14 +1046,26 @@ async fn run() -> Result<u32> {
                         == Some(short_iri.as_str())
             })
         });
-    let survivor = memory_merge(
-        &graph,
-        MergeArgs {
-            source: long_iri.clone(),
-            target: short_iri.clone(),
-        },
-    )
-    .await?;
+    let (survivor, merge_feedback) = tokio::try_join!(
+        memory_merge(
+            &graph,
+            MergeArgs {
+                source: long_iri.clone(),
+                target: short_iri.clone(),
+            },
+        ),
+        tools::memory_feedback(
+            &graph,
+            FeedbackArgs {
+                layers: vec![layer_a.clone()],
+                target: TargetArgs {
+                    kind: "relationship".into(),
+                    iri: merge_survivor_relationship.clone(),
+                },
+                mode: "strengthen".into(),
+            },
+        )
+    )?;
     let removed = tools::memory_get(
         &graph,
         GetArgs {
@@ -828,11 +1079,44 @@ async fn run() -> Result<u32> {
         "merge suggestions prefer the shorter name and memory_merge keeps only the target",
         suggested
             && survivor.get("iri").and_then(Value::as_str) == Some(short_iri.as_str())
-            && removed.get("found").and_then(Value::as_bool) == Some(false),
+            && removed.get("found").and_then(Value::as_bool) == Some(false)
+            && relation_state(&graph, &merge_survivor_relationship)
+                .await?
+                .is_some_and(|(_, current, weight)| current && weight == 1),
         format!(
-            "suggestions={} survivor={survivor} removed={removed}",
-            merge_long["mergeSuggestions"]
+            "suggestions={} survivor={survivor} feedback={merge_feedback} removed={removed}",
+            merge_long["mergeSuggestions"],
         ),
+    );
+
+    let same_txn_short_name = format!("007-{tag}");
+    let same_txn_long_name = format!("007s-{tag}");
+    let same_txn_merge = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            s: entity(same_txn_long_name.clone()),
+            p: "mindreader:property/same-transaction-merge-smoke".into(),
+            o: object(same_txn_short_name.clone()),
+            layers: vec![layer_a.clone()],
+            spike: None,
+            contradicts: false,
+        },
+    )
+    .await?;
+    report.check(
+        "merge suggestions include similar entities created in the same transaction",
+        same_txn_merge
+            .get("mergeSuggestions")
+            .and_then(Value::as_array)
+            .is_some_and(|items| {
+                items.iter().any(|item| {
+                    item.pointer("/source/name").and_then(Value::as_str)
+                        == Some(same_txn_long_name.as_str())
+                        && item.pointer("/target/name").and_then(Value::as_str)
+                            == Some(same_txn_short_name.as_str())
+                })
+            }),
+        &same_txn_merge["mergeSuggestions"],
     );
 
     let target_property_name = format!("mergeProperty{tag}");
@@ -962,10 +1246,27 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    let semantic_runtime =
-        SemanticRuntime::new(Arc::new(SmokeEmbedding), SemanticConfig::default());
+    let semantic_text = format!("merge-{tag}");
+    let semantic_embedding = SmokeEmbedding.embed(&semantic_text).await?;
+    let (contributing_activation_id, contributing_ttl_before) = seed_semantic_activation(
+        &graph,
+        &semantic_embedding,
+        std::slice::from_ref(&replacement_rel),
+        600_000,
+    )
+    .await?;
+    let unresolved_ref = format!("mindreader:relationship/missing-{tag}");
+    let (unresolved_activation_id, unresolved_ttl_before) =
+        seed_semantic_activation(&graph, &semantic_embedding, &[unresolved_ref], 600_000).await?;
+    let semantic_runtime = SemanticRuntime::new(
+        Arc::new(SmokeEmbedding),
+        SemanticConfig {
+            neighbor_limit: 100,
+            ..SemanticConfig::default()
+        },
+    );
     let semantic_args = SemanticSearchArgs {
-        text: format!("merge-{tag}"),
+        text: semantic_text,
         layers: vec![layer_a],
         labels: None,
         limit: Some(20),
@@ -977,6 +1278,15 @@ async fn run() -> Result<u32> {
         semantic_args.clone(),
     )
     .await?;
+    let activation_after_first = fetch_one(
+        &graph,
+        query(
+            "MATCH (a:SemanticActivation:TTL) \
+             RETURN count(a) AS count, max(a.ttl) > timestamp() AS live",
+        ),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("semantic activation aggregate returned no row"))?;
     let semantic_second = memory_semantic_search(
         &graph,
         Some(&semantic_runtime),
@@ -993,8 +1303,11 @@ async fn run() -> Result<u32> {
     )
     .await?
     .ok_or_else(|| operation_error!("semantic activation aggregate returned no row"))?;
+    let contributing_ttl_after =
+        semantic_activation_ttl(&graph, &contributing_activation_id).await?;
+    let unresolved_ttl_after = semantic_activation_ttl(&graph, &unresolved_activation_id).await?;
     report.check(
-        "semantic search ranks facts and stores a live reusable activation",
+        "semantic search refreshes every contributing activation but not unresolved neighbors",
         semantic_first
             .pointer("/facts/0/rank")
             .and_then(Value::as_u64)
@@ -1003,9 +1316,15 @@ async fn run() -> Result<u32> {
                 .pointer("/facts/0/rank")
                 .and_then(Value::as_u64)
                 == Some(1)
-            && activation.get::<i64>("count").unwrap_or(0) == 1
-            && activation.get::<bool>("live").unwrap_or(false),
-        format!("first={semantic_first} second={semantic_second}"),
+            && activation.get::<i64>("count").unwrap_or(0)
+                == activation_after_first.get::<i64>("count").unwrap_or(-1)
+            && activation.get::<i64>("count").unwrap_or(0) >= 1
+            && activation.get::<bool>("live").unwrap_or(false)
+            && contributing_ttl_after.is_some_and(|ttl| ttl > contributing_ttl_before)
+            && unresolved_ttl_after == Some(unresolved_ttl_before),
+        format!(
+            "first={semantic_first} second={semantic_second} activationAfterFirst={activation_after_first:?} activationAfterSecond={activation:?} contributingTtl={contributing_ttl_before}->{contributing_ttl_after:?} unresolvedTtl={unresolved_ttl_before}->{unresolved_ttl_after:?}"
+        ),
     );
 
     Ok(report.failed)

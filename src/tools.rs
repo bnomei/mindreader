@@ -5,12 +5,16 @@ use crate::domain::{
 use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, endpoint_json, ensure_property_in_txn,
     fact_text, fetch_all, fetch_all_txn, fetch_one, fetch_one_txn, merge_literal_in_txn,
-    merge_node_in_txn, node_json, path_to_json, rel_json, safe_rel, spike_label, spike_rank,
-    structural_rel_for, Episode, MergedNode, NodeSpec, FIXED_RELS, MODEL_MARKER_KEY, MODEL_VERSION,
+    merge_node_in_txn, node_json, path_to_json, rel_json, safe_rel, structural_rel_for, Episode,
+    MergedNode, NodeSpec, FIXED_RELS, MERGE_CANDIDATE_INDEX, MODEL_MARKER_KEY, MODEL_VERSION,
 };
+#[cfg(test)]
+use crate::graph::{spike_label, spike_rank};
 use crate::iri::{class_iri, name_from_iri, property_iri};
 use crate::layers::validate_layer_ids;
 use crate::merge::merge_suggestions_in_txn;
+#[cfg(test)]
+use crate::search::SearchArgs;
 use crate::{
     error::{Context, Error, Result},
     operation_error,
@@ -19,7 +23,9 @@ use neo4rs::{query, Graph, Node, Path, Relation, Txn};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -34,6 +40,80 @@ const SYSTEM_OWNED_RELS: &[&str] = &["CONTRADICTS", "SUPERSEDES"];
 const FACT_LOCK_SCOPE: &str = "@fact";
 const LAYERS_PROPERTY: &str = "mindreader:property/layers";
 const PREDICATE_USAGE_PROPERTY: &str = "mindreader:property/predicate-usage";
+const CONTRADICTS_PROPERTY: &str = "mindreader:property/CONTRADICTS";
+
+fn assert_fact_lock_requests(
+    subject_iri: &str,
+    prop_iri: &str,
+    object_iri: &str,
+    contradicts: bool,
+) -> Vec<(String, String, String)> {
+    let mut locks = vec![
+        (
+            prop_iri.to_string(),
+            PREDICATE_USAGE_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            subject_iri.to_string(),
+            prop_iri.to_string(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            subject_iri.to_string(),
+            LAYERS_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            object_iri.to_string(),
+            LAYERS_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+    ];
+    if contradicts {
+        locks.push((
+            object_iri.to_string(),
+            CONTRADICTS_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ));
+    }
+    locks
+}
+
+fn replace_fact_lock_requests(
+    subject_iri: &str,
+    prop_iri: &str,
+    old_iri: &str,
+    new_iri: &str,
+    contradicts: bool,
+) -> Vec<(String, String, String)> {
+    let mut locks = assert_fact_lock_requests(subject_iri, prop_iri, new_iri, contradicts);
+    locks.push((
+        old_iri.to_string(),
+        LAYERS_PROPERTY.into(),
+        FACT_LOCK_SCOPE.into(),
+    ));
+    locks
+}
+
+fn retract_fact_lock_requests(
+    subject_iri: &str,
+    predicate: Option<&str>,
+) -> Vec<(String, String, String)> {
+    let mut locks = vec![(
+        subject_iri.to_string(),
+        predicate.unwrap_or("*").to_string(),
+        FACT_LOCK_SCOPE.into(),
+    )];
+    if let Some(predicate) = predicate {
+        locks.push((
+            predicate.to_string(),
+            PREDICATE_USAGE_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ));
+    }
+    locks
+}
 
 fn reject_system_owned_predicate(predicate: &str) -> Result<()> {
     if structural_rel_for(predicate)
@@ -87,6 +167,7 @@ fn remove_memberships(current: &[String], selected: &[String]) -> Option<Vec<Str
 
 // See graph.rs: `weightText` preserves signed values across neo4rs 0.8 while
 // Cypher arithmetic continues to use the numeric `weight` property.
+#[cfg(test)]
 fn weight(node: &Node) -> i64 {
     node.get::<String>("weightText")
         .ok()
@@ -94,6 +175,7 @@ fn weight(node: &Node) -> i64 {
         .unwrap_or_else(|| node.get::<i64>("weight").unwrap_or(0))
 }
 
+#[cfg(test)]
 fn relation_weight(relation: &Relation) -> i64 {
     relation
         .get::<String>("weightText")
@@ -102,6 +184,7 @@ fn relation_weight(relation: &Relation) -> i64 {
         .unwrap_or_else(|| relation.get::<i64>("weight").unwrap_or(0))
 }
 
+#[cfg(test)]
 fn effective_weight(subject: i64, relationship: i64, object: i64) -> i64 {
     subject.saturating_add(relationship).saturating_add(object)
 }
@@ -116,17 +199,6 @@ pub struct GetArgs {
     pub layers: Vec<String>,
     #[serde(default)]
     pub hops: Option<u32>,
-}
-
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct SearchArgs {
-    pub layers: Vec<String>,
-    #[serde(default)]
-    pub text: Option<String>,
-    #[serde(default)]
-    pub labels: Option<Vec<String>>,
-    #[serde(default)]
-    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -288,6 +360,27 @@ struct CurrentFact {
     rel_id: i64,
     iri: String,
     layers: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FactMembershipChange {
+    rel_id: i64,
+    remaining: Vec<String>,
+}
+
+fn plan_fact_membership_changes(
+    currents: &[CurrentFact],
+    selected: &[String],
+) -> Vec<FactMembershipChange> {
+    currents
+        .iter()
+        .filter_map(|current| {
+            remove_memberships(&current.layers, selected).map(|remaining| FactMembershipChange {
+                rel_id: current.rel_id,
+                remaining,
+            })
+        })
+        .collect()
 }
 
 async fn find_current_pairs_txn(
@@ -513,6 +606,8 @@ pub async fn memory_get(graph: &Graph, args: GetArgs) -> Result<Value> {
     }))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 struct WakeFact {
     s: Value,
     s_iri: String,
@@ -528,6 +623,8 @@ struct WakeFact {
     spike: Option<String>,
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn lucene_escape(text: &str) -> String {
     let mut out = String::from("\"");
     for ch in text.chars() {
@@ -540,7 +637,9 @@ fn lucene_escape(text: &str) -> String {
     out
 }
 
-pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) async fn legacy_memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as usize;
     let labels = args.labels.unwrap_or_default();
@@ -918,16 +1017,18 @@ pub async fn memory_stats(graph: &Graph, args: StatsArgs) -> Result<Value> {
         graph,
         query(
             "SHOW INDEXES YIELD name, state WHERE name IN \
-             ['wakeup_nodes', 'wakeup_facts'] RETURN name, state",
+             ['wakeup_nodes', 'wakeup_facts', 'merge_candidate_names'] RETURN name, state",
         ),
     )
     .await?;
-    let indexes_online = ["wakeup_nodes", "wakeup_facts"].iter().all(|required| {
-        index_rows.iter().any(|row| {
-            row.get::<String>("name").ok().as_deref() == Some(*required)
-                && row.get::<String>("state").ok().as_deref() == Some("ONLINE")
-        })
-    });
+    let indexes_online = ["wakeup_nodes", "wakeup_facts", MERGE_CANDIDATE_INDEX]
+        .iter()
+        .all(|required| {
+            index_rows.iter().any(|row| {
+                row.get::<String>("name").ok().as_deref() == Some(*required)
+                    && row.get::<String>("state").ok().as_deref() == Some("ONLINE")
+            })
+        });
     let constraint_rows = fetch_all(
         graph,
         query(
@@ -1130,7 +1231,7 @@ async fn ensure_contradictions_txn(
                 rel_type: "CONTRADICTS",
                 s: new_o,
                 o: &old_o,
-                prop_iri: "mindreader:property/CONTRADICTS",
+                prop_iri: CONTRADICTS_PROPERTY,
                 layers,
                 episode,
                 reason: None,
@@ -1180,38 +1281,10 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
     let object_iri = object_value.resolved_iri();
     let prop_iri = predicate.iri().to_string();
     let structural = structural_rel_for(&prop_iri);
+    let locks = assert_fact_lock_requests(&subject_iri, &prop_iri, &object_iri, args.contradicts);
     let mut txn = graph.start_txn().await?;
     let write = async {
-        acquire_fact_locks_in_txn(
-            &mut txn,
-            &[(
-                prop_iri.clone(),
-                PREDICATE_USAGE_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            )],
-        )
-        .await?;
-        acquire_fact_locks_in_txn(
-            &mut txn,
-            &[
-                (
-                    subject_iri.clone(),
-                    prop_iri.clone(),
-                    FACT_LOCK_SCOPE.into(),
-                ),
-                (
-                    subject_iri.clone(),
-                    LAYERS_PROPERTY.into(),
-                    FACT_LOCK_SCOPE.into(),
-                ),
-                (
-                    object_iri.clone(),
-                    LAYERS_PROPERTY.into(),
-                    FACT_LOCK_SCOPE.into(),
-                ),
-            ],
-        )
-        .await?;
+        acquire_fact_locks_in_txn(&mut txn, &locks).await?;
         let subject = merge_node_in_txn(
             &mut txn,
             &subject_spec,
@@ -1389,6 +1462,61 @@ async fn change_fact_memberships_txn(
     Ok(true)
 }
 
+async fn change_fact_memberships_batch_txn(
+    txn: &mut Txn,
+    changes: &[FactMembershipChange],
+    episode: &Episode,
+    reason: Option<&str>,
+) -> Result<()> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let expected = i64::try_from(changes.len())
+        .map_err(|_| operation_error!("too many fact membership changes to batch"))?;
+    let ids = changes
+        .iter()
+        .map(|change| change.rel_id)
+        .collect::<Vec<_>>();
+    let remaining = changes
+        .iter()
+        .map(|change| change.remaining.clone())
+        .collect::<Vec<_>>();
+    let row = fetch_one_txn(
+        txn,
+        query(
+            r#"
+            UNWIND range(0, size($ids) - 1) AS i
+            WITH $ids[i] AS rid, $remaining[i] AS remaining
+            MATCH ()-[r]->()
+            WHERE id(r) = rid AND r.validTo IS NULL
+            FOREACH (_ IN CASE WHEN size(remaining) = 0 THEN [1] ELSE [] END |
+              SET r.validTo = datetime(), r.retractedBy = $episode,
+                  r.reason = coalesce($reason, r.reason)
+            )
+            FOREACH (_ IN CASE WHEN size(remaining) > 0 THEN [1] ELSE [] END |
+              SET r.layers = remaining, r.layersUpdatedAt = datetime(),
+                  r.layerEpisodeId = $episode,
+                  r.reason = coalesce($reason, r.reason)
+            )
+            RETURN count(r) AS updated
+            "#,
+        )
+        .param("ids", ids)
+        .param("remaining", remaining)
+        .param("episode", episode.iri.clone())
+        .param("reason", reason.map(str::to_string)),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("fact membership batch returned no result"))?;
+    let updated = row.get::<i64>("updated")?;
+    if updated != expected {
+        return Err(operation_error!(
+            "fact membership batch updated {updated} relationships, expected {expected}"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn memory_replace(graph: &Graph, args: ReplaceArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_replace_once(graph, args.clone()).await {
@@ -1428,42 +1556,15 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
     let new_iri = new_value.resolved_iri();
     let prop_iri = predicate.iri().to_string();
     let structural = structural_rel_for(&prop_iri);
+    let locks = replace_fact_lock_requests(
+        &subject_iri,
+        &prop_iri,
+        &old_iri,
+        &new_iri,
+        args.contradicts,
+    );
     let mut txn = graph.start_txn().await?;
-    acquire_fact_locks_in_txn(
-        &mut txn,
-        &[(
-            prop_iri.clone(),
-            PREDICATE_USAGE_PROPERTY.into(),
-            FACT_LOCK_SCOPE.into(),
-        )],
-    )
-    .await?;
-    acquire_fact_locks_in_txn(
-        &mut txn,
-        &[
-            (
-                subject_iri.clone(),
-                prop_iri.clone(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-            (
-                subject_iri.clone(),
-                LAYERS_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-            (
-                old_iri.clone(),
-                LAYERS_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-            (
-                new_iri.clone(),
-                LAYERS_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-        ],
-    )
-    .await?;
+    acquire_fact_locks_in_txn(&mut txn, &locks).await?;
     let old_currents = find_current_pairs_txn(
         &mut txn,
         &subject_iri,
@@ -1679,23 +1780,8 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
         .chain(SYSTEM_OWNED_RELS)
         .map(|value| (*value).to_string())
         .collect::<Vec<_>>();
+    let locks = retract_fact_lock_requests(&subject_iri, predicate.as_deref());
     let mut txn = graph.start_txn().await?;
-    if let Some(predicate) = &predicate {
-        acquire_fact_locks_in_txn(
-            &mut txn,
-            &[(
-                predicate.clone(),
-                PREDICATE_USAGE_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            )],
-        )
-        .await?;
-    }
-    let locks = vec![(
-        subject_iri.clone(),
-        predicate.clone().unwrap_or_else(|| "*".into()),
-        FACT_LOCK_SCOPE.into(),
-    )];
     acquire_fact_locks_in_txn(&mut txn, &locks).await?;
     let rows = match scope {
         RetractScope::Subject => {
@@ -1760,11 +1846,8 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    let selected = currents
-        .into_iter()
-        .filter(|current| remove_memberships(&current.layers, &layers).is_some())
-        .collect::<Vec<_>>();
-    if selected.is_empty() {
+    let changes = plan_fact_membership_changes(&currents, &layers);
+    if changes.is_empty() {
         txn.rollback().await?;
         return Ok(json!({
             "retracted": 0,
@@ -1775,15 +1858,12 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
         }));
     }
     let episode = create_episode_in_txn(&mut txn, "memory_retract", args.reason.as_deref()).await?;
-    for current in &selected {
-        change_fact_memberships_txn(&mut txn, current, &layers, &episode, args.reason.as_deref())
-            .await?;
-    }
+    change_fact_memberships_batch_txn(&mut txn, &changes, &episode, args.reason.as_deref()).await?;
     txn.commit()
         .await
         .context("commit memory_retract transaction failed")?;
     Ok(json!({
-        "retracted": selected.len(),
+        "retracted": changes.len(),
         "soft": true,
         "layers": layers,
         "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
@@ -2545,8 +2625,10 @@ pub fn map_tool_error(err: Error) -> rmcp::model::ErrorData {
 #[cfg(test)]
 mod tests {
     use super::{
-        effective_weight, map_tool_error, merge_memberships, reject_system_owned_predicate,
-        remove_memberships,
+        assert_fact_lock_requests, effective_weight, map_tool_error, merge_memberships,
+        plan_fact_membership_changes, reject_system_owned_predicate, remove_memberships,
+        replace_fact_lock_requests, retract_fact_lock_requests, CurrentFact, FactMembershipChange,
+        CONTRADICTS_PROPERTY, LAYERS_PROPERTY, PREDICATE_USAGE_PROPERTY,
     };
     use crate::domain::DomainError;
     use crate::graph::spike_rank;
@@ -2590,6 +2672,88 @@ mod tests {
         );
         assert_eq!(remove_memberships(&[], &["project:a".into()]), None);
         assert_eq!(remove_memberships(&[], &[]), Some(Vec::new()));
+    }
+
+    #[test]
+    fn assert_and_replace_plan_all_known_locks_in_one_batch() {
+        let assert_locks = assert_fact_lock_requests("subject", "property", "new", true);
+        assert_eq!(assert_locks.len(), 5);
+        assert!(assert_locks.contains(&(
+            "new".into(),
+            CONTRADICTS_PROPERTY.into(),
+            "@fact".into()
+        )));
+        assert!(assert_locks.contains(&(
+            "property".into(),
+            PREDICATE_USAGE_PROPERTY.into(),
+            "@fact".into()
+        )));
+
+        let replace_locks = replace_fact_lock_requests("subject", "property", "old", "new", true);
+        assert_eq!(replace_locks.len(), 6);
+        assert!(replace_locks.contains(&("old".into(), LAYERS_PROPERTY.into(), "@fact".into())));
+        assert!(replace_locks.contains(&(
+            "new".into(),
+            CONTRADICTS_PROPERTY.into(),
+            "@fact".into()
+        )));
+    }
+
+    #[test]
+    fn retract_plans_subject_and_predicate_guards_together() {
+        assert_eq!(retract_fact_lock_requests("subject", None).len(), 1);
+        let locks = retract_fact_lock_requests("subject", Some("property"));
+        assert_eq!(locks.len(), 2);
+        assert!(locks.contains(&(
+            "property".into(),
+            PREDICATE_USAGE_PROPERTY.into(),
+            "@fact".into()
+        )));
+    }
+
+    #[test]
+    fn broad_retract_plans_only_matching_named_memberships() {
+        let currents = vec![
+            current_fact(1, &[]),
+            current_fact(2, &["project:a"]),
+            current_fact(3, &["project:a", "project:b"]),
+            current_fact(4, &["project:b"]),
+        ];
+
+        assert_eq!(
+            plan_fact_membership_changes(&currents, &["project:a".into()]),
+            vec![
+                FactMembershipChange {
+                    rel_id: 2,
+                    remaining: Vec::new(),
+                },
+                FactMembershipChange {
+                    rel_id: 3,
+                    remaining: vec!["project:b".into()],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn broad_global_retract_plans_only_global_facts() {
+        let currents = vec![current_fact(1, &[]), current_fact(2, &["project:a"])];
+
+        assert_eq!(
+            plan_fact_membership_changes(&currents, &[]),
+            vec![FactMembershipChange {
+                rel_id: 1,
+                remaining: Vec::new(),
+            }]
+        );
+    }
+
+    fn current_fact(rel_id: i64, layers: &[&str]) -> CurrentFact {
+        CurrentFact {
+            rel_id,
+            iri: format!("mindreader:fact/{rel_id}"),
+            layers: layers.iter().map(|layer| (*layer).to_string()).collect(),
+        }
     }
 
     #[test]

@@ -27,6 +27,15 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    #[error(
+        "{provider} embedding request failed with HTTP {status}: {body} (request_id={request_id:?})"
+    )]
+    EmbeddingHttp {
+        provider: &'static str,
+        status: u16,
+        request_id: Option<String>,
+        body: String,
+    },
     #[error("{0}")]
     Configuration(String),
     #[error("{0}")]
@@ -35,6 +44,8 @@ pub enum Error {
     Graph(String),
     #[error("{0}")]
     Operation(String),
+    #[error("concurrent mutation changed {0}")]
+    ConcurrentMutation(String),
     #[error("{message}: {source}")]
     Context {
         message: String,

@@ -7,11 +7,11 @@ use crate::{
     error::{Context, Error, Result},
     operation_error,
 };
-use neo4rs::{query, Graph, Node, Relation, Txn};
+use neo4rs::{query, BoltType, Graph, Node, Relation, Txn};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use tokio::time::{sleep, Duration};
 
 const FORBIDDEN_ENTITY_LABELS: &[&str] = &[
@@ -53,6 +53,18 @@ const BOOTSTRAP_SEEDED_IRIS: &[&str] = &[
     "mindreader:property/SUPERSEDES",
 ];
 
+fn lucene_fuzzy_term(name: &str) -> String {
+    let mut query = String::with_capacity(name.len() + 3);
+    for character in name.to_lowercase().chars() {
+        if character.is_whitespace() || "+-&|!(){}[]^\"~*?:\\/".contains(character) {
+            query.push('\\');
+        }
+        query.push(character);
+    }
+    query.push_str("~2");
+    query
+}
+
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MergeArgs {
     pub source: String,
@@ -72,7 +84,7 @@ pub async fn memory_merge(graph: &Graph, args: MergeArgs) -> Result<Value> {
 }
 
 fn is_transient(error: &Error) -> bool {
-    error.is_transient_neo4j()
+    error.is_transient_neo4j() || matches!(error, Error::ConcurrentMutation(_))
 }
 
 async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
@@ -106,49 +118,85 @@ async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
     }
 }
 
+async fn affected_fact_locks_in_txn(
+    txn: &mut Txn,
+    source_iri: &str,
+    target_iri: &str,
+) -> Result<Vec<(String, String, String)>> {
+    let mut locks = fetch_all_txn(
+        txn,
+        query(
+            "MATCH (s:Entity)-[r]->(o:Entity) \
+             WHERE s.iri IN [$source, $target] OR o.iri IN [$source, $target] \
+                OR r.propertyIri IN [$source, $target] \
+             WITH DISTINCT s, r \
+             UNWIND [ \
+               {subject: s.iri, property: coalesce(r.propertyIri, 'mindreader:property/' + type(r))}, \
+               {subject: r.iri, property: $weightProperty} \
+             ] AS guard \
+             RETURN DISTINCT guard.subject AS subject, guard.property AS property",
+        )
+        .param("source", source_iri.to_string())
+        .param("target", target_iri.to_string())
+        .param("weightProperty", WEIGHT_PROPERTY),
+    )
+    .await?
+    .into_iter()
+    .map(|row| {
+        Ok::<_, Error>((
+            row.get::<String>("subject")?,
+            row.get::<String>("property")?,
+            FACT_LOCK_SCOPE.into(),
+        ))
+    })
+    .collect::<Result<Vec<_>>>()?;
+    locks.sort();
+    locks.dedup();
+    Ok(locks)
+}
+
 async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Result<Value> {
-    acquire_fact_locks_in_txn(
-        txn,
-        &[
-            (
-                source_iri.into(),
-                PREDICATE_USAGE_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-            (
-                target_iri.into(),
-                PREDICATE_USAGE_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-        ],
-    )
-    .await?;
-    acquire_fact_locks_in_txn(
-        txn,
-        &[
-            (
-                source_iri.into(),
-                LAYERS_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-            (
-                source_iri.into(),
-                WEIGHT_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-            (
-                target_iri.into(),
-                LAYERS_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-            (
-                target_iri.into(),
-                WEIGHT_PROPERTY.into(),
-                FACT_LOCK_SCOPE.into(),
-            ),
-        ],
-    )
-    .await?;
+    let initial_affected = affected_fact_locks_in_txn(txn, source_iri, target_iri).await?;
+    let mut locks = vec![
+        (
+            source_iri.into(),
+            PREDICATE_USAGE_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            target_iri.into(),
+            PREDICATE_USAGE_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            source_iri.into(),
+            LAYERS_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            source_iri.into(),
+            WEIGHT_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            target_iri.into(),
+            LAYERS_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+        (
+            target_iri.into(),
+            WEIGHT_PROPERTY.into(),
+            FACT_LOCK_SCOPE.into(),
+        ),
+    ];
+    locks.extend(initial_affected.iter().cloned());
+    acquire_fact_locks_in_txn(txn, &locks).await?;
+    let locked_affected = affected_fact_locks_in_txn(txn, source_iri, target_iri).await?;
+    if locked_affected != initial_affected {
+        return Err(Error::ConcurrentMutation(
+            "the relationships affected by memory_merge; retry the merge".into(),
+        ));
+    }
     let row = fetch_one_txn(
         txn,
         query(
@@ -173,30 +221,6 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     if property_merge {
         require_compatible_property_merge(source_iri, target_iri)?;
     }
-
-    let affected_facts = fetch_all_txn(
-        txn,
-        query(
-            "MATCH (s:Entity)-[r]->(o:Entity) \
-             WHERE s.iri IN [$source, $target] OR o.iri IN [$source, $target] \
-                OR r.propertyIri IN [$source, $target] \
-             RETURN DISTINCT s.iri AS subject, \
-               coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property",
-        )
-        .param("source", source_iri.to_string())
-        .param("target", target_iri.to_string()),
-    )
-    .await?
-    .into_iter()
-    .map(|row| {
-        Ok::<_, Error>((
-            row.get::<String>("subject")?,
-            row.get::<String>("property")?,
-            "@fact".into(),
-        ))
-    })
-    .collect::<Result<Vec<_>>>()?;
-    acquire_fact_locks_in_txn(txn, &affected_facts).await?;
 
     let source_layers = source.get::<Vec<String>>("layers").unwrap_or_default();
     let target_layers = target.get::<Vec<String>>("layers").unwrap_or_default();
@@ -244,6 +268,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
             SET node.layers = $layers,
                 node.weight = $weight,
                 node.weightText = toString($weight),
+                node.mergeName = toLower(coalesce(node.name, '')),
                 node.searchText = trim(coalesce(node.name, '') + ' ' + node.iri + ' ' + coalesce(node.value, '')),
                 node.mergeEpisodeId = $episode
             RETURN node
@@ -409,6 +434,78 @@ struct DuplicateFact {
     episodes: Vec<String>,
 }
 
+#[derive(Debug, PartialEq)]
+struct SurvivorUpdate {
+    iri: String,
+    layers: Vec<String>,
+    weight: i64,
+    provenance: Vec<String>,
+}
+
+#[derive(Debug, PartialEq)]
+struct DuplicateRetirement {
+    iri: String,
+    survivor: String,
+}
+
+fn duplicate_consolidation_plan(
+    groups: &mut BTreeMap<(String, String, String, String), Vec<DuplicateFact>>,
+) -> (Vec<SurvivorUpdate>, Vec<DuplicateRetirement>) {
+    let mut updates = Vec::new();
+    let mut retirements = Vec::new();
+    for facts in groups.values_mut().filter(|facts| facts.len() > 1) {
+        facts.sort_by(|left, right| left.iri.cmp(&right.iri));
+        let survivor = facts[0].iri.clone();
+        let mut layers = facts[0].layers.clone();
+        let mut weight = 0_i64;
+        let mut provenance = BTreeSet::new();
+        for fact in facts.iter() {
+            layers = merge_memberships(&layers, &fact.layers);
+            weight = weight.saturating_add(fact.weight);
+            provenance.extend(fact.episodes.iter().cloned());
+        }
+        updates.push(SurvivorUpdate {
+            iri: survivor.clone(),
+            layers,
+            weight,
+            provenance: provenance.into_iter().collect(),
+        });
+        retirements.extend(facts.iter().skip(1).map(|fact| DuplicateRetirement {
+            iri: fact.iri.clone(),
+            survivor: survivor.clone(),
+        }));
+    }
+    (updates, retirements)
+}
+
+fn survivor_update_params(updates: &[SurvivorUpdate]) -> Vec<HashMap<String, BoltType>> {
+    updates
+        .iter()
+        .map(|update| {
+            HashMap::from([
+                ("iri".into(), update.iri.clone().into()),
+                ("layers".into(), update.layers.clone().into()),
+                ("weight".into(), update.weight.into()),
+                ("provenance".into(), update.provenance.clone().into()),
+            ])
+        })
+        .collect()
+}
+
+fn duplicate_retirement_params(
+    retirements: &[DuplicateRetirement],
+) -> Vec<HashMap<String, String>> {
+    retirements
+        .iter()
+        .map(|retirement| {
+            HashMap::from([
+                ("iri".into(), retirement.iri.clone()),
+                ("survivor".into(), retirement.survivor.clone()),
+            ])
+        })
+        .collect()
+}
+
 async fn consolidate_current_duplicates(
     txn: &mut Txn,
     target_iri: &str,
@@ -459,46 +556,53 @@ async fn consolidate_current_duplicates(
                 episodes,
             });
     }
-    for facts in groups.values_mut().filter(|facts| facts.len() > 1) {
-        facts.sort_by(|left, right| left.iri.cmp(&right.iri));
-        let survivor = facts[0].iri.clone();
-        let mut layers = facts[0].layers.clone();
-        let mut weight = 0_i64;
-        let mut provenance = BTreeSet::new();
-        for fact in facts.iter() {
-            layers = merge_memberships(&layers, &fact.layers);
-            weight = weight.saturating_add(fact.weight);
-            provenance.extend(fact.episodes.iter().cloned());
+    let (updates, retirements) = duplicate_consolidation_plan(&mut groups);
+    if !updates.is_empty() {
+        let expected = updates.len() as i64;
+        let row = fetch_one_txn(
+            txn,
+            query(
+                "UNWIND $updates AS update \
+                 MATCH ()-[r]->() WHERE r.iri = update.iri AND r.validTo IS NULL \
+                 SET r.layers = update.layers, r.weight = update.weight, \
+                     r.weightText = toString(update.weight), \
+                     r.provenanceEpisodeIds = update.provenance, r.mergeEpisodeId = $episode \
+                 RETURN count(r) AS updated",
+            )
+            .param("updates", survivor_update_params(&updates))
+            .param("episode", episode.iri.clone()),
+        )
+        .await?
+        .ok_or_else(|| operation_error!("duplicate survivor update returned no count"))?;
+        let updated = row.get::<i64>("updated")?;
+        if updated != expected {
+            return Err(operation_error!(
+                "duplicate survivor update affected {updated} relationships; expected {expected}"
+            ));
         }
-        txn.run(
+    }
+    if !retirements.is_empty() {
+        let expected = retirements.len() as i64;
+        let row = fetch_one_txn(
+            txn,
             query(
-                "MATCH ()-[r]->() WHERE r.iri = $iri AND r.validTo IS NULL \
-                 SET r.layers = $layers, r.weight = $weight, r.weightText = toString($weight), \
-                     r.provenanceEpisodeIds = $provenance, r.mergeEpisodeId = $episode",
+                "UNWIND $retirements AS retirement \
+                 MATCH ()-[r]->() WHERE r.iri = retirement.iri AND r.validTo IS NULL \
+                 SET r.validTo = datetime(), r.mergedInto = retirement.survivor, \
+                     r.mergeEpisodeId = $episode \
+                 RETURN count(r) AS retired",
             )
-            .param("iri", survivor.clone())
-            .param("layers", layers)
-            .param("weight", weight)
-            .param("provenance", provenance.into_iter().collect::<Vec<_>>())
+            .param("retirements", duplicate_retirement_params(&retirements))
             .param("episode", episode.iri.clone()),
         )
-        .await?;
-        let retired = facts
-            .iter()
-            .skip(1)
-            .map(|fact| fact.iri.clone())
-            .collect::<Vec<_>>();
-        txn.run(
-            query(
-                "MATCH ()-[r]->() WHERE r.iri IN $iris AND r.validTo IS NULL \
-                 SET r.validTo = datetime(), r.mergedInto = $survivor, \
-                     r.mergeEpisodeId = $episode",
-            )
-            .param("iris", retired)
-            .param("survivor", survivor)
-            .param("episode", episode.iri.clone()),
-        )
-        .await?;
+        .await?
+        .ok_or_else(|| operation_error!("duplicate retirement returned no count"))?;
+        let retired = row.get::<i64>("retired")?;
+        if retired != expected {
+            return Err(operation_error!(
+                "duplicate retirement affected {retired} relationships; expected {expected}"
+            ));
+        }
     }
     Ok(())
 }
@@ -511,11 +615,31 @@ pub async fn merge_suggestions_in_txn(
     let mut suggestions = Vec::new();
     let created_set = created_iris.iter().cloned().collect::<BTreeSet<_>>();
     for created_iri in created_iris {
+        let created_name = fetch_one_txn(
+            txn,
+            query("MATCH (created:Entity {iri: $iri}) RETURN created.name AS name")
+                .param("iri", created_iri.clone()),
+        )
+        .await?
+        .and_then(|row| row.get::<String>("name").ok());
+        let Some(created_name) = created_name.filter(|name| !name.is_empty()) else {
+            continue;
+        };
         let rows = fetch_all_txn(
             txn,
             query(
                 r#"
-                MATCH (created:Entity {iri: $iri}), (candidate:Entity)
+                MATCH (created:Entity {iri: $iri})
+                CALL {
+                  CALL db.index.fulltext.queryNodes('merge_candidate_names', $nameQuery)
+                  YIELD node
+                  RETURN node AS candidate
+                  UNION
+                  MATCH (candidate:Entity)
+                  WHERE candidate.iri IN $createdIris
+                  RETURN candidate
+                }
+                WITH created, candidate
                 WHERE candidate <> created
                   AND created.name IS NOT NULL AND candidate.name IS NOT NULL
                   AND (size(coalesce(candidate.layers, [])) = 0
@@ -540,6 +664,8 @@ pub async fn merge_suggestions_in_txn(
                 "#,
             )
             .param("iri", created_iri.clone())
+            .param("nameQuery", lucene_fuzzy_term(&created_name))
+            .param("createdIris", created_iris.to_vec())
             .param("layers", layers.to_vec())
             .param(
                 "forbidden",
@@ -610,7 +736,13 @@ pub async fn merge_suggestions_in_txn(
 
 #[cfg(test)]
 mod tests {
-    use super::{is_bootstrap_seeded, merge_memberships, require_compatible_property_merge};
+    use super::{
+        duplicate_consolidation_plan, is_bootstrap_seeded, is_transient, lucene_fuzzy_term,
+        merge_memberships, require_compatible_property_merge, DuplicateFact, DuplicateRetirement,
+        SurvivorUpdate,
+    };
+    use crate::error::Error;
+    use std::collections::BTreeMap;
 
     #[test]
     fn global_membership_dominates_merge() {
@@ -648,5 +780,124 @@ mod tests {
         assert!(is_bootstrap_seeded("mindreader:class/Element"));
         assert!(is_bootstrap_seeded("mindreader:property/ABOUT"));
         assert!(!is_bootstrap_seeded("mindreader:property/custom"));
+    }
+
+    #[test]
+    fn affected_set_drift_is_retryable() {
+        assert!(is_transient(&Error::ConcurrentMutation(
+            "merge relationships".into()
+        )));
+    }
+
+    #[test]
+    fn fuzzy_candidate_terms_escape_whole_names() {
+        assert_eq!(lucene_fuzzy_term("Spaceships"), "spaceships~2");
+        assert_eq!(lucene_fuzzy_term("space ship"), "space\\ ship~2");
+        assert_eq!(
+            lucene_fuzzy_term("C++ / A(B)"),
+            "c\\+\\+\\ \\/\\ a\\(b\\)~2"
+        );
+        assert_eq!(lucene_fuzzy_term("007s"), "007s~2");
+    }
+
+    #[test]
+    fn duplicate_plan_aggregates_every_group_before_batched_writes() {
+        let mut groups = BTreeMap::from([
+            (
+                (
+                    "s-a".into(),
+                    "REL".into(),
+                    "property-a".into(),
+                    "o-a".into(),
+                ),
+                vec![
+                    DuplicateFact {
+                        iri: "rel-b".into(),
+                        layers: vec!["project:b".into()],
+                        weight: 7,
+                        episodes: vec!["episode-b".into(), "episode-shared".into()],
+                    },
+                    DuplicateFact {
+                        iri: "rel-a".into(),
+                        layers: vec!["project:a".into()],
+                        weight: i64::MAX,
+                        episodes: vec!["episode-a".into(), "episode-shared".into()],
+                    },
+                ],
+            ),
+            (
+                (
+                    "s-b".into(),
+                    "REL".into(),
+                    "property-b".into(),
+                    "o-b".into(),
+                ),
+                vec![
+                    DuplicateFact {
+                        iri: "rel-c".into(),
+                        layers: Vec::new(),
+                        weight: -3,
+                        episodes: vec!["episode-c".into()],
+                    },
+                    DuplicateFact {
+                        iri: "rel-d".into(),
+                        layers: vec!["project:d".into()],
+                        weight: 1,
+                        episodes: vec!["episode-d".into()],
+                    },
+                ],
+            ),
+            (
+                (
+                    "s-c".into(),
+                    "REL".into(),
+                    "property-c".into(),
+                    "o-c".into(),
+                ),
+                vec![DuplicateFact {
+                    iri: "rel-single".into(),
+                    layers: vec!["project:single".into()],
+                    weight: 4,
+                    episodes: vec!["episode-single".into()],
+                }],
+            ),
+        ]);
+
+        let (updates, retirements) = duplicate_consolidation_plan(&mut groups);
+
+        assert_eq!(
+            updates,
+            vec![
+                SurvivorUpdate {
+                    iri: "rel-a".into(),
+                    layers: vec!["project:a".into(), "project:b".into()],
+                    weight: i64::MAX,
+                    provenance: vec![
+                        "episode-a".into(),
+                        "episode-b".into(),
+                        "episode-shared".into()
+                    ],
+                },
+                SurvivorUpdate {
+                    iri: "rel-c".into(),
+                    layers: Vec::new(),
+                    weight: -2,
+                    provenance: vec!["episode-c".into(), "episode-d".into()],
+                },
+            ]
+        );
+        assert_eq!(
+            retirements,
+            vec![
+                DuplicateRetirement {
+                    iri: "rel-b".into(),
+                    survivor: "rel-a".into(),
+                },
+                DuplicateRetirement {
+                    iri: "rel-d".into(),
+                    survivor: "rel-c".into(),
+                },
+            ]
+        );
     }
 }

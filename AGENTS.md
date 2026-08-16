@@ -17,7 +17,8 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - `src/service.rs`: typed application boundary shared by MCP and other adapters.
 - `src/error.rs`: typed application errors, preserved source context, and retry classification.
 - `src/domain.rs`: validated layer, entity, literal, target, replacement, and retraction concepts.
-- `src/tools.rs`: public tool arguments and graph behavior.
+- `src/tools.rs`: mutation arguments and graph behavior.
+- `src/search.rs`: database-side retrieval ranking and bounded result assembly.
 - `src/graph.rs`: Neo4j connection/bootstrap, query helpers, serialization, safe labels/relationships, and persistence primitives.
 - `src/merge.rs`: advisory duplicate suggestions and permanent same-kind node merging.
 - `src/semantic.rs`: direct/vector rank fusion and expiring semantic activations.
@@ -25,6 +26,7 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - `src/layers.rs`: layer validation and visibility-union policy.
 - `src/iri.rs`: deterministic IRI minting and kind/label mapping.
 - `src/bin/mindreader-smoke.rs`: live Neo4j integration coverage.
+- `src/bin/mindreader-bench.rs`: release-mode graph performance and ranking regression benchmark.
 - `scripts/mcp_handshake_probe.py`: portable stdio handshake diagnostic.
 - `docker-compose.yml` and `Dockerfile`: local Neo4j and containerized server paths.
 

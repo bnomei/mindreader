@@ -1,8 +1,9 @@
 use crate::config::{Config, SemanticConfig};
+use crate::domain::DomainError;
 use crate::embeddings::{build_provider, normalize_vector, EmbeddingProvider};
-use crate::graph::{endpoint_json, fetch_all, rel_json, spike_label, SEMANTIC_INDEX};
+use crate::graph::{endpoint_json, fetch_all, fetch_one, rel_json, spike_label, SEMANTIC_INDEX};
 use crate::layers::validate_layer_ids;
-use crate::tools::{memory_search, SearchArgs};
+use crate::search::{memory_search, SearchArgs};
 use crate::{
     error::{Context, Result},
     operation_error,
@@ -14,6 +15,8 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+
+pub const MAX_SEMANTIC_TEXT_BYTES: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SemanticSearchArgs {
@@ -62,9 +65,25 @@ impl SemanticRuntime {
 #[derive(Debug, Clone)]
 struct Activation {
     element_id: String,
-    embedding: Vec<f64>,
     result_refs: Vec<String>,
     similarity: f64,
+}
+
+fn validate_semantic_text(text: &str) -> Result<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Err(DomainError::InvalidInput(
+            "memory_semantic_search text must not be empty".into(),
+        )
+        .into());
+    }
+    if text.len() > MAX_SEMANTIC_TEXT_BYTES {
+        return Err(DomainError::InvalidInput(format!(
+            "memory_semantic_search text must not exceed {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes"
+        ))
+        .into());
+    }
+    Ok(text.to_string())
 }
 
 pub async fn memory_semantic_search(
@@ -79,12 +98,7 @@ pub async fn memory_semantic_search(
             secrets_path.display()
         )
     })?;
-    let text = args.text.trim().to_string();
-    if text.is_empty() {
-        return Err(operation_error!(
-            "memory_semantic_search text must not be empty"
-        ));
-    }
+    let text = validate_semantic_text(&args.text)?;
     let layers = validate_layer_ids(args.layers)?
         .into_iter()
         .map(|layer| layer.into_string())
@@ -128,6 +142,7 @@ pub async fn memory_semantic_search(
     for (iri, fact) in resolve_facts(graph, &layers, &labels, missing).await? {
         facts_by_iri.insert(iri, fact);
     }
+    let contributing_activation_ids = contributing_activation_ids(&activations, &facts_by_iri);
 
     let mut fused = HashMap::<String, f64>::new();
     add_ranked(
@@ -170,7 +185,15 @@ pub async fn memory_semantic_search(
         })
         .collect::<Vec<_>>();
 
-    persist_activation(graph, runtime, &embedding, &result_refs, &activations).await?;
+    persist_activation(
+        graph,
+        runtime,
+        &embedding,
+        &result_refs,
+        &activations,
+        &contributing_activation_ids,
+    )
+    .await?;
 
     Ok(json!({
         "query": text,
@@ -195,6 +218,22 @@ fn add_ranked(
     }
 }
 
+fn contributing_activation_ids(
+    activations: &[Activation],
+    facts: &HashMap<String, Value>,
+) -> Vec<String> {
+    activations
+        .iter()
+        .filter(|activation| {
+            activation
+                .result_refs
+                .iter()
+                .any(|iri| facts.contains_key(iri))
+        })
+        .map(|activation| activation.element_id.clone())
+        .collect()
+}
+
 async fn query_activations(
     graph: &Graph,
     runtime: &SemanticRuntime,
@@ -206,8 +245,7 @@ async fn query_activations(
             "CALL db.index.vector.queryNodes('{SEMANTIC_INDEX}', $neighbors, $embedding) \
              YIELD node, score \
              WHERE node.ttl >= timestamp() AND score >= $threshold \
-             RETURN elementId(node) AS elementId, node.embedding AS embedding, \
-                    node.resultRefs AS resultRefs, score \
+             RETURN elementId(node) AS elementId, node.resultRefs AS resultRefs, score \
              ORDER BY score DESC, elementId ASC"
         ))
         .param("neighbors", runtime.config.neighbor_limit as i64)
@@ -220,7 +258,6 @@ async fn query_activations(
         .map(|row| {
             Ok(Activation {
                 element_id: row.get("elementId")?,
-                embedding: row.get("embedding")?,
                 result_refs: row.get::<Vec<String>>("resultRefs").unwrap_or_default(),
                 similarity: row.get("score")?,
             })
@@ -309,34 +346,35 @@ async fn persist_activation(
     embedding: &[f64],
     result_refs: &[String],
     neighbors: &[Activation],
+    contributing_activation_ids: &[String],
 ) -> Result<()> {
-    let convergence = neighbors
-        .iter()
-        .filter(|activation| {
-            activation.similarity >= runtime.config.convergence_similarity_threshold
-                && jaccard(&activation.result_refs, result_refs)
-                    >= runtime.config.convergence_result_overlap_threshold
-        })
-        .max_by(|left, right| {
-            left.similarity
-                .partial_cmp(&right.similarity)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
     let ttl_ms = runtime
         .config
         .ttl_days
         .checked_mul(86_400_000)
         .and_then(|milliseconds| i64::try_from(milliseconds).ok())
         .ok_or_else(|| operation_error!("semantic TTL is too large"))?;
+    let convergence = select_convergence(neighbors, result_refs, &runtime.config);
+    let mut refreshed_activation_ids = contributing_activation_ids.to_vec();
     if let Some(existing) = convergence {
-        let midpoint = existing
-            .embedding
+        refreshed_activation_ids.push(existing.element_id.clone());
+    }
+    refreshed_activation_ids.sort();
+    refreshed_activation_ids.dedup();
+    refresh_recalled_activations(graph, &refreshed_activation_ids, ttl_ms).await?;
+    if let Some(existing) = convergence {
+        let Some(existing_embedding) =
+            load_activation_embedding(graph, &existing.element_id).await?
+        else {
+            return create_activation(graph, embedding, result_refs, ttl_ms).await;
+        };
+        let midpoint = existing_embedding
             .iter()
             .zip(embedding)
             .map(|(left, right)| left + right)
             .collect::<Vec<_>>();
         let midpoint = normalize_vector(midpoint, runtime.dimensions(), "semantic centroid")?;
-        let updated = fetch_all(
+        let updated = fetch_one(
             graph,
             query(
                 r#"
@@ -345,22 +383,90 @@ async fn persist_activation(
                 SET a.resultRefs = $resultRefs
                 WITH a
                 CALL db.create.setNodeVectorProperty(a, 'embedding', $embedding)
-                WITH a
-                CALL apoc.ttl.expireIn(a, $ttl, 'ms')
                 RETURN elementId(a) AS elementId
                 "#,
             )
             .param("elementId", existing.element_id.clone())
             .param("resultRefs", result_refs.to_vec())
-            .param("embedding", midpoint)
-            .param("ttl", ttl_ms),
+            .param("embedding", midpoint),
         )
         .await?;
-        if !updated.is_empty() {
+        if updated.is_some() {
             return Ok(());
         }
     }
-    fetch_all(
+    create_activation(graph, embedding, result_refs, ttl_ms).await
+}
+
+fn select_convergence<'a>(
+    neighbors: &'a [Activation],
+    result_refs: &[String],
+    config: &SemanticConfig,
+) -> Option<&'a Activation> {
+    neighbors
+        .iter()
+        .filter(|activation| {
+            activation.similarity >= config.convergence_similarity_threshold
+                && jaccard(&activation.result_refs, result_refs)
+                    >= config.convergence_result_overlap_threshold
+        })
+        .max_by(|left, right| {
+            left.similarity
+                .partial_cmp(&right.similarity)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+}
+
+async fn refresh_recalled_activations(
+    graph: &Graph,
+    element_ids: &[String],
+    ttl_ms: i64,
+) -> Result<()> {
+    if element_ids.is_empty() {
+        return Ok(());
+    }
+    fetch_one(
+        graph,
+        query(
+            r#"
+            UNWIND $elementIds AS activationId
+            MATCH (a:SemanticActivation:TTL)
+            WHERE elementId(a) = activationId AND a.ttl >= timestamp()
+            WITH DISTINCT a
+            CALL apoc.ttl.expireIn(a, $ttl, 'ms')
+            RETURN count(a) AS refreshed
+            "#,
+        )
+        .param("elementIds", element_ids.to_vec())
+        .param("ttl", ttl_ms),
+    )
+    .await
+    .context("refresh recalled semantic activation TTLs")?;
+    Ok(())
+}
+
+async fn load_activation_embedding(graph: &Graph, element_id: &str) -> Result<Option<Vec<f64>>> {
+    fetch_one(
+        graph,
+        query(
+            "MATCH (a:SemanticActivation) \
+             WHERE elementId(a) = $elementId AND a.ttl >= timestamp() \
+             RETURN a.embedding AS embedding",
+        )
+        .param("elementId", element_id.to_string()),
+    )
+    .await?
+    .map(|row| row.get::<Vec<f64>>("embedding").map_err(Into::into))
+    .transpose()
+}
+
+async fn create_activation(
+    graph: &Graph,
+    embedding: &[f64],
+    result_refs: &[String],
+    ttl_ms: i64,
+) -> Result<()> {
+    fetch_one(
         graph,
         query(
             r#"
@@ -396,6 +502,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn semantic_text_is_trimmed_and_byte_bounded() {
+        assert_eq!(validate_semantic_text("  recall  ").unwrap(), "recall");
+        assert!(matches!(
+            validate_semantic_text("   ").unwrap_err(),
+            crate::error::Error::Domain(DomainError::InvalidInput(_))
+        ));
+        assert!(validate_semantic_text(&"x".repeat(MAX_SEMANTIC_TEXT_BYTES)).is_ok());
+        assert!(matches!(
+            validate_semantic_text(&"é".repeat(MAX_SEMANTIC_TEXT_BYTES / 2 + 1)).unwrap_err(),
+            crate::error::Error::Domain(DomainError::InvalidInput(_))
+        ));
+    }
+
+    #[test]
     fn overlap_is_jaccard_similarity() {
         assert_eq!(jaccard(&[], &[]), 1.0);
         assert_eq!(
@@ -418,5 +538,64 @@ mod tests {
         );
         assert!(!fused.contains_key("missing"));
         assert!(fused["a"] > 0.0);
+    }
+
+    #[test]
+    fn only_activations_with_resolved_visible_facts_contribute() {
+        let activations = vec![
+            Activation {
+                element_id: "visible".into(),
+                result_refs: vec!["missing".into(), "fact".into()],
+                similarity: 0.9,
+            },
+            Activation {
+                element_id: "unresolved".into(),
+                result_refs: vec!["missing".into()],
+                similarity: 0.99,
+            },
+            Activation {
+                element_id: "empty".into(),
+                result_refs: Vec::new(),
+                similarity: 1.0,
+            },
+        ];
+        let facts = HashMap::from([("fact".into(), json!({}))]);
+
+        assert_eq!(
+            contributing_activation_ids(&activations, &facts),
+            vec!["visible"]
+        );
+    }
+
+    #[test]
+    fn convergence_selects_highest_similarity_and_last_equal_tie() {
+        let config = SemanticConfig {
+            convergence_similarity_threshold: 0.8,
+            convergence_result_overlap_threshold: 0.5,
+            ..SemanticConfig::default()
+        };
+        let neighbors = vec![
+            Activation {
+                element_id: "a".into(),
+                result_refs: vec!["one".into(), "two".into()],
+                similarity: 0.95,
+            },
+            Activation {
+                element_id: "b".into(),
+                result_refs: vec!["one".into(), "two".into()],
+                similarity: 0.95,
+            },
+            Activation {
+                element_id: "c".into(),
+                result_refs: vec!["other".into()],
+                similarity: 0.99,
+            },
+        ];
+        assert_eq!(
+            select_convergence(&neighbors, &["one".into(), "two".into()], &config,)
+                .map(|activation| activation.element_id.as_str()),
+            Some("b")
+        );
+        assert!(select_convergence(&neighbors, &["missing".into()], &config).is_none());
     }
 }

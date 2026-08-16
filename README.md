@@ -236,8 +236,8 @@ All tools return structured JSON. Every scoped tool requires a `layers` array; t
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
-| `memory_search` | `layers` | `text`, `labels`, `limit` (`20`, clamped to `1..100`) | Find current visible facts and ranked `ABOUT` context. The result limit is applied only after Spike, weight, relevance, and deterministic tie-break ranking. |
-| `memory_semantic_search` | non-empty `text`, `layers` | `labels`, `limit` (`20`, clamped to `1..100`) | Embed the query, blend direct matches with nearby remembered result bundles, and return current visible facts with a 1-based `rank`. |
+| `memory_search` | `layers` | `text`, `labels`, `limit` (`20`, clamped to `1..100`) | Find current visible facts and ranked `ABOUT` context for the returned fact endpoints. The result limit is applied only after Spike, weight, relevance, and deterministic tie-break ranking. |
+| `memory_semantic_search` | non-empty `text` (at most 32 KiB UTF-8), `layers` | `labels`, `limit` (`20`, clamped to `1..100`) | Embed the query, blend direct matches with nearby remembered result bundles, and return current visible facts with a 1-based `rank`. |
 | `memory_get` | `iri`, `layers` | `hops` (`0`; only `1` includes neighbors) | Fetch a visible node and, optionally, its current visible one-hop relationships. |
 | `memory_traverse` | `from`, `layers` | `rels` (all fixed relationships), `depth` (`1`, clamped to `1..3`), `limit` (`50`, clamped to `1..200`) | Walk current visible typed relationships in either direction. |
 | `memory_stats` | `layers` | None | Report graph-model readiness, visible node/edge counts, database-wide episode count, and per-membership active edge totals. |
@@ -324,11 +324,13 @@ Retrieval returns stable IRIs for nodes and relationships. Pass one back to `mem
 
 Retrieval never changes weight automatically, feedback can arrive in a later turn, and there is no time decay. Search first orders facts by Spike category (`Knowledge > Insight > Pattern > Signal`), then by the combined subject + relationship + object weight within a category, then by text relevance. A relationship feedback target must still be current, and every target must remain visible in `@layers`.
 
+Search computes that complete ordering in Neo4j before applying the fact limit, so selective and common queries use the same ranking contract. The top-level `spike` array contains at most the requested fact limit of ranked `ABOUT` context entries for endpoints in the returned facts; it is not an unbounded summary of facts discarded by the limit.
+
 ### Semantic recall
 
 `memory_semantic_search` embeds the query with one external provider, runs the ordinary direct search, retrieves nearby semantic activations from Neo4j's cosine vector index, resolves their relationship IRIs against the current graph and requested scope, and combines the rankings with weighted reciprocal-rank fusion. Direct matches have weight `2.0` by default; recalled bundles are weighted by vector similarity. Recalled facts must still be current, match `labels`, and satisfy relationship-and-endpoint visibility in `@layers`.
 
-An activation is an internal `SemanticActivation:TTL` node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. Similar searches with sufficiently overlapping results converge into one activation and refresh its TTL; other searches create a new activation. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
+An activation is an internal `SemanticActivation:TTL` node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. Every recalled activation that contributes at least one currently resolvable fact refreshes its TTL. A sufficiently similar search with overlapping results also converges its vector and result bundle into one winning activation; otherwise the search creates a new activation. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
 
 The embedding provider, model, and dimensions define one vector space for the database. If that selection changes, Mindreader discards only the ephemeral activations and recreates their vector index; durable graph memory remains intact. Semantic search requires an embedding key, but all other tools remain usable without one.
 
@@ -408,9 +410,9 @@ XAI_API_KEY=
 
 Non-empty process environment secrets take precedence over that file. `NEO4J_PASSWORD` is required for database-backed calls. If `OPENAI_API_KEY` is set, Mindreader uses the configured OpenAI model. Otherwise, if `XAI_API_KEY` is set, it uses the configured xAI model. OpenAI therefore wins when both keys exist. The selected provider's model must be non-empty and its configured dimension must match the returned vectors. Non-secret `NEO4J_URI`, `NEO4J_USER`, model, dimension, and semantic settings are not read from environment variables.
 
-At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 4, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
+At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 5, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. The merge-candidate index uses a synchronous keyword-analyzed lowercase whole-name property so APOC can rerank a small indexed candidate set without scanning every entity. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
 
-Version 4 requires a fresh database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
+Version 5 requires a fresh database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
 
 ## Run entirely with Docker
 
@@ -447,6 +449,14 @@ cargo run --bin mindreader-smoke
 
 Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and `.env` instead of the operator's normal configuration directory. The smoke test writes persistent fixtures to the configured Neo4j database and does not clean them up. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for graph model versioning and release expectations.
 
+Run the release-mode graph benchmark against a disposable database before changing search, logical locks, or merge-candidate generation:
+
+```bash
+cargo run --release --bin mindreader-bench -- --config-dir PATH --entities 10000 --samples 30
+```
+
+The benchmark refuses any database that is not pristine after model-v5 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions. Never point it at production or a database whose contents must be preserved.
+
 ## Repository map
 
 | Path | Responsibility |
@@ -455,7 +465,8 @@ Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and 
 | [`src/service.rs`](src/service.rs) | Typed application boundary used by transport adapters. |
 | [`src/error.rs`](src/error.rs) | Typed application errors, retained source context, and Neo4j retry classification. |
 | [`src/domain.rs`](src/domain.rs) | Validated layer IDs and tagged entity, literal, target, replacement, and retraction concepts. |
-| [`src/tools.rs`](src/tools.rs) | Tool arguments, scoped graph behavior, advisory merge suggestions, feedback, membership auditing, supersession, contradiction, and retraction. |
+| [`src/tools.rs`](src/tools.rs) | Mutation arguments, scoped graph behavior, feedback, membership auditing, supersession, contradiction, and retraction. |
+| [`src/search.rs`](src/search.rs) | Full-text and label-only retrieval, complete database-side ranking, and bounded result assembly. |
 | [`src/merge.rs`](src/merge.rs) | Permanent entity merging and APOC-backed fuzzy suggestions. |
 | [`src/semantic.rs`](src/semantic.rs) | Direct-plus-vector semantic ranking, activation convergence, and TTL refresh. |
 | [`src/embeddings.rs`](src/embeddings.rs) | Native OpenAI and xAI embedding clients and vector validation. |
@@ -464,6 +475,7 @@ Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and 
 | [`src/layers.rs`](src/layers.rs) | Layer validation and visibility-union policy. |
 | [`src/iri.rs`](src/iri.rs) | IRI detection, slugging, minting, and kind/label mappings. |
 | [`src/bin/mindreader-smoke.rs`](src/bin/mindreader-smoke.rs) | Live end-to-end graph behavior checks. |
+| [`src/bin/mindreader-bench.rs`](src/bin/mindreader-bench.rs) | Reproducible release-mode search, logical-lock, and merge-suggestion benchmarks. |
 | [`scripts/mcp_handshake_probe.py`](scripts/mcp_handshake_probe.py) | Portable MCP initialize and tool-discovery diagnostic. |
 | [`mcp.json`](mcp.json) | Server metadata, transport, environment, and exported tool inventory. |
 
@@ -476,6 +488,8 @@ Set `NEO4J_PASSWORD` in the `.env` beside the generated `config.toml`, or in the
 ### Semantic search reports that no provider is configured
 
 Set `OPENAI_API_KEY` or `XAI_API_KEY` in the native `.env` or process environment. If using xAI, also set a non-empty `[embeddings.xai].model` and the matching dimensions in `config.toml`. Provider failure does not fall through to the other provider because their vector spaces are not interchangeable.
+
+Embedding requests make at most three attempts within a fixed 20-second operation budget. Retryable transport failures and HTTP `408`, `409`, `429`, and server errors use jittered backoff; provider `Retry-After` guidance is honored only when it fits the remaining budget. Error and success bodies are size-bounded before parsing.
 
 ### A database call reports a missing APOC function or procedure
 

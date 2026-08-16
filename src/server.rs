@@ -2,11 +2,12 @@ use crate::config::Config;
 use crate::error::{Error, Result as AppResult};
 use crate::graph;
 use crate::merge::MergeArgs;
-use crate::semantic::SemanticSearchArgs;
+use crate::search::SearchArgs;
+use crate::semantic::{SemanticSearchArgs, MAX_SEMANTIC_TEXT_BYTES};
 use crate::service::MemoryService;
 use crate::tools::{
     self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs, SchemaArgs,
-    SearchArgs, StatsArgs, TraverseArgs,
+    StatsArgs, TraverseArgs,
 };
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -75,7 +76,11 @@ fn schema_memory_semantic_search() -> Arc<rmcp::model::JsonObject> {
     object_schema(serde_json::json!({
         "type": "object",
         "properties": {
-            "text": { "type": "string", "minLength": 1 },
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "description": format!("Query text; runtime limit is {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes.")
+            },
             "layers": layers_schema(),
             "labels": { "type": "array", "items": { "type": "string" } },
             "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
@@ -643,6 +648,16 @@ mod tests {
                 );
             }
         }
+        let semantic = router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "memory_semantic_search")
+            .expect("semantic search tool")
+            .schema_as_json_value();
+        assert!(semantic["properties"]["text"]["maxLength"].is_null());
+        assert!(semantic["properties"]["text"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("32768 UTF-8 bytes")));
     }
 
     #[test]
