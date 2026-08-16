@@ -21,8 +21,13 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - name: Install Just
+        uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: just@1.58.0
+          fallback: none
       - name: Check formatting
-        run: cargo fmt --all -- --check
+        run: just fmt
       - name: Check release scripts
         run: |
           bash -n scripts/*.sh
@@ -50,6 +55,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - name: Install Just
+        uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: just@1.58.0
+          fallback: none
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -57,7 +67,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+        run: just clippy
 
   msrv:
     name: Rust 1.89 compatibility
@@ -69,13 +79,18 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.89"
+      - name: Install Just
+        uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: just@1.58.0
+          fallback: none
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: msrv-1.89-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: true
       - name: Check minimum supported Rust version
-        run: cargo check --locked --all-targets --all-features
+        run: just check
 
   test:
     name: Tests
@@ -85,6 +100,11 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Install Just
+        uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: just@1.58.0
+          fallback: none
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -92,7 +112,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
       - name: Run tests
-        run: cargo test --locked --all-targets --all-features
+        run: just test
       - name: Run documentation tests
         run: cargo test --locked --doc
       - name: Verify Rust documentation

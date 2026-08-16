@@ -58,20 +58,20 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - Search with `rg` or `rg --files` before editing.
 - Use `apply_patch` for hand-authored file changes.
 - Use UV for Python: run the handshake probe as `uv run scripts/mcp_handshake_probe.py`. Do not invoke Python directly.
-- Reuse the repository's normal `target/` directory. Do not set `CARGO_TARGET_DIR` to `/private/tmp`, `.codex-cache`, or another secondary location. If Cargo holds its lock, wait and poll; use `cargo clean` for disk pressure.
+- Reuse the repository's normal `target/` directory. Do not set `CARGO_TARGET_DIR` to `/private/tmp`, `.codex-cache`, or another secondary location. If Cargo holds its lock, wait and poll. Treat 5 GiB of Cargo-reported apparent size as the manual cleanup review threshold: run `just target-report` and `just clean-preview`, then use a suitably scoped `cargo clean` only after reviewing the preview. Never schedule or implicitly run cleanup.
 - Preserve unrelated work in a dirty tree. Do not reset or overwrite user changes.
 - Update source-facing documentation when tool inputs, defaults, limits, environment variables, layering, IRI rules, or operational behavior changes.
 - The graph model is fresh-database-only. Bootstrap is idempotent for the current model marker, but incompatible or unversioned non-empty databases must fail with reset/recreate guidance; do not add data migrations.
 
 ## Validation
 
-Run the checks appropriate to the change and fix every actionable failure:
+Use `just check` for the fast compile loop and `just test` while developing. Before handoff, run the shared full gate and fix every actionable failure:
 
 ```bash
-cargo fmt -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
+just verify-full
 ```
+
+`just verify-full` runs formatting, Clippy with warnings denied, and all-target/all-feature tests using locked dependencies. CI and release verification use these same recipes.
 
 For changes that affect graph queries, persistence semantics, layers, configuration, or tool behavior, also start Neo4j and run the live smoke suite:
 

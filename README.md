@@ -635,13 +635,16 @@ The second command waits for MCP input on stdin without allocating a pseudo-TTY.
 
 ## Development
 
-Format, lint, and run the unit tests:
+Install [Just](https://github.com/casey/just#installation) 1.58.0 or newer, then use the fast compile and test recipes while developing:
 
 ```bash
-cargo fmt -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+just check
+just test
 ```
+
+Before handoff, run `just verify-full`. It applies the same formatting, warning-free Clippy, and locked all-target/all-feature test gate used by CI and release verification.
+
+Cargo artifacts remain in the repository's normal `target/` directory. If Cargo's apparent-size summary grows beyond 5 GiB, inspect it with `just target-report`, preview every managed path with `just clean-preview`, and run an appropriately scoped `cargo clean` only after reviewing the preview. Both reporting recipes use Cargo's cross-platform dry-run mode; cleanup is never automatic.
 
 Run the live integration smoke test when Neo4j is available:
 

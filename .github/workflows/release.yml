@@ -96,6 +96,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - name: Install Just
+        uses: taiki-e/install-action@v2.85.5
+        with:
+          tool: just@1.58.0
+          fallback: none
       - name: Restore Rust cache
         uses: Swatinem/rust-cache@v2
         with:
@@ -103,9 +108,7 @@ jobs:
           cache-on-failure: true
       - name: Verify Rust source
         run: |
-          cargo fmt --all -- --check
-          cargo clippy --locked --all-targets --all-features -- -D warnings
-          cargo test --locked --all-targets --all-features
+          just verify-full
           RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
           cargo publish --dry-run --locked -p mindreader
       - name: Verify distribution contracts

@@ -2,14 +2,18 @@
 
 ## Development
 
+Install [Just](https://github.com/casey/just#installation) 1.58.0 or newer, then:
+
 1. Copy `.env.example` to `.env` and set `NEO4J_PASSWORD`.
 2. Start the isolated tools Neo4j (`docker compose --profile tools up -d neo4j-tools`) or use an existing disposable instance. Do not run smoke or bench against a live MCP database on port 7687.
 3. Run:
-   - `cargo fmt --all -- --check`
-   - `cargo clippy --locked --all-targets --all-features -- -D warnings`
-   - `cargo test --locked --all-targets --all-features`
+   - `just check` for the fast compile loop
+   - `just test` while developing
+   - `just verify-full` before handoff; this runs formatting, Clippy with warnings denied, and all-target/all-feature tests
    - `npm test --prefix npm/mindreader`
    - `cargo run --features developer-tools --bin mindreader-smoke -- --config-dir packaging/tools-config` (when the tools Neo4j is available)
+
+Build artifacts stay in the repository's normal `target/` directory. When Cargo's apparent-size summary exceeds 5 GiB, run `just target-report` and `just clean-preview`, review what Cargo would remove, and then choose a suitably scoped `cargo clean`. Both reporting recipes use Cargo's cross-platform dry-run mode; cleanup is intentionally manual rather than scheduled.
 
 ## Graph model versioning
 

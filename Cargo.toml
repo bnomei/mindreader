@@ -17,6 +17,7 @@ include = [
   "/LICENSE",
   "/CHANGELOG.md",
   "/CONTRIBUTING.md",
+  "/justfile",
   "/mcp.json",
   "/scripts/mcp_handshake_probe.py",
   "/skills/using-mindreader/**",
@@ -30,6 +31,9 @@ publish = ["crates-io"]
 
 [features]
 developer-tools = []
+
+[profile.dev]
+debug = "line-tables-only"
 
 [lib]
 name = "mindreader"
