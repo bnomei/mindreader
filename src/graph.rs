@@ -723,7 +723,7 @@ fn unbounded_relation_weight(rel: &UnboundedRelation) -> i64 {
         .unwrap_or_else(|| rel.get::<i64>("weight").unwrap_or(0))
 }
 
-/// Serialize a Neo4j entity node for tool responses (signed weight via weightText).
+/// Serialize a graph node as agent-facing JSON (`kind=node`, signed `weight`).
 pub fn node_json(node: &Node) -> Value {
     let labels: Vec<String> = node
         .labels()
@@ -756,7 +756,7 @@ pub fn node_json(node: &Node) -> Value {
     obj
 }
 
-/// Serialize a relationship with endpoint IRIs for tool responses.
+/// Serialize a current edge as a fact (`kind=fact`) with endpoint IRIs.
 pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     let mut obj = json!({
         "type": rel.typ(),
@@ -1016,7 +1016,7 @@ pub async fn merge_literal_in_txn(
     })
 }
 
-/// Ensure a property stub exists without leaving the caller's transaction.
+/// MERGE a global Property (`stub=false`, `layers=[]`) inside the caller's transaction.
 pub async fn ensure_property_in_txn(
     txn: &mut Txn,
     property: &str,

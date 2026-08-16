@@ -1,10 +1,11 @@
-//! Semantic recall: embed queries, fuse direct hits with remembered activations.
+//! Semantic recall: embed a query and fuse it with remembered activations.
 //!
-//! Combines current `memory_search` results with nearby TTL-bounded activation
-//! bundles via reciprocal rank fusion, then returns current visible facts under
-//! the same layer and label filters. Activations expire and can converge when
-//! similar queries share overlapping result sets. Requires a configured
-//! embedding provider; without keys the tool fails with configuration guidance.
+//! Used when `memory_recall` sets `semantic:true`. Combines ranked direct
+//! `ASSERTS`/`ABOUT` hits with TTL activation bundles via reciprocal rank
+//! fusion, still under the request `scope`. Query text is sent to the
+//! configured embedding provider; without a key this path fails as
+//! `missing_embedding`. Activations expire and may converge. This write is
+//! why recall is not advertised `readOnly`.
 
 use crate::config::{Config, SemanticConfig};
 use crate::domain::DomainError;
@@ -28,7 +29,7 @@ use std::sync::Arc;
 /// Maximum UTF-8 byte length accepted for semantic query text.
 pub const MAX_SEMANTIC_TEXT_BYTES: usize = 32 * 1024;
 
-/// Arguments for embedding-backed semantic search under a layer union.
+/// In-process semantic args; MCP maps `memory_recall` `text`+`semantic:true` here.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SemanticSearchArgs {
     pub text: String,
@@ -100,7 +101,7 @@ fn validate_semantic_text(text: &str) -> Result<String> {
     Ok(text.to_string())
 }
 
-/// Embed the query, fuse direct search with neighbor activations, return ranked current facts.
+/// Embed the query, fuse ranked direct hits with activations, return current facts.
 pub async fn memory_semantic_search(
     graph: &Graph,
     runtime: Option<&SemanticRuntime>,

@@ -1,9 +1,8 @@
-//! Validated domain values for layers, entities, literals, spikes, and retraction.
+//! Validated domain values for layer ids, nodes, literals, spikes, and retract width.
 //!
-//! Types here enforce input contracts before any Neo4j work: layer id shape,
-//! entity/literal object shapes, predicate IRIs, Spike ranks, and retract
-//! scopes. Graph adapters convert these values into Cypher parameters rather
-//! than re-validating strings ad hoc.
+//! These types run before Neo4j work: kebab-case layer ids, `node`/`literal`
+//! object shapes, predicate IRIs, Spike ranks, and retract scopes. Graph
+//! adapters turn the validated values into Cypher parameters.
 
 use crate::iri::{default_lower_for_kind, is_iri, kind_for_label, mint_iri, slugify};
 use schemars::JsonSchema;
@@ -136,7 +135,7 @@ impl PredicateRef {
     }
 }
 
-/// Wire-shape subject node for MCP/tool arguments (`kind` must be `"node"`).
+/// Wire-shape subject for writes: `kind` must be `"node"`, plus `iri` or `name`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EntityInput {
     pub kind: String,
@@ -148,7 +147,7 @@ pub struct EntityInput {
     pub labels: Vec<String>,
 }
 
-/// Wire-shape fact object: tagged node or literal fields on one plain object schema.
+/// Wire-shape object: one tagged bag (`node` or `literal`) without schema unions.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ObjectInput {
     pub kind: String,
@@ -164,7 +163,7 @@ pub struct ObjectInput {
     pub datatype: Option<String>,
 }
 
-/// Validated entity reference after kind and IRI/name checks.
+/// Validated node reference after `kind=node` and IRI/name checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRef {
     pub iri: Option<String>,
@@ -200,7 +199,7 @@ impl EntityRef {
     }
 }
 
-/// Validated fact object: entity reference or typed literal.
+/// Validated fact object: a node reference or a typed literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectValue {
     Entity(EntityRef),
@@ -341,7 +340,7 @@ impl SpikeRank {
     }
 }
 
-/// How wide a soft retraction is: one triple, all facts for a predicate, or a whole subject.
+/// In-process retract width: one fact, all facts for a predicate, or a whole subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetractScope {
     Fact,

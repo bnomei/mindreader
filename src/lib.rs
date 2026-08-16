@@ -1,12 +1,13 @@
 //! Mindreader: RDFS schema-as-data agent memory over Neo4j.
 //!
-//! The library is the source of truth for graph semantics. Transport adapters
-//! (stdio MCP), live smoke coverage, and benchmarks call these modules rather
-//! than embedding their own Cypher or layer policy.
+//! This crate owns graph semantics. The stdio MCP adapter, smoke suite, and
+//! bench call these modules instead of writing their own Cypher or visibility
+//! policy. MCP exposes seven tools: recall, write, revise, withdraw, judge,
+//! place, and unify.
 //!
-//! Memory is stored as explicit graph triples with provenance episodes,
-//! request-scoped multi-layer visibility, shared feedback weights, soft
-//! retraction (`validTo`), and intentional same-kind entity merging.
+//! Facts are explicit triples with Episode provenance, request `scope`
+//! (stored as `layers` memberships), signed feedback weights, soft retraction
+//! (`validTo`), and intentional same-kind unify.
 
 pub mod config;
 pub mod domain;

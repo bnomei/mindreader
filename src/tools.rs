@@ -1,10 +1,12 @@
-//! Mutation arguments and graph behavior for the non-search memory tools.
+//! Graph mutations and in-process helpers behind the seven MCP writers.
 //!
-//! Implements get, traverse, stats, assert, replace, retract, feedback, layers,
-//! and schema: set-valued assertions, soft retraction, explicit SUPERSEDES
-//! corrections, shared signed weights, membership audits with endpoint closure,
-//! and global schema-as-data. CONTRADICTS and SUPERSEDES are system-owned.
-//! State-changing mutations create one Episode when they change graph state.
+//! MCP calls `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`,
+//! and `memory_place` here. Older names (`memory_assert`, `memory_replace`, …)
+//! stay as in-process entry points for smoke and bench. Writes are set-valued,
+//! corrections record `SUPERSEDES` in one transaction, retraction is soft
+//! (`validTo`), and membership edits keep endpoint closure. Class/Property
+//! records stay global (`layers=[]`, `stub=false`). `CONTRADICTS` and
+//! `SUPERSEDES` are system-owned. A state change records exactly one Episode.
 
 use crate::domain::{
     DomainError, EntityInput, EntityRef, ObjectInput, ObjectValue, PredicateRef, RetractScope,
@@ -269,7 +271,7 @@ fn relationship_iri() -> String {
     format!("mindreader:relationship/{}", Uuid::new_v4())
 }
 
-/// Arguments for IRI lookup with optional one-hop neighbor expansion.
+/// In-process IRI lookup; MCP recall uses `iris` plus `hops` 0 or 1.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetArgs {
     pub iri: String,
@@ -278,13 +280,13 @@ pub struct GetArgs {
     pub hops: Option<u32>,
 }
 
-/// Arguments for model readiness and layer-scoped graph counters.
+/// Operator graph counters; not an MCP tool.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StatsArgs {
     pub layers: Vec<String>,
 }
 
-/// Arguments for bounded typed-edge walks from a visible start IRI.
+/// In-process typed walk; MCP recall uses `around` and predicate `p`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct TraverseArgs {
     pub from: String,
@@ -297,7 +299,7 @@ pub struct TraverseArgs {
     pub limit: Option<u32>,
 }
 
-/// One set-valued triple inside a `memory_assert` call (`facts[]`).
+/// One set-valued triple inside a `memory_write` `facts[]` item.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssertFact {
@@ -310,7 +312,7 @@ pub struct AssertFact {
     pub contradicts: bool,
 }
 
-/// Arguments for batched set-valued assertion (membership merge, optional Spike/CONTRADICTS).
+/// `memory_write` arguments: `facts[]` plus call-level `scope`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AssertArgs {
@@ -366,7 +368,7 @@ pub struct RetractArgs {
     pub reason: Option<String>,
 }
 
-/// Stable node or relationship target for feedback and membership audits.
+/// Pasteable handle: `kind` is `node` or `fact`, plus a stable IRI.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TargetArgs {
     pub kind: String,
@@ -1417,7 +1419,7 @@ async fn ensure_contradictions_txn(
     Ok(changed)
 }
 
-/// Assert one or more exact set-valued triples; one Episode if any fact changed.
+/// In-process batched write; MCP registers this as `memory_write`.
 pub async fn memory_assert(graph: &Graph, args: AssertArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_assert_once(graph, args.clone()).await {
@@ -1732,7 +1734,7 @@ async fn change_fact_memberships_batch_txn(
     Ok(())
 }
 
-/// Correct one exact fact in the listed memberships and record SUPERSEDES in the same transaction.
+/// In-process replace by restated `s`/`p`/`old`; MCP prefers a fact handle.
 pub async fn memory_replace(graph: &Graph, args: ReplaceArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_replace_once(graph, args.clone()).await {
@@ -1938,7 +1940,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
     }))
 }
 
-/// Remove selected fact memberships and set `validTo` after the last one is removed.
+/// In-process soft retract; MCP `memory_withdraw` accepts a fact handle or subject.
 pub async fn memory_retract(graph: &Graph, args: RetractArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_retract_once(graph, args.clone()).await {
@@ -2126,7 +2128,7 @@ fn validate_target(target: &TargetArgs) -> Result<()> {
     Ok(())
 }
 
-/// Apply explicit strengthen (+1) or weaken (−1) to a visible current node or relationship weight.
+/// In-process ±1 on a visible current node or fact; MCP batches this as `memory_judge`.
 pub async fn memory_feedback(graph: &Graph, args: FeedbackArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_feedback_once(graph, args.clone()).await {
@@ -2277,7 +2279,7 @@ fn membership_allows(record: &[String], required: &[String]) -> bool {
     record.is_empty() || required.iter().all(|layer| record.contains(layer))
 }
 
-/// Add or remove layer memberships on a target while preserving relationship endpoint closure.
+/// In-process membership edit; MCP `memory_place` remaps `scope` vs add/remove.
 pub async fn memory_layers(graph: &Graph, args: LayersArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_layers_once(graph, args.clone()).await {
@@ -2510,7 +2512,7 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
     }))
 }
 
-/// Write global RDFS class or property schema-as-data, or list the catalog (no `layers` input).
+/// In-process schema write or catalog; MCP lists schema via `memory_recall` labels.
 pub async fn memory_schema(graph: &Graph, args: SchemaArgs) -> Result<Value> {
     if args.list {
         return memory_schema_list(graph, args).await;
@@ -2896,7 +2898,7 @@ pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> R
     Ok(row.and_then(|row| row.get::<i64>("n").ok()).unwrap_or(0))
 }
 
-/// One-hop or node-only recall for one or more IRIs.
+/// `memory_recall` `iris` path: node payloads, and neighbor facts when `hops=1`.
 pub async fn memory_recall_iris(
     graph: &Graph,
     iris: Vec<String>,
@@ -2960,7 +2962,7 @@ pub async fn memory_recall_iris(
     }))
 }
 
-/// Walk from an IRI, filtering user predicates by name/IRI rather than Neo4j type.
+/// `memory_recall` `around` path: walk current edges and filter by predicate name or IRI.
 pub async fn memory_recall_around(
     graph: &Graph,
     from: &str,
@@ -3021,7 +3023,7 @@ pub async fn memory_recall_around(
     }))
 }
 
-/// Agent-facing write: same contract as batched assert.
+/// MCP `memory_write`: batched set-valued triples, one Episode if anything changed.
 pub async fn memory_write(graph: &Graph, args: WriteArgs) -> Result<Value> {
     memory_assert(graph, args).await
 }
@@ -3102,7 +3104,7 @@ fn object_input_from_node(node: &Node) -> ObjectInput {
     }
 }
 
-/// Correct one current fact identified by `{kind:fact, iri}`.
+/// MCP `memory_revise`: resolve a fact IRI, then membership-selective SUPERSEDES.
 pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
     if args.target.kind != "fact" {
         return Err(
@@ -3137,7 +3139,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
     Ok(result)
 }
 
-/// Soft-withdraw a fact handle or every current fact for a subject (+ optional `p`).
+/// MCP `memory_withdraw`: soft-retract by fact IRI or subject (optional predicate).
 pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value> {
     let has_target = args.target.is_some();
     let has_subject = args.subject.is_some();
@@ -3198,7 +3200,7 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
     Ok(result)
 }
 
-/// Apply sequential ±1 ratings under one Episode per call (delegates per rating).
+/// MCP `memory_judge`: sequential ±1 ratings; each rating currently records its own Episode.
 pub async fn memory_judge(graph: &Graph, args: JudgeArgs) -> Result<Value> {
     if args.ratings.is_empty() || args.ratings.len() > MAX_ASSERT_FACTS {
         return Err(DomainError::InvalidInput(format!(
@@ -3232,7 +3234,7 @@ pub async fn memory_judge(graph: &Graph, args: JudgeArgs) -> Result<Value> {
     }))
 }
 
-/// Change memberships. `scope` is the visibility union; `add`/`remove` are the edit.
+/// MCP `memory_place`: edit stored memberships while `scope` only filters visibility.
 pub async fn memory_place(graph: &Graph, args: PlaceArgs) -> Result<Value> {
     validate_target(&args.target)?;
     let mut result = memory_layers(

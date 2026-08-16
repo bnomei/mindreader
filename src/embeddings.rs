@@ -48,6 +48,7 @@ impl Default for RetryPolicy {
 /// Async embedding backend used by semantic search and smoke fixtures.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
+    /// Send query text to the remote provider; never log the API key.
     async fn embed(&self, text: &str) -> Result<Vec<f64>>;
     fn provider(&self) -> &'static str;
     fn model(&self) -> &str;

@@ -1,9 +1,10 @@
-//! Permanent same-kind entity merge and advisory duplicate suggestions.
+//! Permanent same-kind unify and advisory duplicate suggestions.
 //!
-//! `memory_merge` moves memberships, history, and edges from a source IRI onto
-//! a surviving target of the same canonical kind across all layers. Bootstrap
-//! seed Class/Property IRIs cannot be merge sources. Assert and related tools
-//! may call [`merge_suggestions_in_txn`] for review-only fuzzy name matches.
+//! MCP `memory_unify` calls [`memory_merge`]: source memberships, history, and
+//! edges move onto a surviving target of the same canonical kind, with no
+//! `scope` filter. Bootstrap-seeded Class/Property IRIs cannot be sources.
+//! Writes may attach [`merge_suggestions_in_txn`] results as review-only
+//! `{source,target}` IRI pairs.
 
 use crate::domain::DomainError;
 use crate::graph::{
@@ -72,14 +73,14 @@ fn lucene_fuzzy_term(name: &str) -> String {
     query
 }
 
-/// Source and target entity IRIs for a permanent same-kind merge.
+/// MCP `memory_unify` arguments: surviving `target` IRI absorbs `source`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MergeArgs {
     pub source: String,
     pub target: String,
 }
 
-/// Merge `source` into `target`, retrying transient Neo4j and concurrent-mutation failures.
+/// Permanently unify two same-kind nodes; MCP name is `memory_unify`.
 pub async fn memory_merge(graph: &Graph, args: MergeArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_merge_once(graph, &args).await {

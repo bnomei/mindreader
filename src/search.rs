@@ -1,10 +1,11 @@
-//! Database-side retrieval ranking and bounded fact assembly for `memory_search`.
+//! Ranked fact retrieval and the graph-free `memory_recall` input contract.
 //!
-//! Full-text wakeup indexes and optional label filters produce candidates;
-//! ranking is Spike category first (Knowledge > Insight > Pattern > Signal),
-//! then shared subject+relationship+object weight within that category, then
-//! text score. Layer filters require visible endpoints and current
-//! relationships (`validTo` null). Retrieval never mutates weights.
+//! Text and non-schema label queries rank current `ASSERTS`/`ABOUT` facts:
+//! Spike category first, then subject+fact+object weight, then text score.
+//! `validate_recall_args` enforces exactly one selector (`text`, `iris`,
+//! `labels`, or `around`) without advertising schema unions. Catalog labels
+//! (`Class`/`Property`) do not enter this rank path. Retrieval never changes
+//! weights.
 
 use crate::domain::DomainError;
 use crate::error::{Error, Result};
@@ -18,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
-/// Arguments for full-text / label-scoped fact retrieval under a layer union.
+/// In-process ranked search (`layers` here is the request visibility union).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchArgs {
     pub layers: Vec<String>,
@@ -30,7 +31,7 @@ pub struct SearchArgs {
     pub limit: Option<u32>,
 }
 
-/// Agent-facing recall: exactly one selector among text / iris / labels / around.
+/// MCP `memory_recall` arguments. Runtime accepts exactly one selector.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecallArgs {
@@ -129,12 +130,14 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     Ok(())
 }
 
+/// Fact IRI from a result envelope (`target.iri`, else legacy `relationship.iri`).
 pub fn fact_handle_iri(fact: &Value) -> Option<&str> {
     fact.pointer("/target/iri")
         .or_else(|| fact.pointer("/relationship/iri"))
         .and_then(Value::as_str)
 }
 
+/// True when every label is `Class` or `Property` (catalog path, not ranked search).
 pub fn is_schema_catalog_labels(labels: &[String]) -> bool {
     !labels.is_empty()
         && labels.iter().all(|label| {
@@ -401,7 +404,7 @@ fn relation_weight(relation: &Relation) -> i64 {
         .unwrap_or_else(|| relation.get::<i64>("weight").unwrap_or(0))
 }
 
-/// Rank current visible facts for a text and/or label query under the request layer union.
+/// Rank current visible `ASSERTS`/`ABOUT` facts for text and/or non-schema labels.
 pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as i64;

@@ -1,13 +1,13 @@
-//! Layer validation and visibility-union policy.
+//! Layer-id validation and visibility-union policy.
 //!
-//! Every scoped tool supplies a `layers` array. Empty means global-only for
-//! request filters; named layers form an OR union. Records with empty
-//! memberships are global and visible in every request scope. Visible
-//! relationships also require visible endpoints (enforced in graph queries).
+//! MCP scoped tools take a `scope` array of layer ids. Empty `scope` is
+//! global-only. Named ids form an OR union. Graph records store memberships
+//! in `layers`; empty memberships are global and visible in every request.
+//! Relationship visibility also requires visible endpoints (enforced in Cypher).
 
 use crate::domain::{DomainError, LayerId};
 
-/// Validate request layer strings, remove duplicates, and sort the result.
+/// Parse MCP `scope` (or stored membership) strings, dedupe, and sort.
 pub fn validate_layer_ids<I, S>(layers: I) -> Result<Vec<LayerId>, DomainError>
 where
     I: IntoIterator<Item = S>,

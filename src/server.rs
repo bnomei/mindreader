@@ -1,11 +1,11 @@
-//! MCP stdio adapter: tool registration, host-compatible schemas, lazy Neo4j.
+//! MCP stdio adapter: seven tools, host-compatible schemas, lazy Neo4j.
 //!
-//! Advertises all twelve memory tools with plain tagged object input and output
-//! schemas (no `anyOf`/`oneOf`/`allOf`, which break some hosts). Initialize and
-//! `tools/list` do not require Neo4j; the first tool call (or explicit connect)
-//! bootstraps the graph and [`MemoryService`]. Recoverable tool failures return
-//! structured `isError` results. Rate limiting and the 45s invoke timeout apply
-//! only to MCP handlers.
+//! Advertises `memory_recall`, `memory_write`, `memory_revise`,
+//! `memory_withdraw`, `memory_judge`, `memory_place`, and `memory_unify` as
+//! plain tagged object schemas (no `anyOf`/`oneOf`/`allOf`). Initialize and
+//! `tools/list` do not wait on Neo4j. Recoverable failures are structured
+//! `isError` results. The 120/min burst-20 limiter and 45s timeout apply only
+//! to `#[tool]` handlers through the process-local invoke path.
 
 use crate::config::Config;
 use crate::domain::DomainError;
@@ -481,7 +481,7 @@ impl TokenBucket {
     }
 }
 
-/// MCP server handle: tool router, lazy `MemoryService`, and loaded config.
+/// Stdio MCP server: seven-tool router, lazy Neo4j service, and invoke limiter.
 #[derive(Clone)]
 pub struct Mindreader {
     pub tool_router: ToolRouter<Self>,
@@ -526,7 +526,7 @@ impl Mindreader {
         Ok(())
     }
 
-    /// Sorted list of registered MCP tool names (for startup logs and tests).
+    /// Sorted names of the seven advertised MCP tools.
     pub fn registered_tool_names() -> Vec<String> {
         let router = Self::tool_router();
         let mut names: Vec<String> = router.map.keys().map(|k| k.to_string()).collect();
