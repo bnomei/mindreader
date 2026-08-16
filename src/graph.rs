@@ -241,6 +241,7 @@ pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Res
     Ok(())
 }
 
+/// Require APOC Core/Extended plus TTL before bootstrap continues.
 async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     let functions = fetch_all(
         graph,
@@ -311,6 +312,7 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Create or replace the activation vector index; a space change deletes old activations.
 async fn ensure_semantic_index(graph: &Graph, embedding: &EmbeddingSpace) -> Result<()> {
     if !(1..=4096).contains(&embedding.dimensions) {
         return Err(graph_error!(
@@ -447,6 +449,7 @@ async fn verify_required_constraints(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Write the model marker on an empty database; reject unversioned non-empty graphs.
 async fn ensure_model_marker(graph: &Graph) -> Result<()> {
     let markers = fetch_all(
         graph,
@@ -513,6 +516,7 @@ async fn ensure_model_marker(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Accept only the current model marker; never migrate an older or newer graph.
 fn validate_model_version(version: i64) -> Result<()> {
     if version == MODEL_VERSION {
         return Ok(());
@@ -872,6 +876,7 @@ pub struct NodeSpec {
     pub labels: Vec<String>,
 }
 
+/// Collision-resistant subject/predicate/layer guard used for writer lock order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FactLockSpec {
     key: String,
@@ -1051,6 +1056,7 @@ pub async fn ensure_property_in_txn(
     Ok((iri, created, node_json(&node)))
 }
 
+/// Length-prefixed SHA-256 so IRI fragments cannot collide across fields.
 fn lock_key(subject_iri: &str, predicate_iri: &str, layer: &str) -> String {
     let mut hasher = Sha256::new();
     for part in [subject_iri, predicate_iri, layer] {
@@ -1064,6 +1070,7 @@ fn lock_key(subject_iri: &str, predicate_iri: &str, layer: &str) -> String {
         .collect()
 }
 
+/// Expand each fact into subject-wide and predicate-specific locks, then sort by key.
 pub(crate) fn fact_lock_specs(facts: &[(String, String, String)]) -> Vec<FactLockSpec> {
     let mut locks = Vec::with_capacity(facts.len() * 2);
     for (subject_iri, predicate_iri, layer) in facts {

@@ -50,8 +50,11 @@ impl Default for RetryPolicy {
 pub trait EmbeddingProvider: Send + Sync {
     /// Send query text to the remote provider; never log the API key.
     async fn embed(&self, text: &str) -> Result<Vec<f64>>;
+    /// Provider id used in error messages and embedding-space markers.
     fn provider(&self) -> &'static str;
+    /// Model id sent to the remote embedding API.
     fn model(&self) -> &str;
+    /// Expected vector length after L2 normalization.
     fn dimensions(&self) -> usize;
 }
 
@@ -268,6 +271,7 @@ fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Honor OpenAI `x-should-retry` when present; otherwise retry 408/409/429 and 5xx.
 fn should_retry_response(provider: &str, status: StatusCode, headers: &HeaderMap) -> bool {
     if provider == "openai" {
         match header_text(headers, "x-should-retry").as_deref() {
@@ -288,6 +292,7 @@ fn retryable_reqwest_error(error: &reqwest::Error) -> bool {
         && (error.is_timeout() || error.is_connect() || error.is_request() || error.is_body())
 }
 
+/// Prefer `retry-after-ms`, then delta-seconds, then an HTTP-date Retry-After.
 fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
     if let Some(milliseconds) = header_text(headers, "retry-after-ms")
         .and_then(|value| value.parse::<f64>().ok())
@@ -325,6 +330,7 @@ fn retry_delay(
         .saturating_add(jitter)
 }
 
+/// Read at most `limit` bytes and report whether the body was truncated.
 async fn read_limited(
     mut response: Response,
     limit: usize,

@@ -1,3 +1,7 @@
+//! CPU-local embedding normalization benches (no Neo4j).
+//!
+//! Graph ranking and lock latency live in `mindreader-bench`.
+
 use divan::{counter::ItemsCount, Bencher};
 use mindreader::embeddings::normalize_vector;
 

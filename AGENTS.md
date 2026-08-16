@@ -6,7 +6,7 @@ These instructions apply to the entire repository.
 
 ## Project contract
 
-Mindreader is a Rust stdio MCP server backed by Neo4j. It exposes exactly eight memory tools (`memory_recall`, `memory_recall_semantic`, `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, `memory_unify`) and stores explicit graph triples with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, explicit supersession history, semantic recall, and intentional same-kind entity merging. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/writing-to-mindreader/SKILL.md` aligned with it.
+Mindreader is a Rust stdio MCP server backed by Neo4j. The agent is the clerk of an inspectable graph: it exposes exactly eight memory tools (`memory_recall`, `memory_recall_semantic`, `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, `memory_unify`) and stores only explicitly asserted triples, with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, explicit supersession history, optional semantic recall, and intentional same-kind entity merging. There is no hidden fact extractor. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/using-mindreader/SKILL.md` aligned with it.
 
 Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward compatibility, or add abstraction for hypothetical future requirements. Choose the simplest implementation that fully satisfies the current contract.
 
@@ -39,7 +39,7 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - Every scoped tool requires a validated `scope` array. `[]` means global-only; named layers form an OR union, and visible relationships require visible endpoints. Layer IDs use lowercase kebab-case colon namespaces. Graph storage still uses the `layers` property.
 - Empty record memberships mean global. An exact relationship has one identity across memberships; assertions merge memberships rather than duplicate the relationship.
 - Class/Property nodes and schema-definition edges are always global (`layers=[]`, `stub=false`). `memory_recall` with `labels` Class and/or Property is the catalog. Database-wide `memory_unify` is the only MCP tool without a `scope` input.
-- `memory_recall` is closed-world and read-only. `memory_recall_semantic` is the only recall tool that sends query text to the configured embedding provider or maintains semantic activations. Both default to 20 results and accept at most 100; `memory_recall.iris` accepts at most 20 node IRIs.
+- `memory_recall` is closed-world and read-only. `memory_recall_semantic` is the only recall tool that sends query text to the configured embedding provider or maintains semantic activations. Both default to 20 results and accept at most 100; `memory_recall.iris` accepts at most 20 node IRIs. `memory_recall` accepts exactly one of `text`, `iris`, `labels`, `around`, or `history`, plus optional `detail` (`concise`|`detailed`).
 - `memory_judge` changes a visible node or current fact's shared signed weight by exactly `+1` or `-1` per rating. Its 1–20 ratings are one atomic transaction and one Episode; duplicate targets are invalid. Retrieval never changes weight automatically, weights do not decay, and search uses weight only within the same Spike category.
 - `memory_place` applies 1–20 membership edits atomically, records at most one Episode, and must validate relationship endpoint closure against the batch's final state. `scope` is visibility; each edit's `add`/`remove` arrays are the membership change. Duplicate targets are invalid.
 - Retraction is soft: set `validTo`; do not hard-delete nodes or history.
@@ -100,5 +100,5 @@ Before handing off a change:
 3. Confirm new dynamic Cypher identifiers pass through an allowlist validator.
 4. Confirm stdout stays protocol-clean.
 5. Confirm MCP tool names and schemas pass unit tests and remain host-compatible.
-6. Update `README.md`, `mcp.json`, and the writing skill when their documented contract changes.
+6. Update `README.md`, `mcp.json`, and the using-mindreader skill when their documented contract changes.
 7. Report which checks ran and whether the live Neo4j smoke test was skipped.

@@ -54,8 +54,10 @@ pub enum Error {
     Graph(String),
     #[error("{0}")]
     Operation(String),
+    /// A concurrent writer invalidated a precondition; MCP may retry.
     #[error("concurrent mutation changed {0}")]
     ConcurrentMutation(String),
+    /// Commit returned an error after the transaction may already have applied.
     #[error("{operation} commit outcome is unknown: {source}")]
     AmbiguousCommit {
         operation: &'static str,
@@ -115,8 +117,10 @@ fn neo4j_is_transient(error: &Neo4jError) -> bool {
 
 /// Adds operational context while retaining a typed source chain.
 pub trait Context<T> {
+    /// Wrap `Err` with a ready-made context message.
     fn context(self, message: impl Into<String>) -> Result<T>;
 
+    /// Wrap `Err` with a lazily built context message.
     fn with_context<F>(self, message: F) -> Result<T>
     where
         F: FnOnce() -> String;
@@ -144,6 +148,7 @@ where
     }
 }
 
+/// Construct a configuration failure from a format string.
 #[macro_export]
 macro_rules! config_error {
     ($($arg:tt)*) => {
@@ -151,6 +156,7 @@ macro_rules! config_error {
     };
 }
 
+/// Construct an embedding-provider failure from a format string.
 #[macro_export]
 macro_rules! embedding_error {
     ($($arg:tt)*) => {
@@ -158,6 +164,7 @@ macro_rules! embedding_error {
     };
 }
 
+/// Construct a graph/bootstrap failure from a format string.
 #[macro_export]
 macro_rules! graph_error {
     ($($arg:tt)*) => {
@@ -165,6 +172,7 @@ macro_rules! graph_error {
     };
 }
 
+/// Construct an operation failure from a format string.
 #[macro_export]
 macro_rules! operation_error {
     ($($arg:tt)*) => {

@@ -3,7 +3,7 @@
 //! Text and non-schema label queries rank current `ASSERTS`/`ABOUT` facts:
 //! Spike category first, then subject+fact+object weight, then text score.
 //! `validate_recall_args` enforces exactly one selector (`text`, `iris`,
-//! `labels`, or `around`) without advertising schema unions. Catalog labels
+//! `labels`, `around`, or `history`) without advertising schema unions. Catalog labels
 //! (`Class`/`Property`) do not enter this rank path. Retrieval never changes
 //! weights.
 
@@ -52,6 +52,10 @@ pub struct RecallArgs {
     #[serde(default)]
     pub depth: Option<u32>,
     #[serde(default)]
+    pub history: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
     pub limit: Option<u32>,
 }
 
@@ -70,13 +74,24 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let selectors = [text.is_some(), iris > 0, labels > 0, around.is_some()]
-        .into_iter()
-        .filter(|selected| *selected)
-        .count();
+    let history = args
+        .history
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selectors = [
+        text.is_some(),
+        iris > 0,
+        labels > 0,
+        around.is_some(),
+        history.is_some(),
+    ]
+    .into_iter()
+    .filter(|selected| *selected)
+    .count();
     if selectors != 1 {
         return Err(DomainError::InvalidInput(
-            "memory_recall requires exactly one of text, iris, labels, or around".into(),
+            "memory_recall requires exactly one of text, iris, labels, around, or history".into(),
         )
         .into());
     }
@@ -86,9 +101,12 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
         "iris"
     } else if labels > 0 {
         "labels"
-    } else {
+    } else if around.is_some() {
         "around"
+    } else {
+        "history"
     };
+    crate::payload::Detail::parse(args.detail.as_deref())?;
     if selector != "iris" && args.hops.is_some() {
         return Err(DomainError::InvalidInput(format!(
             "memory_recall hops applies only to the iris selector, not {selector}"
@@ -104,6 +122,12 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     if selector != "around" && args.depth.is_some() {
         return Err(DomainError::InvalidInput(format!(
             "memory_recall depth applies only to the around selector, not {selector}"
+        ))
+        .into());
+    }
+    if selector != "history" && args.history.is_some() {
+        return Err(DomainError::InvalidInput(format!(
+            "memory_recall history applies only to the history selector, not {selector}"
         ))
         .into());
     }
@@ -155,6 +179,14 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
             .into());
         }
     }
+    if let Some(iri) = history {
+        if !is_iri(iri) {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_recall history requires a node or fact IRI, not {iri:?}"
+            ))
+            .into());
+        }
+    }
     if let Some(hops) = args.hops {
         if hops != 0 && hops != 1 {
             return Err(
@@ -202,6 +234,7 @@ fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Quote a Lucene phrase and escape operators so user text cannot change query shape.
 fn lucene_escape(text: &str) -> String {
     let mut out = String::from("\"");
     for ch in text.chars() {
@@ -305,6 +338,7 @@ LIMIT $limit
 RETURN s, r, o, property, spikeRank, toString(effectiveWeight) AS effectiveWeight, score
 "#;
 
+/// Assemble the closed-world rank query: text index or label filter, then Spike/weight/score.
 fn ranked_query(text_mode: bool) -> String {
     let candidates = if text_mode {
         TEXT_CANDIDATES
@@ -314,6 +348,7 @@ fn ranked_query(text_mode: bool) -> String {
     format!("{candidates}{RANK_AND_LIMIT}")
 }
 
+/// Neighbor `ABOUT` facts that give Spike context around ranked subjects.
 async fn spike_context(
     graph: &Graph,
     layers: &[String],
@@ -438,6 +473,7 @@ async fn spike_context(
     Ok(spike_list)
 }
 
+// Prefer `weightText` so signed weights survive neo4rs 0.8 integer decoding.
 fn node_weight(node: &Node) -> i64 {
     node.get::<String>("weightText")
         .ok()
@@ -593,6 +629,8 @@ mod tests {
             hops: None,
             p: None,
             depth: None,
+            history: None,
+            detail: None,
             limit: None,
         };
         assert!(validate_recall_args(&args).is_err());
@@ -609,6 +647,12 @@ mod tests {
         assert!(validate_recall_args(&args).is_ok());
         args.iris = Some(vec!["mindreader:relationship/fact".into()]);
         assert!(validate_recall_args(&args).is_err());
+        args.iris = None;
+        args.hops = None;
+        args.history = Some("mindreader:relationship/fact".into());
+        assert!(validate_recall_args(&args).is_ok());
+        args.detail = Some("verbose".into());
+        assert!(validate_recall_args(&args).is_err());
     }
 
     #[test]
@@ -622,6 +666,8 @@ mod tests {
             hops: None,
             p: None,
             depth: None,
+            history: None,
+            detail: None,
             limit: Some(20),
         };
         assert!(validate_recall_args(&base).is_ok());

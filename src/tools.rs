@@ -24,6 +24,7 @@ use crate::graph::{spike_label, spike_rank};
 use crate::iri::{class_iri, name_from_iri, property_iri};
 use crate::layers::validate_layer_ids;
 use crate::merge::merge_suggestions_in_txn;
+use crate::payload::finish_mutation;
 #[cfg(test)]
 use crate::search::SearchArgs;
 use crate::{
@@ -125,6 +126,7 @@ fn retract_fact_lock_requests(
     locks
 }
 
+/// Block client writes of CONTRADICTS and SUPERSEDES as ordinary predicates.
 fn reject_system_owned_predicate(predicate: &str) -> Result<()> {
     if structural_rel_for(predicate)
         .as_deref()
@@ -215,6 +217,7 @@ fn prepare_assert_fact(fact: AssertFact) -> Result<PreparedAssertFact> {
     })
 }
 
+/// Union named memberships; either empty list is global and wins.
 fn merge_memberships(current: &[String], incoming: &[String]) -> Vec<String> {
     if current.is_empty() || incoming.is_empty() {
         return Vec::new();
@@ -226,6 +229,7 @@ fn merge_memberships(current: &[String], incoming: &[String]) -> Vec<String> {
     merged
 }
 
+/// Drop the selected memberships; `None` means the record is unchanged or not in this scope.
 fn remove_memberships(current: &[String], selected: &[String]) -> Option<Vec<String>> {
     if selected.is_empty() {
         return current.is_empty().then(Vec::new);
@@ -545,6 +549,7 @@ struct FactMembershipChange {
     remaining: Vec<String>,
 }
 
+/// Compute remaining memberships for revise/withdraw; omit facts that do not intersect `selected`.
 fn plan_fact_membership_changes(
     currents: &[CurrentFact],
     selected: &[String],
@@ -1400,6 +1405,7 @@ async fn find_conflicts_txn(
     .collect()
 }
 
+/// Idempotently add current CONTRADICTS edges from a new object to each conflicting value.
 async fn ensure_contradictions_txn(
     txn: &mut Txn,
     new_o: &str,
@@ -1449,6 +1455,7 @@ pub async fn memory_assert(graph: &Graph, args: AssertArgs) -> Result<Value> {
     unreachable!("bounded retry loop always returns")
 }
 
+/// One write attempt: lock, MERGE endpoints, merge memberships or no-op, one Episode if changed.
 async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
     validate_assert_args(&args)?;
     let layers = normalize_layers(args.scope)?;
@@ -1508,18 +1515,24 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
             return Err(error);
         }
     };
-    Ok(json!({
-        "ok": true,
-        "noop": !changed,
-        "scope": layers,
-        "episode": if changed {
-            json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool })
-        } else {
-            Value::Null
-        },
-        "review": review_payloads(&merge_suggestions, &items),
-        "facts": items,
-    }))
+    Ok(finish_mutation(
+        json!({
+            "ok": true,
+            "noop": !changed,
+            "scope": layers,
+            "episode": if changed {
+                json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool })
+            } else {
+                Value::Null
+            },
+            "review": review_payloads(&merge_suggestions, &items),
+            "facts": items.clone(),
+        }),
+        &items,
+        &[],
+        None,
+        None,
+    ))
 }
 
 fn review_payloads(merge_suggestions: &[Value], facts: &[Value]) -> Value {
@@ -1828,9 +1841,16 @@ async fn memory_replace_once(
             let selected = expected_fact_iri
                 .map(|iri| format!("fact handle {iri}"))
                 .unwrap_or_else(|| format!("fact ({subject_iri}, {prop_iri}, {old_iri})"));
-            DomainError::Precondition(format!(
-                "cannot replace the selected memberships of non-current {selected}"
-            ))
+            if old_currents.iter().any(|current| {
+                expected_fact_iri.is_none_or(|iri| current.iri == iri) && current.layers.is_empty()
+            }) && !layers.is_empty()
+            {
+                DomainError::Precondition(format!("{selected} is global; retry with scope: []"))
+            } else {
+                DomainError::Precondition(format!(
+                    "cannot replace the selected memberships of non-current {selected}"
+                ))
+            }
         })?;
     if old_iri == new_iri {
         txn.rollback().await?;
@@ -2129,6 +2149,16 @@ async fn memory_retract_once(
         })
         .collect::<Vec<_>>();
     if changes.is_empty() {
+        if !currents.is_empty()
+            && currents.iter().all(|current| current.layers.is_empty())
+            && !layers.is_empty()
+        {
+            txn.rollback().await?;
+            return Err(DomainError::Precondition(
+                "fact target is global; retry with scope: []".into(),
+            )
+            .into());
+        }
         txn.rollback().await?;
         return Ok(json!({
             "retracted": 0,
@@ -2343,6 +2373,7 @@ async fn memory_feedback_once(graph: &Graph, args: FeedbackArgs) -> Result<Value
     }))
 }
 
+/// Endpoint closure: a global fact needs global endpoints; a named fact needs global or covering endpoints.
 fn membership_allows(record: &[String], required: &[String]) -> bool {
     if required.is_empty() {
         return record.is_empty();
@@ -3057,56 +3088,55 @@ pub async fn memory_recall_iris(
     }
 
     let mut facts = Vec::new();
-    let mut truncated = false;
-    if hops == 1 {
-        let rows = fetch_all(
-            graph,
-            query(RECALL_IRI_FACTS_QUERY)
-                .param("iris", iris)
-                .param("layers", layers.clone())
-                .param("limit", i64::from(fact_limit.saturating_add(1))),
-        )
-        .await?;
-        truncated = rows.len() > fact_limit as usize;
-        for row in rows.into_iter().take(fact_limit as usize) {
-            let (Ok(index), Ok(subject), Ok(relationship), Ok(object), Ok(property)) = (
-                row.get::<i64>("inputIndex"),
-                row.get::<Node>("s"),
-                row.get::<Relation>("r"),
-                row.get::<Node>("o"),
-                row.get::<String>("property"),
-            ) else {
-                continue;
-            };
-            let subject_iri = subject.get::<String>("iri").unwrap_or_default();
-            let object_iri = object.get::<String>("iri").unwrap_or_default();
-            let relationship = rel_json(&relationship, &subject_iri, &object_iri);
-            let memberships = relationship
-                .get("scope")
-                .and_then(Value::as_array)
-                .map(|values| {
-                    values
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let fact = crate::graph::fact_envelope(
-                endpoint_json(&subject),
-                &property,
-                endpoint_json(&object),
-                &relationship,
-                &memberships,
-                None,
-            );
-            if let Some(lookup_facts) = lookups
-                .get_mut(index as usize)
-                .and_then(|lookup| lookup.get_mut("facts"))
-                .and_then(Value::as_array_mut)
-            {
-                lookup_facts.push(fact.clone());
-            }
+    let rows = fetch_all(
+        graph,
+        query(RECALL_IRI_FACTS_QUERY)
+            .param("iris", iris)
+            .param("layers", layers.clone())
+            .param("limit", i64::from(fact_limit.saturating_add(1))),
+    )
+    .await?;
+    let truncated = rows.len() > fact_limit as usize;
+    for row in rows.into_iter().take(fact_limit as usize) {
+        let (Ok(index), Ok(subject), Ok(relationship), Ok(object), Ok(property)) = (
+            row.get::<i64>("inputIndex"),
+            row.get::<Node>("s"),
+            row.get::<Relation>("r"),
+            row.get::<Node>("o"),
+            row.get::<String>("property"),
+        ) else {
+            continue;
+        };
+        let subject_iri = subject.get::<String>("iri").unwrap_or_default();
+        let object_iri = object.get::<String>("iri").unwrap_or_default();
+        let relationship = rel_json(&relationship, &subject_iri, &object_iri);
+        let memberships = relationship
+            .get("scope")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let fact = crate::graph::fact_envelope(
+            endpoint_json(&subject),
+            &property,
+            endpoint_json(&object),
+            &relationship,
+            &memberships,
+            None,
+        );
+        if let Some(lookup_facts) = lookups
+            .get_mut(index as usize)
+            .and_then(|lookup| lookup.get_mut("facts"))
+            .and_then(Value::as_array_mut)
+        {
+            lookup_facts.push(fact.clone());
+        }
+        if hops == 1 {
             facts.push(fact);
         }
     }
@@ -3123,6 +3153,7 @@ pub async fn memory_recall_iris(
     }))
 }
 
+/// Variable-length walk query for `memory_recall` `around` at the requested depth.
 fn recall_around_query(depth: u32) -> String {
     format!(
         r#"
@@ -3284,11 +3315,199 @@ pub async fn memory_recall_around(
     }))
 }
 
+const RECALL_HISTORY_FACT_QUERY: &str = r#"
+MATCH (s:Entity)-[anchor]->(o:Entity)
+WHERE anchor.iri = $iri
+  AND (size(coalesce(s.layers, [])) = 0
+       OR any(layer IN coalesce(s.layers, []) WHERE layer IN $layers))
+  AND (size(coalesce(anchor.layers, [])) = 0
+       OR any(layer IN coalesce(anchor.layers, []) WHERE layer IN $layers))
+  AND (size(coalesce(o.layers, [])) = 0
+       OR any(layer IN coalesce(o.layers, []) WHERE layer IN $layers))
+WITH s, coalesce(anchor.propertyIri, 'mindreader:property/' + type(anchor)) AS property
+MATCH (s)-[r]->(other:Entity)
+WHERE coalesce(r.propertyIri, 'mindreader:property/' + type(r)) = property
+  AND NOT type(r) IN $protected
+  AND (size(coalesce(r.layers, [])) = 0
+       OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
+  AND (size(coalesce(other.layers, [])) = 0
+       OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
+WITH s, r, other, property, r.validTo IS NULL AS current, toString(r.validTo) AS validTo
+ORDER BY current DESC, validTo DESC, r.iri ASC
+LIMIT $limit
+RETURN s, r, other AS o, property, current, validTo
+"#;
+
+const RECALL_HISTORY_NODE_QUERY: &str = r#"
+MATCH (n:Entity {iri: $iri})
+WHERE size(coalesce(n.layers, [])) = 0
+   OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers)
+MATCH (n)-[r]-(other:Entity)
+WHERE NOT type(r) IN $protected
+  AND (size(coalesce(r.layers, [])) = 0
+       OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
+  AND (size(coalesce(other.layers, [])) = 0
+       OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
+WITH startNode(r) AS s, r, endNode(r) AS o,
+     coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property,
+     r.validTo IS NULL AS current, toString(r.validTo) AS validTo
+ORDER BY current DESC, validTo DESC, r.iri ASC
+LIMIT $limit
+RETURN s, r, o, property, current, validTo
+"#;
+
+/// `memory_recall` `history` path: current and superseded facts for one handle.
+pub async fn memory_recall_history(
+    graph: &Graph,
+    iri: &str,
+    scope: Vec<String>,
+    limit: u32,
+) -> Result<Value> {
+    if !(1..=100).contains(&limit) {
+        return Err(DomainError::InvalidInput("memory_recall limit must be 1..=100".into()).into());
+    }
+    let layers = normalize_layers(scope)?;
+    let protected = SYSTEM_OWNED_RELS
+        .iter()
+        .map(|value| (*value).to_string())
+        .collect::<Vec<_>>();
+    let fact_iri = iri.starts_with("mindreader:relationship/");
+    let found_query = if fact_iri {
+        "MATCH ()-[r]->() WHERE r.iri = $iri \
+         AND (size(coalesce(r.layers, [])) = 0 \
+              OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers)) \
+         RETURN count(r) AS n"
+    } else {
+        "MATCH (n:Entity {iri: $iri}) \
+         WHERE size(coalesce(n.layers, [])) = 0 \
+            OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers) \
+         RETURN count(n) AS n"
+    };
+    let found = fetch_one(
+        graph,
+        query(found_query)
+            .param("iri", iri.to_string())
+            .param("layers", layers.clone()),
+    )
+    .await?
+    .and_then(|row| row.get::<i64>("n").ok())
+    .unwrap_or(0)
+        > 0;
+    if !found {
+        return Ok(json!({
+            "ok": true,
+            "mode": "history",
+            "scope": layers,
+            "from": iri,
+            "facts": [],
+            "nodes": [],
+            "paths": [],
+            "about": [],
+            "lookups": [{ "iri": iri, "found": false, "facts": [] }],
+            "truncated": false,
+        }));
+    }
+    let cypher = if fact_iri {
+        RECALL_HISTORY_FACT_QUERY
+    } else {
+        RECALL_HISTORY_NODE_QUERY
+    };
+    let rows = fetch_all(
+        graph,
+        query(cypher)
+            .param("iri", iri.to_string())
+            .param("layers", layers.clone())
+            .param("protected", protected)
+            .param("limit", i64::from(limit.saturating_add(1))),
+    )
+    .await?;
+    let truncated = rows.len() > limit as usize;
+    let mut facts = Vec::new();
+    let mut nodes_by_iri = std::collections::HashMap::new();
+    if !fact_iri {
+        if let Some(row) = fetch_one(
+            graph,
+            query(
+                "MATCH (n:Entity {iri: $iri}) \
+                 WHERE size(coalesce(n.layers, [])) = 0 \
+                    OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers) \
+                 RETURN n",
+            )
+            .param("iri", iri.to_string())
+            .param("layers", layers.clone()),
+        )
+        .await?
+        {
+            if let Ok(node) = row.get::<Node>("n") {
+                nodes_by_iri.insert(iri.to_string(), node_json(&node));
+            }
+        }
+    }
+    for row in rows.into_iter().take(limit as usize) {
+        let (Ok(subject), Ok(relationship), Ok(object), Ok(property), Ok(current)) = (
+            row.get::<Node>("s"),
+            row.get::<Relation>("r"),
+            row.get::<Node>("o"),
+            row.get::<String>("property"),
+            row.get::<bool>("current"),
+        ) else {
+            continue;
+        };
+        let subject_iri = subject.get::<String>("iri").unwrap_or_default();
+        let object_iri = object.get::<String>("iri").unwrap_or_default();
+        nodes_by_iri.insert(subject_iri.clone(), node_json(&subject));
+        nodes_by_iri.insert(object_iri.clone(), node_json(&object));
+        let relationship = rel_json(&relationship, &subject_iri, &object_iri);
+        let memberships = relationship
+            .get("scope")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut fact = crate::graph::fact_envelope(
+            endpoint_json(&subject),
+            &property,
+            endpoint_json(&object),
+            &relationship,
+            &memberships,
+            None,
+        );
+        fact["current"] = json!(current);
+        if let Ok(valid_to) = row.get::<String>("validTo") {
+            if !valid_to.is_empty() && valid_to != "null" {
+                fact["validTo"] = json!(valid_to);
+            }
+        }
+        facts.push(fact);
+    }
+    let mut nodes = nodes_by_iri.into_iter().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.0.cmp(&right.0));
+    let nodes = nodes.into_iter().map(|(_, node)| node).collect::<Vec<_>>();
+    Ok(json!({
+        "ok": true,
+        "mode": "history",
+        "scope": layers,
+        "from": iri,
+        "facts": facts.clone(),
+        "nodes": nodes,
+        "paths": [],
+        "about": [],
+        "lookups": [{ "iri": iri, "found": true, "facts": facts }],
+        "truncated": truncated,
+    }))
+}
+
 /// MCP `memory_write`: batched set-valued triples, one Episode if anything changed.
 pub async fn memory_write(graph: &Graph, args: WriteArgs) -> Result<Value> {
     memory_assert(graph, args).await
 }
 
+/// Load a visible current fact handle, distinguishing global-vs-named scope misses.
 async fn load_current_fact(
     graph: &Graph,
     iri: &str,
@@ -3312,10 +3531,36 @@ async fn load_current_fact(
         .param("iri", iri.to_string())
         .param("layers", layers.to_vec()),
     )
-    .await?
-    .ok_or_else(|| {
-        DomainError::Precondition("fact target is missing, hidden, or historical".to_string())
-    })?;
+    .await?;
+    let row = match row {
+        Some(row) => row,
+        None => {
+            let existing = fetch_one(
+                graph,
+                query(
+                    "MATCH ()-[r]->() WHERE r.iri = $iri AND r.validTo IS NULL \
+                     RETURN coalesce(r.layers, []) AS layers",
+                )
+                .param("iri", iri.to_string()),
+            )
+            .await?;
+            return Err(if let Some(existing) = existing {
+                let stored = existing.get::<Vec<String>>("layers").unwrap_or_default();
+                if stored.is_empty() && !layers.is_empty() {
+                    DomainError::Precondition(format!(
+                        "fact target {iri} is global; retry with scope: []"
+                    ))
+                } else {
+                    DomainError::Precondition(
+                        "fact target is missing, hidden, or historical".into(),
+                    )
+                }
+            } else {
+                DomainError::Precondition("fact target is missing, hidden, or historical".into())
+            }
+            .into());
+        }
+    };
     let subject: Node = row.get("s")?;
     let object: Node = row.get("o")?;
     let property: String = row.get("p")?;
@@ -3418,23 +3663,35 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
             "conflicts": conflicts,
         })
     };
-    Ok(json!({
-        "ok": true,
-        "scope": result.get("layers").cloned().unwrap_or_else(|| json!([])),
-        "noop": noop,
-        "episode": result.get("episode").cloned().unwrap_or(Value::Null),
-        "target": current_target,
-        "previousTarget": args.target,
-        "fact": fact,
-        "review": {
-            "unify": merge_suggestions,
-            "alternatives": if conflicts.as_array().is_some_and(|values| !values.is_empty()) {
-                json!([{ "target": current_target, "conflicts": conflicts }])
-            } else {
-                json!([])
+    let previous_target = json!(args.target);
+    let facts = if fact.is_null() {
+        Vec::new()
+    } else {
+        vec![fact.clone()]
+    };
+    Ok(finish_mutation(
+        json!({
+            "ok": true,
+            "scope": result.get("layers").cloned().unwrap_or_else(|| json!([])),
+            "noop": noop,
+            "episode": result.get("episode").cloned().unwrap_or(Value::Null),
+            "target": current_target.clone(),
+            "previousTarget": previous_target.clone(),
+            "fact": fact,
+            "review": {
+                "unify": merge_suggestions,
+                "alternatives": if conflicts.as_array().is_some_and(|values| !values.is_empty()) {
+                    json!([{ "target": current_target.clone(), "conflicts": conflicts }])
+                } else {
+                    json!([])
+                },
             },
-        },
-    }))
+        }),
+        &facts,
+        &[],
+        Some(current_target),
+        Some(previous_target),
+    ))
 }
 
 /// MCP `memory_withdraw`: soft-retract by fact IRI or subject (optional predicate).
@@ -3490,17 +3747,30 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
         .get("withdrawnTargets")
         .cloned()
         .unwrap_or_else(|| json!([]));
-    Ok(json!({
-        "ok": true,
-        "scope": result.get("layers").cloned().unwrap_or_else(|| json!([])),
-        "noop": retracted == 0,
-        "episode": result.get("episode").cloned().unwrap_or(Value::Null),
-        "retracted": retracted,
-        "withdrawnTargets": withdrawn_targets,
-        "reason": result.get("reason").cloned().unwrap_or(Value::Null),
-    }))
+    let withdrawn_facts = withdrawn_targets
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|target| json!({ "target": target }))
+        .collect::<Vec<_>>();
+    Ok(finish_mutation(
+        json!({
+            "ok": true,
+            "scope": result.get("layers").cloned().unwrap_or_else(|| json!([])),
+            "noop": retracted == 0,
+            "episode": result.get("episode").cloned().unwrap_or(Value::Null),
+            "retracted": retracted,
+            "withdrawnTargets": withdrawn_targets,
+            "reason": result.get("reason").cloned().unwrap_or(Value::Null),
+        }),
+        &withdrawn_facts,
+        &[],
+        None,
+        None,
+    ))
 }
 
+/// Map `strengthen`/`weaken` to a single +1 or -1 weight step.
 fn judge_delta(mode: &str) -> Result<i64> {
     match mode {
         "strengthen" => Ok(1),
@@ -3512,6 +3782,7 @@ fn judge_delta(mode: &str) -> Result<i64> {
     }
 }
 
+/// Require 1..=20 unique rateable targets before the judge transaction starts.
 fn validate_judge_args(args: &JudgeArgs) -> Result<()> {
     if args.ratings.is_empty() || args.ratings.len() > MAX_ASSERT_FACTS {
         return Err(DomainError::InvalidInput(format!(
@@ -3535,6 +3806,7 @@ fn validate_judge_args(args: &JudgeArgs) -> Result<()> {
     Ok(())
 }
 
+/// Apply one ±1 rating to a visible current node or fact; saturate at i64 bounds.
 async fn apply_judge_rating_txn(
     txn: &mut Txn,
     scope: &[String],
@@ -3700,14 +3972,30 @@ async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
             return Err(error);
         }
     };
-    Ok(json!({
-        "ok": true,
-        "scope": scope,
-        "noop": false,
-        "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
-        "summary": { "requested": items.len(), "changed": items.len(), "noop": 0 },
-        "items": items,
-    }))
+    let judge_facts = items
+        .iter()
+        .filter(|item| item.pointer("/target/kind").and_then(Value::as_str) == Some("fact"))
+        .map(|item| json!({ "target": item.get("target") }))
+        .collect::<Vec<_>>();
+    let judge_nodes = items
+        .iter()
+        .filter(|item| item.pointer("/target/kind").and_then(Value::as_str) == Some("node"))
+        .filter_map(|item| item.get("target").cloned())
+        .collect::<Vec<_>>();
+    Ok(finish_mutation(
+        json!({
+            "ok": true,
+            "scope": scope,
+            "noop": false,
+            "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
+            "summary": { "requested": items.len(), "changed": items.len(), "noop": 0 },
+            "items": items,
+        }),
+        &judge_facts,
+        &judge_nodes,
+        None,
+        None,
+    ))
 }
 
 /// Apply 1–20 explicit ratings atomically under one `memory_judge` Episode.
@@ -3740,6 +4028,7 @@ struct PlannedPlaceEdit {
     removed: Vec<String>,
 }
 
+/// Validate 1..=20 unique membership edits; `scope` stays visibility, not the change.
 fn normalize_place_args(args: PlaceArgs) -> Result<(Vec<String>, Vec<NormalizedPlaceEdit>)> {
     if args.edits.is_empty() || args.edits.len() > MAX_ASSERT_FACTS {
         return Err(DomainError::InvalidInput(format!(
@@ -3881,6 +4170,7 @@ async fn acquire_place_closure_locks_txn(
     acquire_fact_locks_in_txn(txn, &locks).await
 }
 
+/// Compute the membership list after add/remove; emptying a named record makes it global.
 fn planned_memberships(before: &[String], edit: &NormalizedPlaceEdit) -> PlannedPlaceEdit {
     let mut after = before
         .iter()
@@ -3909,6 +4199,7 @@ fn planned_memberships(before: &[String], edit: &NormalizedPlaceEdit) -> Planned
     }
 }
 
+/// Reject a batch whose final memberships would expose a fact while an endpoint is hidden.
 async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit]) -> Result<()> {
     let node_iris = planned
         .iter()
@@ -4127,16 +4418,32 @@ async fn memory_place_once(
             })
         })
         .collect::<Vec<_>>();
-    Ok(json!({
-        "ok": true,
-        "scope": scope,
-        "noop": changed == 0,
-        "episode": episode.map(|episode| json!({
-            "iri": episode.iri, "at": episode.at, "tool": episode.tool
-        })).unwrap_or(Value::Null),
-        "summary": { "requested": items.len(), "changed": changed, "noop": items.len() - changed },
-        "items": items,
-    }))
+    let place_facts = items
+        .iter()
+        .filter(|item| item.pointer("/target/kind").and_then(Value::as_str) == Some("fact"))
+        .map(|item| json!({ "target": item.get("target") }))
+        .collect::<Vec<_>>();
+    let place_nodes = items
+        .iter()
+        .filter(|item| item.pointer("/target/kind").and_then(Value::as_str) == Some("node"))
+        .filter_map(|item| item.get("target").cloned())
+        .collect::<Vec<_>>();
+    Ok(finish_mutation(
+        json!({
+            "ok": true,
+            "scope": scope,
+            "noop": changed == 0,
+            "episode": episode.map(|episode| json!({
+                "iri": episode.iri, "at": episode.at, "tool": episode.tool
+            })).unwrap_or(Value::Null),
+            "summary": { "requested": items.len(), "changed": changed, "noop": items.len() - changed },
+            "items": items,
+        }),
+        &place_facts,
+        &place_nodes,
+        None,
+        None,
+    ))
 }
 
 /// Apply 1–20 membership edits atomically against their combined final state.

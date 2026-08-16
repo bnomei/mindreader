@@ -22,7 +22,7 @@ where
     Ok(layers)
 }
 
-/// Return the deterministic request scope used by graph queries.
+/// Clone the already-validated request `scope`; empty remains global-only.
 pub fn visible_layers(requested: &[LayerId]) -> Vec<LayerId> {
     requested.to_vec()
 }

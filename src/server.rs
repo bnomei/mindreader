@@ -217,6 +217,8 @@ fn node_schema() -> Value {
             "weight": { "type": "integer" },
             "stub": { "type": "boolean" },
             "tool": { "type": "string" },
+            "rateable": { "type": "boolean" },
+            "mutable": { "type": "boolean" },
             "target": target_schema_with_kinds(&["node"], "Pasteable node handle.")
         },
         "required": ["iri"]
@@ -270,7 +272,11 @@ fn fact_schema() -> Value {
             "weight": { "type": "integer" },
             "rank": { "type": "integer", "minimum": 1 },
             "conflicts": { "type": "array", "items": conflict_schema() },
-            "noop": { "type": "boolean" }
+            "noop": { "type": "boolean" },
+            "current": { "type": "boolean" },
+            "rateable": { "type": "boolean" },
+            "mutable": { "type": "boolean" },
+            "validTo": { "type": "string" }
         },
         "required": ["target", "s", "p", "o"]
     })
@@ -314,6 +320,60 @@ fn episode_schema() -> Value {
     })
 }
 
+fn node_handle_schema(description: &str) -> Value {
+    target_schema_with_kinds(&["node"], description)
+}
+
+fn handles_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Pasteable identities from this result. Empty arrays and nulls are unused roles, not commands.",
+        "properties": {
+            "facts": { "type": "array", "items": fact_target_schema() },
+            "nodes": { "type": "array", "items": node_handle_schema("Pasteable node handle.") },
+            "current": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "properties": {
+                    "kind": { "type": "string", "enum": ["node", "fact"] },
+                    "iri": { "type": "string", "minLength": 1 }
+                }
+            },
+            "retired": {
+                "type": ["object", "null"],
+                "additionalProperties": false,
+                "properties": {
+                    "kind": { "type": "string", "enum": ["node", "fact"] },
+                    "iri": { "type": "string", "minLength": 1 }
+                }
+            },
+            "unify": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "source": node_handle_schema("Absorbed node handle."),
+                        "target": node_handle_schema("Surviving node handle.")
+                    },
+                    "required": ["source", "target"]
+                }
+            }
+        },
+        "required": ["facts", "nodes", "current", "retired", "unify"]
+    })
+}
+
+fn detail_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["concise", "detailed"],
+        "default": "detailed",
+        "description": "concise returns handles plus thin s/p/o lines. detailed is the full envelope."
+    })
+}
+
 fn review_schema() -> Value {
     json!({
         "type": "object",
@@ -325,20 +385,27 @@ fn review_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "source": node_schema(),
-                        "target": node_schema(),
-                        "similarity": { "type": "number", "minimum": 0, "maximum": 1 },
-                        "merge": {
+                        "source": {
                             "type": "object",
-                            "additionalProperties": false,
                             "properties": {
-                                "source": { "type": "string", "minLength": 1 },
-                                "target": { "type": "string", "minLength": 1 }
+                                "kind": { "type": "string", "enum": ["node"] },
+                                "iri": { "type": "string" },
+                                "name": { "type": ["string", "null"] }
                             },
-                            "required": ["source", "target"]
-                        }
+                            "required": ["kind", "iri"]
+                        },
+                        "target": {
+                            "type": "object",
+                            "properties": {
+                                "kind": { "type": "string", "enum": ["node"] },
+                                "iri": { "type": "string" },
+                                "name": { "type": ["string", "null"] }
+                            },
+                            "required": ["kind", "iri"]
+                        },
+                        "similarity": { "type": "number", "minimum": 0, "maximum": 1 }
                     },
-                    "required": ["source", "target", "similarity", "merge"]
+                    "required": ["source", "target", "similarity"]
                 }
             },
             "alternatives": {
@@ -371,6 +438,7 @@ fn summary_schema() -> Value {
     })
 }
 
+/// Process-local token bucket for MCP `#[tool]` handlers only.
 struct TokenBucket {
     inner: Mutex<TokenBucketState>,
 }
@@ -390,6 +458,7 @@ impl TokenBucket {
         }
     }
 
+    /// Take one token from the process-local 120/min burst-20 bucket.
     fn try_acquire(&self) -> std::result::Result<(), u64> {
         let mut state = self
             .inner
@@ -466,6 +535,7 @@ impl Mindreader {
         names
     }
 
+    /// Rate-limit and time-box one MCP `#[tool]` call after lazy Neo4j connect.
     async fn invoke<F, Fut>(&self, op: F) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(MemoryService) -> Fut,
@@ -498,6 +568,7 @@ impl Mindreader {
     }
 }
 
+/// Recoverable tool failure as `isError` with `{ok:false,reason,message,retryable,outcome}`.
 fn structured_error(reason: &str, message: impl std::fmt::Display) -> CallToolResult {
     let (retryable, outcome) = error_retry_metadata(reason);
     CallToolResult::structured_error(json!({
@@ -553,11 +624,13 @@ fn map_tool_result(result: AppResult<Value>) -> CallToolResult {
     }
 }
 
+/// Map application errors to MCP `reason` codes; domain validation stays `invalid_input`.
 fn classify_tool_error(error: &Error) -> &'static str {
     match error {
         Error::Domain(DomainError::InvalidInput(_)) => "invalid_input",
         Error::Domain(DomainError::Precondition(_)) => "precondition_failed",
         Error::ConcurrentMutation(_) => "concurrent_mutation",
+        // Setup and missing-key failures; HTTP status variants map separately.
         Error::Embedding(_) => "missing_embedding",
         Error::EmbeddingHttp { status: 429, .. } => "rate_limited",
         Error::EmbeddingHttp { .. } => "embedding_http",
@@ -646,6 +719,12 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
                 "maximum": 3,
                 "default": 1
             },
+            "history": {
+                "type": "string",
+                "minLength": 1,
+                "description": "One node or fact IRI. Returns current and historical facts for that identity."
+            },
+            "detail": detail_schema(),
             "limit": {
                 "type": "integer",
                 "description": "Maximum returned facts across the selected mode.",
@@ -676,6 +755,7 @@ fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
                 "uniqueItems": true,
                 "items": label_schema()
             },
+            "detail": detail_schema(),
             "limit": {
                 "type": "integer",
                 "description": "Maximum fused semantic results.",
@@ -777,16 +857,8 @@ fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "source": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Same-kind node IRI that will be permanently absorbed."
-            },
-            "target": {
-                "type": "string",
-                "minLength": 1,
-                "description": "Same-kind surviving node IRI whose identity and name remain."
-            }
+            "source": node_handle_schema("Same-kind node that will be permanently absorbed."),
+            "target": node_handle_schema("Same-kind surviving node whose identity and name remain.")
         },
         "required": ["source", "target"]
     }))
@@ -794,7 +866,9 @@ fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
 
 fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
-        "mode": { "type": "string", "enum": ["text", "iris", "labels", "catalog", "around"] },
+        "mode": { "type": "string", "enum": ["text", "iris", "labels", "catalog", "around", "history"] },
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
+        "handles": handles_schema(),
         "scope": scope_schema(),
         "facts": { "type": "array", "items": fact_schema() },
         "nodes": { "type": "array", "items": node_schema() },
@@ -833,6 +907,8 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
 fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "mode": { "type": "string", "enum": ["semantic"] },
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
+        "handles": handles_schema(),
         "scope": scope_schema(),
         "facts": { "type": "array", "items": fact_schema() },
         "nodes": { "type": "array", "items": node_schema() },
@@ -873,7 +949,8 @@ fn schema_out_memory_write() -> Arc<rmcp::model::JsonObject> {
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
         "facts": { "type": "array", "items": fact_schema() },
-        "review": review_schema()
+        "review": review_schema(),
+        "handles": handles_schema()
     })))
 }
 
@@ -885,7 +962,8 @@ fn schema_out_memory_revise() -> Arc<rmcp::model::JsonObject> {
         "target": fact_target_schema(),
         "previousTarget": fact_target_schema(),
         "fact": nullable_fact_schema(),
-        "review": review_schema()
+        "review": review_schema(),
+        "handles": handles_schema()
     })))
 }
 
@@ -896,7 +974,8 @@ fn schema_out_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
         "episode": episode_schema(),
         "retracted": { "type": "integer" },
         "withdrawnTargets": { "type": "array", "items": fact_target_schema() },
-        "reason": { "type": ["string", "null"] }
+        "reason": { "type": ["string", "null"] },
+        "handles": handles_schema()
     })))
 }
 
@@ -922,7 +1001,8 @@ fn schema_out_memory_judge() -> Arc<rmcp::model::JsonObject> {
                 },
                 "required": ["index", "target", "mode", "delta", "before", "after", "status"]
             }
-        }
+        },
+        "handles": handles_schema()
     })))
 }
 
@@ -948,7 +1028,8 @@ fn schema_out_memory_place() -> Arc<rmcp::model::JsonObject> {
                 },
                 "required": ["index", "target", "before", "memberships", "added", "removed", "status"]
             }
-        }
+        },
+        "handles": handles_schema()
     })))
 }
 
@@ -956,7 +1037,8 @@ fn schema_out_memory_unify() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
-        "node": node_schema()
+        "node": node_schema(),
+        "handles": handles_schema()
     })))
 }
 
@@ -965,7 +1047,7 @@ impl Mindreader {
     #[tool(
         name = "memory_recall",
         title = "Recall visible memory",
-        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, or around; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris; p and depth apply only to around, with predicates filtered before limiting and paths[i] giving the deterministic shortest witness for facts[i]. Class or Property labels read the global catalog.",
+        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris (0 still returns incident fact handles on lookups); p and depth apply only to around; history walks current and validTo/SUPERSEDES facts for one node or fact IRI. detail is concise or detailed. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -981,7 +1063,7 @@ impl Mindreader {
     #[tool(
         name = "memory_recall_semantic",
         title = "Recall by meaning",
-        description = "Use for conceptual recall when lexical memory_recall is insufficient. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. The call maintains expiring semantic activations, so it is neither read-only nor idempotent.",
+        description = "Use for conceptual recall when lexical memory_recall is insufficient. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. detail is concise or detailed. The call maintains expiring semantic activations, so it is neither read-only nor idempotent.",
         input_schema = schema_memory_recall_semantic(),
         output_schema = schema_out_memory_recall_semantic(),
         annotations(title = "Recall by meaning", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
@@ -1077,7 +1159,7 @@ impl Mindreader {
     #[tool(
         name = "memory_unify",
         title = "Permanently unify nodes",
-        description = "Use only after reviewing review.unify and confirming two same-kind nodes are identical. This database-wide operation permanently absorbs source into target; target IRI and name survive. Reverse the pair when the other identity should survive. It has no scope because all memberships and history must be reconciled.",
+        description = "Use only after reviewing review.unify and confirming two same-kind nodes are identical. source and target are pasteable node handles {kind:\"node\", iri}. This database-wide operation permanently absorbs source into target; target IRI and name survive. Reverse the pair when the other identity should survive. It has no scope because all memberships and history must be reconciled.",
         input_schema = schema_memory_unify(),
         output_schema = schema_out_memory_unify(),
         annotations(title = "Permanently unify nodes", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
@@ -1101,7 +1183,7 @@ impl ServerHandler for Mindreader {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "scope is an OR-union ([] is global-only). Recall before write; use memory_recall_semantic only for conceptual retrieval because it calls the embedding provider and updates activations. Write facts[] (1-20). Paste returned targets into revise, withdraw, judge, or place edits[]. Review review.unify before unifying. Never send Cypher or assert CONTRADICTS/SUPERSEDES.",
+                "scope is an OR-union ([] is global-only). One memory_recall selector (text, iris, labels, around, or history), or skip recall when the write is already exact. Use memory_recall_semantic only for conceptual retrieval because it calls the embedding provider and updates activations. Write facts[] (1-20). Paste returned target handles into revise, withdraw, judge, place, or unify. Review review.unify before unifying. Never send Cypher or assert CONTRADICTS/SUPERSEDES.",
             )
     }
 
@@ -1476,6 +1558,11 @@ mod tests {
         assert_eq!(recall["properties"]["iris"]["maxItems"], 20);
         assert_eq!(recall["properties"]["depth"]["minimum"], 1);
         assert_eq!(recall["properties"]["depth"]["maximum"], 3);
+        assert_eq!(
+            recall["properties"]["detail"]["enum"],
+            serde_json::json!(["concise", "detailed"])
+        );
+        assert!(recall["properties"].get("history").is_some());
         assert!(recall["properties"].get("semantic").is_none());
 
         let semantic = tools

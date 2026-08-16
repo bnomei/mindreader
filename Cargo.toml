@@ -18,7 +18,7 @@ include = [
   "/CONTRIBUTING.md",
   "/mcp.json",
   "/scripts/mcp_handshake_probe.py",
-  "/skills/writing-to-mindreader/SKILL.md",
+  "/skills/using-mindreader/**",
 ]
 keywords = ["mcp", "neo4j", "knowledge-graph", "memory", "semantic-search"]
 repository = "https://github.com/bnomei/mindreader"

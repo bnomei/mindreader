@@ -35,6 +35,7 @@ struct Report {
     failed: u32,
 }
 
+/// Deterministic 3-d fixture used when no remote embedding key is configured.
 struct SmokeEmbedding;
 
 #[async_trait]
@@ -324,6 +325,7 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Connect, exercise the eight tools and graph contracts, and leave fixtures in place.
 async fn run() -> Result<u32> {
     let mut args = std::env::args().skip(1);
     let cfg = match (args.next().as_deref(), args.next(), args.next()) {
@@ -1393,6 +1395,8 @@ async fn run() -> Result<u32> {
             hops: Some(1),
             p: None,
             depth: None,
+            history: None,
+            detail: None,
             limit: Some(1),
         })
         .await?;
@@ -1416,6 +1420,8 @@ async fn run() -> Result<u32> {
             hops: None,
             p: Some(vec![format!("not-{property}")]),
             depth: Some(1),
+            history: None,
+            detail: None,
             limit: Some(1),
         })
         .await?;
@@ -1429,6 +1435,8 @@ async fn run() -> Result<u32> {
             hops: None,
             p: Some(vec![property.clone()]),
             depth: Some(1),
+            history: None,
+            detail: None,
             limit: Some(1),
         })
         .await?;
@@ -1442,6 +1450,8 @@ async fn run() -> Result<u32> {
             hops: None,
             p: None,
             depth: None,
+            history: None,
+            detail: None,
             limit: Some(100),
         })
         .await?;
@@ -1510,6 +1520,71 @@ async fn run() -> Result<u32> {
         &catalog,
     );
 
+    let hops0 = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone(), layer_c.clone()],
+            text: None,
+            iris: Some(vec![closure_subject.clone()]),
+            labels: None,
+            around: None,
+            hops: Some(0),
+            p: None,
+            depth: None,
+            history: None,
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let history_iri = witnessed_around
+        .pointer("/facts/0/target/iri")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let history = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone(), layer_c.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            history: Some(history_iri.clone()),
+            detail: None,
+            limit: Some(20),
+        })
+        .await?;
+    report.check(
+        "memory_recall hops 0 still returns incident fact handles, concise detail, and history walks a fact",
+        hops0.get("mode").and_then(Value::as_str) == Some("iris")
+            && hops0
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty)
+            && hops0
+                .pointer("/lookups/0/facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| !facts.is_empty())
+            && hops0.get("detail").and_then(Value::as_str) == Some("concise")
+            && hops0
+                .pointer("/handles/facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| !facts.is_empty())
+            && history.get("mode").and_then(Value::as_str) == Some("history")
+            && history
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| {
+                    facts.iter().any(|fact| {
+                        fact.pointer("/target/iri").and_then(Value::as_str)
+                            == Some(history_iri.as_str())
+                            && fact.get("current").and_then(Value::as_bool) == Some(true)
+                    })
+                }),
+        format!("hops0={hops0} history={history}"),
+    );
+
     let merge_short = tools::memory_assert(
         &graph,
         assert_args(
@@ -1541,18 +1616,15 @@ async fn run() -> Result<u32> {
         .and_then(Value::as_array)
         .is_some_and(|items| {
             items.iter().any(|item| {
-                item.pointer("/merge/source").and_then(Value::as_str) == Some(long_iri.as_str())
-                    && item.pointer("/merge/target").and_then(Value::as_str)
+                item.pointer("/source/iri").and_then(Value::as_str) == Some(long_iri.as_str())
+                    && item.pointer("/target/iri").and_then(Value::as_str)
                         == Some(short_iri.as_str())
             })
         });
     let (survivor, merge_feedback) = tokio::try_join!(
         memory_merge(
             &graph,
-            MergeArgs {
-                source: long_iri.clone(),
-                target: short_iri.clone(),
-            },
+            MergeArgs::from_iris(long_iri.clone(), short_iri.clone()),
         ),
         tools::memory_feedback(
             &graph,
@@ -1669,10 +1741,7 @@ async fn run() -> Result<u32> {
     .await?;
     memory_merge(
         &graph,
-        MergeArgs {
-            source: source_property_iri.clone(),
-            target: target_property_iri.clone(),
-        },
+        MergeArgs::from_iris(source_property_iri.clone(), target_property_iri.clone()),
     )
     .await?;
     let property_state = fetch_one(
@@ -1690,26 +1759,20 @@ async fn run() -> Result<u32> {
     .ok_or_else(|| operation_error!("property merge aggregate returned no row"))?;
     let wrong_kind = memory_merge(
         &graph,
-        MergeArgs {
-            source: short_iri.clone(),
-            target: target_property_iri.clone(),
-        },
+        MergeArgs::from_iris(short_iri.clone(), target_property_iri.clone()),
     )
     .await;
     let incompatible_property = memory_merge(
         &graph,
-        MergeArgs {
-            source: target_property_iri.clone(),
-            target: "mindreader:property/ABOUT".into(),
-        },
+        MergeArgs::from_iris(target_property_iri.clone(), "mindreader:property/ABOUT"),
     )
     .await;
     let system_property = memory_merge(
         &graph,
-        MergeArgs {
-            source: target_property_iri.clone(),
-            target: "mindreader:property/CONTRADICTS".into(),
-        },
+        MergeArgs::from_iris(
+            target_property_iri.clone(),
+            "mindreader:property/CONTRADICTS",
+        ),
     )
     .await;
     report.check(
@@ -1755,6 +1818,7 @@ async fn run() -> Result<u32> {
         scope: vec![layer_a],
         text: semantic_text,
         labels: None,
+        detail: None,
         limit: Some(20),
     };
     let semantic_first = memory_semantic_search(

@@ -17,10 +17,12 @@ pub mod graph;
 pub mod iri;
 pub mod layers;
 pub mod merge;
+pub mod payload;
 pub mod search;
 pub mod semantic;
 pub mod server;
 pub mod service;
 pub mod tools;
 
+/// Stdio MCP server: eight tools, lazy Neo4j, and the process-local invoke limiter.
 pub use server::Mindreader;

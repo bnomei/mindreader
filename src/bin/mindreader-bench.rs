@@ -28,6 +28,7 @@ struct Options {
     samples: usize,
 }
 
+/// Parse `--config-dir`, `--entities`, and `--samples` for a disposable-database run.
 fn parse_options() -> Result<Options> {
     let mut config_dir = None;
     let mut entities = DEFAULT_ENTITIES;
@@ -91,6 +92,7 @@ fn summary(mut timings_ms: Vec<f64>) -> Value {
     })
 }
 
+/// Create a disposable ranked-search corpus in the configured database.
 async fn seed(
     graph: &Graph,
     prefix: &str,
@@ -344,6 +346,7 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Seed, warm indexes, then sample ranked search, lock, and merge-suggestion latency.
 async fn run() -> Result<Value> {
     let options = parse_options()?;
     let config = match options.config_dir {

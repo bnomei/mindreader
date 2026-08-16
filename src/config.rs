@@ -101,6 +101,7 @@ impl Default for SemanticConfig {
 }
 
 impl SemanticConfig {
+    /// Reject non-positive TTL, out-of-range neighbor/RRF knobs, or non-finite thresholds.
     fn validate(&self) -> Result<()> {
         if self.ttl_days == 0 {
             return Err(config_error!("semantic.ttl_days must be greater than zero"));
@@ -165,6 +166,7 @@ pub enum EmbeddingProviderKind {
 }
 
 impl EmbeddingProviderKind {
+    /// Stable provider id stored on the Neo4j embedding-space marker.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
@@ -183,6 +185,7 @@ pub struct SelectedEmbedding {
 }
 
 impl SelectedEmbedding {
+    /// Provider/model/dimension identity used to accept or rebuild the vector index.
     pub fn space(&self) -> EmbeddingSpace {
         EmbeddingSpace {
             provider: self.provider.as_str().into(),
@@ -218,6 +221,7 @@ pub fn config_dir() -> Result<PathBuf> {
     Ok(base.config_dir().join("mindreader"))
 }
 
+/// Create-only write; existing files are left untouched. Secret files use mode 0600 on Unix.
 fn write_new_file(path: &Path, contents: &str, secret: bool) -> Result<()> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -236,6 +240,7 @@ fn write_new_file(path: &Path, contents: &str, secret: bool) -> Result<()> {
     Ok(())
 }
 
+/// Create the config directory and seed `config.toml` plus a colocated `.env` without overwriting.
 fn initialize_directory(path: &Path) -> Result<()> {
     fs::create_dir_all(path)
         .with_context(|| format!("create Mindreader config directory {}", path.display()))?;
@@ -265,6 +270,7 @@ fn prefer_nonempty(process: Option<String>, file: Option<String>) -> Option<Stri
     nonempty(process).or_else(|| nonempty(file))
 }
 
+/// Prefer a non-empty process environment value over the colocated `.env` entry.
 fn resolve_secret(name: &str, file: &HashMap<String, String>) -> Option<String> {
     prefer_nonempty(env::var(name).ok(), file.get(name).cloned())
 }
@@ -354,6 +360,7 @@ impl Config {
     }
 }
 
+/// Require a model id and 1..=4096 dimensions once an API key is present.
 fn selected_embedding(
     provider: EmbeddingProviderKind,
     config: &ProviderConfig,

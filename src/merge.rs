@@ -6,11 +6,12 @@
 //! Writes may attach [`merge_suggestions_in_txn`] results as review-only
 //! `{source,target}` IRI pairs.
 
-use crate::domain::DomainError;
+use crate::domain::{DomainError, NodeHandle};
 use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, fetch_all_txn, fetch_one_txn, node_json,
     structural_rel_for, Episode,
 };
+use crate::payload::{finish_mutation, unify_review_item};
 use crate::{
     error::{Error, Result},
     operation_error,
@@ -73,11 +74,21 @@ fn lucene_fuzzy_term(name: &str) -> String {
     query
 }
 
-/// MCP `memory_unify` arguments: surviving `target` IRI absorbs `source`.
+/// MCP `memory_unify` arguments: surviving `target` node absorbs `source`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MergeArgs {
-    pub source: String,
-    pub target: String,
+    pub source: NodeHandle,
+    pub target: NodeHandle,
+}
+
+impl MergeArgs {
+    /// Build unify arguments from two node IRIs (smoke, bench, and in-process callers).
+    pub fn from_iris(source: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            source: NodeHandle::from_iri(source),
+            target: NodeHandle::from_iri(target),
+        }
+    }
 }
 
 /// Permanently unify two same-kind nodes; MCP name is `memory_unify`.
@@ -97,9 +108,12 @@ fn is_transient(error: &Error) -> bool {
     error.is_transient_neo4j() || matches!(error, Error::ConcurrentMutation(_))
 }
 
+/// One unify attempt: validate kinds, move history in one transaction, commit or roll back.
 async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
-    let source = args.source.trim();
-    let target = args.target.trim();
+    let source = args.source.iri()?.to_string();
+    let target = args.target.iri()?.to_string();
+    let source = source.as_str();
+    let target = target.as_str();
     if source.is_empty() || target.is_empty() {
         return Err(DomainError::InvalidInput("source and target must not be empty".into()).into());
     }
@@ -346,16 +360,24 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     )
     .await?;
     consolidate_current_duplicates(txn, target_iri, property_merge, &episode).await?;
-    Ok(json!({
-        "ok": true,
-        "noop": false,
-        "node": node_json(&merged_node),
-        "episode": {
-            "iri": episode.iri,
-            "at": episode.at,
-            "tool": episode.tool,
-        },
-    }))
+    let node = node_json(&merged_node);
+    let current = node.get("target").cloned();
+    Ok(finish_mutation(
+        json!({
+            "ok": true,
+            "noop": false,
+            "node": node.clone(),
+            "episode": {
+                "iri": episode.iri,
+                "at": episode.at,
+                "tool": episode.tool,
+            },
+        }),
+        &[],
+        &[node],
+        current,
+        None,
+    ))
 }
 
 fn canonical_kinds(node: &Node) -> BTreeSet<String> {
@@ -366,6 +388,7 @@ fn canonical_kinds(node: &Node) -> BTreeSet<String> {
         .collect()
 }
 
+/// Require both nodes to share exactly one canonical kind (Class, Property, Element, or Spike).
 fn require_same_kind(source: &Node, target: &Node) -> Result<String> {
     let source_kinds = canonical_kinds(source);
     let target_kinds = canonical_kinds(target);
@@ -378,6 +401,7 @@ fn require_same_kind(source: &Node, target: &Node) -> Result<String> {
     Ok(source_kinds.into_iter().next().expect("one kind checked"))
 }
 
+/// Forbid merging system-owned Properties or Properties with different structural types.
 fn require_compatible_property_merge(source_iri: &str, target_iri: &str) -> Result<()> {
     let source_rel = structural_rel_for(source_iri);
     let target_rel = structural_rel_for(target_iri);
@@ -407,6 +431,7 @@ fn is_bootstrap_seeded(iri: &str) -> bool {
     BOOTSTRAP_SEEDED_IRIS.contains(&iri)
 }
 
+/// Reject Literal, Episode, lock, meta, and activation nodes as unify endpoints.
 fn reject_internal_node(node: &Node, field: &str) -> Result<()> {
     if node.labels().iter().any(|label| {
         FORBIDDEN_ENTITY_LABELS
@@ -421,6 +446,7 @@ fn reject_internal_node(node: &Node, field: &str) -> Result<()> {
     Ok(())
 }
 
+// Prefer `weightText` so signed weights survive neo4rs 0.8 integer decoding.
 fn node_weight(node: &Node) -> i64 {
     node.get::<String>("weightText")
         .ok()
@@ -436,6 +462,7 @@ fn relation_weight(relation: &Relation) -> i64 {
         .unwrap_or_else(|| relation.get::<i64>("weight").unwrap_or(0))
 }
 
+/// Union named memberships; either empty list is global and wins.
 fn merge_memberships(left: &[String], right: &[String]) -> Vec<String> {
     if left.is_empty() || right.is_empty() {
         return Vec::new();
@@ -758,12 +785,13 @@ pub async fn merge_suggestions_in_txn(
         } else {
             (created_iri, created_name, candidate_iri, candidate_name)
         };
-        suggestions.push(json!({
-            "source": { "iri": source, "name": source_name },
-            "target": { "iri": target, "name": target_name },
-            "similarity": row.get::<f64>("similarity")?,
-            "merge": { "source": source, "target": target },
-        }));
+        suggestions.push(unify_review_item(
+            &source,
+            &source_name,
+            &target,
+            &target_name,
+            row.get::<f64>("similarity")?,
+        ));
     }
     suggestions.sort_by(|left, right| {
         right["similarity"]
@@ -781,7 +809,10 @@ pub async fn merge_suggestions_in_txn(
                     .cmp(&right["target"]["iri"].as_str())
             })
     });
-    suggestions.dedup_by(|left, right| left["merge"] == right["merge"]);
+    suggestions.dedup_by(|left, right| {
+        left["source"]["iri"] == right["source"]["iri"]
+            && left["target"]["iri"] == right["target"]["iri"]
+    });
     Ok(suggestions)
 }
 

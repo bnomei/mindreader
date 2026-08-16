@@ -53,36 +53,48 @@ impl MemoryService {
     pub async fn recall(&self, args: RecallArgs) -> Result<Value> {
         validate_recall_args(&args)?;
         let scope = args.scope.clone();
-        if let Some(around) = args
+        let detail = crate::payload::Detail::parse(args.detail.as_deref())?;
+        let result = if let Some(history) = args
+            .history
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            tools::memory_recall_history(
+                &self.graph,
+                history,
+                scope.clone(),
+                args.limit.unwrap_or(20),
+            )
+            .await?
+        } else if let Some(around) = args
             .around
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            return tools::memory_recall_around(
+            tools::memory_recall_around(
                 &self.graph,
                 around,
-                scope,
+                scope.clone(),
                 args.p.unwrap_or_default(),
                 args.depth.unwrap_or(1),
                 args.limit.unwrap_or(20),
             )
-            .await;
-        }
-        if let Some(iris) = args
+            .await?
+        } else if let Some(iris) = args
             .iris
             .filter(|values| values.iter().any(|value| !value.trim().is_empty()))
         {
-            return tools::memory_recall_iris(
+            tools::memory_recall_iris(
                 &self.graph,
                 iris,
-                scope,
+                scope.clone(),
                 args.hops.unwrap_or(0),
                 args.limit.unwrap_or(20),
             )
-            .await;
-        }
-        if let Some(labels) = args
+            .await?
+        } else if let Some(labels) = args
             .labels
             .filter(|values| values.iter().any(|value| !value.trim().is_empty()))
         {
@@ -102,7 +114,7 @@ impl MemoryService {
                 }
                 let truncated = items.len() > args.limit.unwrap_or(20) as usize;
                 items.truncate(args.limit.unwrap_or(20) as usize);
-                return Ok(json!({
+                json!({
                     "ok": true,
                     "mode": "catalog",
                     "scope": scope,
@@ -112,29 +124,32 @@ impl MemoryService {
                     "about": [],
                     "lookups": [],
                     "truncated": truncated,
-                }));
+                })
+            } else {
+                search::memory_search(
+                    &self.graph,
+                    SearchArgs {
+                        layers: scope.clone(),
+                        text: None,
+                        labels: Some(labels),
+                        limit: args.limit,
+                    },
+                )
+                .await?
             }
-            return search::memory_search(
+        } else {
+            search::memory_search(
                 &self.graph,
                 SearchArgs {
-                    layers: scope,
-                    text: None,
-                    labels: Some(labels),
+                    layers: scope.clone(),
+                    text: args.text,
+                    labels: None,
                     limit: args.limit,
                 },
             )
-            .await;
-        }
-        search::memory_search(
-            &self.graph,
-            SearchArgs {
-                layers: scope,
-                text: args.text,
-                labels: None,
-                limit: args.limit,
-            },
-        )
-        .await
+            .await?
+        };
+        Ok(crate::payload::finish_recall(result, &scope, detail))
     }
 
     /// MCP `memory_write`: batched set-valued triples under one `scope`.
@@ -168,6 +183,7 @@ impl MemoryService {
     }
 }
 
+/// Always-global Class/Property catalog row (`layers=[]`) for `memory_recall` labels.
 fn catalog_node(value: &Value, label: &str) -> Value {
     let iri = value.get("iri").cloned().unwrap_or(Value::Null);
     json!({

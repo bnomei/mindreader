@@ -1,0 +1,4 @@
+interface:
+  display_name: "Using Mindreader"
+  short_description: "Recall and maintain durable graph memory"
+  default_prompt: "Use $using-mindreader to recall and maintain durable context for this task."

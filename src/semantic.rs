@@ -40,6 +40,8 @@ pub struct SemanticSearchArgs {
     #[serde(default)]
     pub labels: Option<Vec<String>>,
     #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
     pub limit: Option<u32>,
 }
 
@@ -62,14 +64,17 @@ impl SemanticRuntime {
         }))
     }
 
+    /// Selected embedding backend id (`openai`, `xai`, or a fixture).
     pub fn provider(&self) -> &'static str {
         self.provider.provider()
     }
 
+    /// Model id the backend will embed with.
     pub fn model(&self) -> &str {
         self.provider.model()
     }
 
+    /// Vector length the Neo4j activation index and HTTP provider must share.
     pub fn dimensions(&self) -> usize {
         self.provider.dimensions()
     }
@@ -134,6 +139,7 @@ pub fn validate_semantic_search_args(args: &SemanticSearchArgs) -> Result<()> {
             .into());
         }
     }
+    crate::payload::Detail::parse(args.detail.as_deref())?;
     Ok(())
 }
 
@@ -272,19 +278,24 @@ pub async fn memory_semantic_search(
     )
     .await?;
 
-    Ok(json!({
-        "ok": true,
-        "mode": "semantic",
-        "facts": facts,
-        "nodes": [],
-        "paths": [],
-        "about": about,
-        "lookups": [],
-        "scope": layers,
-        "truncated": truncated,
-    }))
+    Ok(crate::payload::finish_recall(
+        json!({
+            "ok": true,
+            "mode": "semantic",
+            "facts": facts,
+            "nodes": [],
+            "paths": [],
+            "about": about,
+            "lookups": [],
+            "scope": layers,
+            "truncated": truncated,
+        }),
+        &layers,
+        crate::payload::Detail::parse(args.detail.as_deref())?,
+    ))
 }
 
+/// Reciprocal-rank contribution from one ordered list, gated to resolved facts.
 fn add_ranked(
     fused: &mut HashMap<String, f64>,
     iris: &[String],
@@ -315,6 +326,7 @@ fn contributing_activation_ids(
         .collect()
 }
 
+/// Vector-search live activations above the recall similarity threshold.
 async fn query_activations(
     graph: &Graph,
     runtime: &SemanticRuntime,
@@ -346,6 +358,7 @@ async fn query_activations(
         .collect()
 }
 
+/// Load current visible `ASSERTS`/`ABOUT` envelopes for activation result IRIs.
 async fn resolve_facts(
     graph: &Graph,
     layers: &[String],
@@ -420,6 +433,7 @@ async fn resolve_facts(
     Ok(facts)
 }
 
+/// Refresh recalled TTLs, then either converge into a neighbor or mint a new activation.
 async fn persist_activation(
     graph: &Graph,
     runtime: &SemanticRuntime,
@@ -478,6 +492,7 @@ async fn persist_activation(
     create_activation(graph, embedding, result_refs, ttl_ms).await
 }
 
+/// Choose the nearest neighbor that is similar enough and overlaps enough to merge.
 fn select_convergence<'a>(
     neighbors: &'a [Activation],
     result_refs: &[String],
@@ -497,6 +512,7 @@ fn select_convergence<'a>(
         })
 }
 
+/// Extend APOC TTL on still-live activations that contributed to this recall.
 async fn refresh_recalled_activations(
     graph: &Graph,
     element_ids: &[String],
@@ -540,6 +556,7 @@ async fn load_activation_embedding(graph: &Graph, element_id: &str) -> Result<Op
     .transpose()
 }
 
+/// Insert a new activation node, write its embedding, and start its TTL lease.
 async fn create_activation(
     graph: &Graph,
     embedding: &[f64],
@@ -566,6 +583,7 @@ async fn create_activation(
     Ok(())
 }
 
+/// Result-set overlap; two empty sets count as complete overlap for convergence.
 fn jaccard(left: &[String], right: &[String]) -> f64 {
     let left = left.iter().collect::<HashSet<_>>();
     let right = right.iter().collect::<HashSet<_>>();
@@ -601,6 +619,7 @@ mod tests {
             scope: vec!["project:mindreader".into()],
             text: "recall".into(),
             labels: Some(vec!["Element".into()]),
+            detail: None,
             limit: Some(100),
         };
         assert!(validate_semantic_search_args(&args).is_ok());

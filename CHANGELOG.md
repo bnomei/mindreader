@@ -9,6 +9,11 @@ versions follow Semantic Versioning.
 
 - Batched fuzzy merge-candidate lookup into two set-oriented Neo4j queries instead of two Bolt round trips per newly created entity.
 - Fused embedding finiteness validation with squared-norm accumulation while preserving sequential floating-point order.
+- Renamed the bundled `writing-to-mindreader` skill to `using-mindreader` and expanded it from write guidance into the complete recall, mutation, review, verification, feedback, placement, and unification flow.
+- Sharpened the README and skill around the clerk loop: closed-world recall, set-valued writes versus revise, pasteable handles, and advisory review queues. Tightened MCP server instructions to prefer one recall rather than a full ritual.
+- Standardized pasteable handles: `memory_unify` and `review.unify` use `{kind:"node", iri}` objects, every success result includes a `handles` bag, fact envelopes expose `current` / `rateable` / `mutable`, and text/semantic recall fill `nodes[]`.
+- `memory_recall.iris` with `hops: 0` still returns incident fact handles on `lookups[i].facts`. Both recall tools accept `detail` (`concise` or `detailed`).
+- Added `memory_recall` `history` for current and `validTo` facts of one node or fact IRI. Named-scope revise/withdraw of a global fact now says to retry with `scope: []`.
 
 ### Added
 

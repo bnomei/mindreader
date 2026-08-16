@@ -1,7 +1,7 @@
 {
   "name": "mindreader",
   "version": "0.4.0",
-  "description": "Deterministic, privacy-first Neo4j memory MCP server",
+  "description": "Deterministic Neo4j graph memory for MCP agents: explicit triples, no hidden extraction",
   "transport": {
     "type": "stdio",
     "command": "mindreader",

@@ -14,8 +14,10 @@ use thiserror::Error;
 /// Caller-facing domain failure: bad input versus violated graph precondition.
 #[derive(Debug, Error)]
 pub enum DomainError {
+    /// Wire or argument validation failed before any graph write.
     #[error("{0}")]
     InvalidInput(String),
+    /// The graph exists but the requested handle, membership, or closure is unusable.
     #[error("{0}")]
     Precondition(String),
 }
@@ -30,6 +32,7 @@ pub enum DomainError {
 pub struct LayerId(String);
 
 impl LayerId {
+    /// Parse a kebab-case colon-namespaced id; the token `global` is invalid (use `[]`).
     pub fn parse(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         if value == "global" || !is_valid_layer_id(&value) {
@@ -113,6 +116,7 @@ impl<'de> Deserialize<'de> for LayerId {
 pub struct PredicateRef(String);
 
 impl PredicateRef {
+    /// Canonicalize a local name or IRI into a property IRI with a nonempty local name.
     pub fn parse(value: impl Into<String>) -> Result<Self, DomainError> {
         let value = value.into();
         let trimmed = value.trim();
@@ -132,6 +136,40 @@ impl PredicateRef {
 
     pub fn iri(&self) -> &str {
         &self.0
+    }
+}
+
+/// Pasteable node handle used by `memory_unify`.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+pub struct NodeHandle {
+    pub kind: String,
+    pub iri: String,
+}
+
+impl NodeHandle {
+    /// Build a `{kind: node, iri}` handle; IRI checks happen in [`Self::iri`].
+    pub fn from_iri(iri: impl Into<String>) -> Self {
+        Self {
+            kind: "node".into(),
+            iri: iri.into(),
+        }
+    }
+
+    /// Return the node IRI after rejecting non-node kinds and relationship IRIs.
+    pub fn iri(&self) -> Result<&str, DomainError> {
+        if self.kind != "node" {
+            return Err(DomainError::InvalidInput(
+                "memory_unify source and target kind must be \"node\"".into(),
+            ));
+        }
+        let iri = self.iri.trim();
+        if iri.is_empty() || !is_iri(iri) || iri.starts_with("mindreader:relationship/") {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_unify requires a node IRI, not {:?}",
+                self.iri
+            )));
+        }
+        Ok(iri)
     }
 }
 
@@ -172,6 +210,7 @@ pub struct EntityRef {
 }
 
 impl EntityRef {
+    /// Require `kind=node` and at least one of `iri` or `name`.
     pub fn from_input(input: EntityInput) -> Result<Self, DomainError> {
         if input.kind != "node" {
             return Err(DomainError::InvalidInput(
@@ -207,6 +246,7 @@ pub enum ObjectValue {
 }
 
 impl ObjectValue {
+    /// Accept a tagged `node` or `literal` bag and reject mixed fields.
     pub fn from_input(input: ObjectInput) -> Result<Self, DomainError> {
         match input.kind.as_str() {
             "node" => {
@@ -316,6 +356,7 @@ pub enum SpikeRank {
 }
 
 impl SpikeRank {
+    /// Parse an optional Spike label; omitted means the subject is unranked.
     pub fn parse(value: Option<String>) -> Result<Option<Self>, DomainError> {
         value
             .map(|value| match value.as_str() {
@@ -349,6 +390,7 @@ pub enum RetractScope {
 }
 
 impl RetractScope {
+    /// Parse retract width: `fact`, `predicate`, or `subject`.
     pub fn parse(value: &str) -> Result<Self, DomainError> {
         match value {
             "fact" => Ok(Self::Fact),
