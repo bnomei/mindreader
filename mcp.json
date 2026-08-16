@@ -1,6 +1,6 @@
 {
   "name": "mindreader",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Deterministic, privacy-first Neo4j memory MCP server",
   "transport": {
     "type": "stdio",
@@ -13,17 +13,12 @@
     "XAI_API_KEY"
   ],
   "tools": [
-    "memory_get",
-    "memory_search",
-    "memory_semantic_search",
-    "memory_traverse",
-    "memory_stats",
-    "memory_assert",
-    "memory_replace",
-    "memory_retract",
-    "memory_feedback",
-    "memory_layers",
-    "memory_merge",
-    "memory_schema"
+    "memory_recall",
+    "memory_write",
+    "memory_revise",
+    "memory_withdraw",
+    "memory_judge",
+    "memory_place",
+    "memory_unify"
   ]
 }

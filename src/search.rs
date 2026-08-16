@@ -6,8 +6,11 @@
 //! text score. Layer filters require visible endpoints and current
 //! relationships (`validTo` null). Retrieval never mutates weights.
 
-use crate::error::Result;
-use crate::graph::{endpoint_json, fetch_all, node_json, rel_json, spike_label, spike_rank};
+use crate::domain::DomainError;
+use crate::error::{Error, Result};
+use crate::graph::{
+    endpoint_json, fact_envelope, fetch_all, node_json, rel_json, spike_label, spike_rank,
+};
 use crate::layers::validate_layer_ids;
 use neo4rs::{query, Graph, Node, Relation};
 use schemars::JsonSchema;
@@ -25,6 +28,119 @@ pub struct SearchArgs {
     pub labels: Option<Vec<String>>,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Agent-facing recall: exactly one selector among text / iris / labels / around.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RecallArgs {
+    pub scope: Vec<String>,
+    #[serde(default)]
+    pub text: Option<String>,
+    #[serde(default)]
+    pub iris: Option<Vec<String>>,
+    #[serde(default)]
+    pub labels: Option<Vec<String>>,
+    #[serde(default)]
+    pub around: Option<String>,
+    #[serde(default)]
+    pub semantic: bool,
+    #[serde(default)]
+    pub hops: Option<u32>,
+    #[serde(default)]
+    pub p: Option<Vec<String>>,
+    #[serde(default)]
+    pub depth: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// Graph-free recall input contract (runtime XOR, no schema union).
+pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
+    validate_layer_ids(args.scope.clone())?;
+    let text = args
+        .text
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let iris = args
+        .iris
+        .as_ref()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    let labels = args
+        .labels
+        .as_ref()
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    let around = args
+        .around
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let selectors = [text.is_some(), iris > 0, labels > 0, around.is_some()]
+        .into_iter()
+        .filter(|selected| *selected)
+        .count();
+    if selectors != 1 {
+        return Err(DomainError::InvalidInput(
+            "memory_recall requires exactly one of text, iris, labels, or around".into(),
+        )
+        .into());
+    }
+    if args.semantic && text.is_none() {
+        return Err(
+            DomainError::InvalidInput("memory_recall semantic:true requires text".into()).into(),
+        );
+    }
+    if let Some(hops) = args.hops {
+        if hops != 0 && hops != 1 {
+            return Err(
+                DomainError::InvalidInput("memory_recall hops must be 0 or 1".into()).into(),
+            );
+        }
+    }
+    if let Some(depth) = args.depth {
+        if !(1..=3).contains(&depth) {
+            return Err(
+                DomainError::InvalidInput("memory_recall depth must be 1..=3".into()).into(),
+            );
+        }
+    }
+    if let Some(limit) = args.limit {
+        if limit == 0 || limit > 200 {
+            return Err(Error::from(DomainError::InvalidInput(
+                "memory_recall limit must be 1..=200".into(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn fact_handle_iri(fact: &Value) -> Option<&str> {
+    fact.pointer("/target/iri")
+        .or_else(|| fact.pointer("/relationship/iri"))
+        .and_then(Value::as_str)
+}
+
+pub fn is_schema_catalog_labels(labels: &[String]) -> bool {
+    !labels.is_empty()
+        && labels.iter().all(|label| {
+            let trimmed = label.trim();
+            trimmed == "Class" || trimmed == "Property"
+        })
 }
 
 fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
@@ -334,16 +450,33 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
             .ok()
             .and_then(|value| value.parse::<i64>().ok())
             .unwrap_or(0);
-        facts.push(json!({
-            "s": endpoint_json(&subject),
-            "p": row.get::<String>("property")?,
-            "o": endpoint_json(&object),
-            "relationship": rel_json(&relationship, &subject_iri, &object_iri),
-            "layers": relationship.get::<Vec<String>>("layers").unwrap_or_default(),
-            "spike": spike_from_rank(row.get::<i64>("spikeRank").unwrap_or(0)),
-            "score": row.get::<f64>("score")?,
-            "effectiveWeight": effective_weight,
-        }));
+        let property = row.get::<String>("property")?;
+        let relationship = rel_json(&relationship, &subject_iri, &object_iri);
+        let scope = relationship
+            .get("layers")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let scope_vec = scope
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut fact = fact_envelope(
+            endpoint_json(&subject),
+            &property,
+            endpoint_json(&object),
+            &relationship,
+            &scope_vec,
+            spike_from_rank(row.get::<i64>("spikeRank").unwrap_or(0)).map(Value::String),
+        );
+        fact["score"] = json!(row.get::<f64>("score")?);
+        fact["effectiveWeight"] = json!(effective_weight);
+        facts.push(fact);
     }
     let spike = spike_context(
         graph,
@@ -356,14 +489,15 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
         "query": if trimmed.is_empty() { Value::Null } else { json!(trimmed) },
         "mode": "wakeup",
         "facts": facts,
-        "spike": spike,
-        "layers": layers,
+        "about": spike,
+        "scope": layers,
+        "semantic": false,
     }))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{lucene_escape, ranked_query, spike_from_rank};
+    use super::{lucene_escape, ranked_query, spike_from_rank, validate_recall_args, RecallArgs};
 
     #[test]
     fn search_helpers_preserve_contract_values() {
@@ -374,5 +508,34 @@ mod tests {
         assert!(query.contains("ORDER BY spikeRank DESC, effectiveWeight DESC, score DESC"));
         assert!(query.contains("LIMIT $limit"));
         assert!(!query.contains("collect("));
+    }
+
+    #[test]
+    fn recall_args_require_exactly_one_selector() {
+        let mut args = RecallArgs {
+            scope: vec!["project:x".into()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: None,
+            semantic: false,
+            hops: None,
+            p: None,
+            depth: None,
+            limit: None,
+        };
+        assert!(validate_recall_args(&args).is_err());
+        args.text = Some("Alice".into());
+        assert!(validate_recall_args(&args).is_ok());
+        args.around = Some("mindreader:element/alice".into());
+        assert!(validate_recall_args(&args).is_err());
+        args.around = None;
+        args.hops = Some(2);
+        assert!(validate_recall_args(&args).is_err());
+        args.hops = Some(1);
+        args.semantic = true;
+        assert!(validate_recall_args(&args).is_ok());
+        args.text = None;
+        assert!(validate_recall_args(&args).is_err());
     }
 }

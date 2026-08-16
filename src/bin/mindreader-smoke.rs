@@ -1,4 +1,4 @@
-//! Live Neo4j integration suite for the twelve memory tools and graph contracts.
+//! Live Neo4j integration suite for the seven memory tools and graph contracts.
 //!
 //! Mutates the configured database and leaves fixtures in place; use a
 //! development or disposable instance only. Enabled with the `developer-tools`
@@ -84,7 +84,7 @@ impl Report {
 
 fn entity(name: impl Into<String>) -> EntityInput {
     EntityInput {
-        kind: "entity".into(),
+        kind: "node".into(),
         iri: None,
         name: Some(name.into()),
         labels: vec!["Element".into()],
@@ -93,7 +93,7 @@ fn entity(name: impl Into<String>) -> EntityInput {
 
 fn entity_iri(iri: impl Into<String>) -> EntityInput {
     EntityInput {
-        kind: "entity".into(),
+        kind: "node".into(),
         iri: Some(iri.into()),
         name: None,
         labels: Vec::new(),
@@ -102,7 +102,7 @@ fn entity_iri(iri: impl Into<String>) -> EntityInput {
 
 fn object(name: impl Into<String>) -> ObjectInput {
     ObjectInput {
-        kind: "entity".into(),
+        kind: "node".into(),
         iri: None,
         name: Some(name.into()),
         labels: vec!["Element".into()],
@@ -113,7 +113,7 @@ fn object(name: impl Into<String>) -> ObjectInput {
 
 fn object_iri(iri: impl Into<String>) -> ObjectInput {
     ObjectInput {
-        kind: "entity".into(),
+        kind: "node".into(),
         iri: Some(iri.into()),
         name: None,
         labels: Vec::new(),
@@ -126,7 +126,7 @@ fn assert_args(
     s: EntityInput,
     p: impl AsRef<str>,
     o: ObjectInput,
-    layers: Vec<String>,
+    scope: Vec<String>,
 ) -> AssertArgs {
     AssertArgs {
         facts: vec![AssertFact {
@@ -136,13 +136,14 @@ fn assert_args(
             spike: None,
             contradicts: false,
         }],
-        layers,
+        scope,
     }
 }
 
 fn relationship_iri(value: &Value) -> Result<String> {
     value
-        .pointer("/facts/0/relationship/iri")
+        .pointer("/facts/0/target/iri")
+        .or_else(|| value.pointer("/facts/0/relationship/iri"))
         .or_else(|| value.pointer("/relationship/iri"))
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -172,7 +173,11 @@ fn fact_relationships(value: &Value) -> Vec<String> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|fact| fact.pointer("/relationship/iri").and_then(Value::as_str))
+        .filter_map(|fact| {
+            fact.pointer("/target/iri")
+                .or_else(|| fact.pointer("/relationship/iri"))
+                .and_then(Value::as_str)
+        })
         .map(str::to_string)
         .collect()
 }
@@ -312,12 +317,12 @@ async fn run() -> Result<u32> {
     let mut report = Report::new();
     let tool_names = Mindreader::registered_tool_names();
     report.check(
-        "MCP registers the twelve-tool contract",
-        tool_names.len() == 12
-            && tool_names.contains(&"memory_feedback".into())
-            && tool_names.contains(&"memory_layers".into())
-            && tool_names.contains(&"memory_merge".into())
-            && tool_names.contains(&"memory_semantic_search".into()),
+        "MCP registers the seven-tool contract",
+        tool_names.len() == 7
+            && tool_names.contains(&"memory_recall".into())
+            && tool_names.contains(&"memory_write".into())
+            && tool_names.contains(&"memory_revise".into())
+            && tool_names.contains(&"memory_unify".into()),
         format!("tools={tool_names:?}"),
     );
 
@@ -551,7 +556,7 @@ async fn run() -> Result<u32> {
                     contradicts: false,
                 },
             ],
-            layers: vec![layer_a.clone()],
+            scope: vec![layer_a.clone()],
         },
     )
     .await?;
@@ -592,7 +597,7 @@ async fn run() -> Result<u32> {
                     contradicts: false,
                 })
                 .collect(),
-            layers: vec![layer_a.clone()],
+            scope: vec![layer_a.clone()],
         },
     )
     .await?;
@@ -704,7 +709,7 @@ async fn run() -> Result<u32> {
                     spike: None,
                     contradicts: true,
                 }],
-                layers: vec![layer_a.clone()],
+                scope: vec![layer_a.clone()],
             },
         ),
         tools::memory_assert(
@@ -717,7 +722,7 @@ async fn run() -> Result<u32> {
                     spike: None,
                     contradicts: true,
                 }],
-                layers: vec![layer_a.clone()],
+                scope: vec![layer_a.clone()],
             },
         ),
     )?;
@@ -910,7 +915,7 @@ async fn run() -> Result<u32> {
         FeedbackArgs {
             layers: vec![layer_a.clone()],
             target: TargetArgs {
-                kind: "relationship".into(),
+                kind: "fact".into(),
                 iri: high_rel.clone(),
             },
             mode: "strengthen".into(),
@@ -922,7 +927,7 @@ async fn run() -> Result<u32> {
         FeedbackArgs {
             layers: vec![layer_a.clone()],
             target: TargetArgs {
-                kind: "relationship".into(),
+                kind: "fact".into(),
                 iri: low_rel.clone(),
             },
             mode: "weaken".into(),
@@ -953,7 +958,7 @@ async fn run() -> Result<u32> {
                 FeedbackArgs {
                     layers: vec![layer],
                     target: TargetArgs {
-                        kind: "relationship".into(),
+                        kind: "fact".into(),
                         iri: relationship,
                     },
                     mode: "strengthen".into(),
@@ -996,7 +1001,7 @@ async fn run() -> Result<u32> {
         LayersArgs {
             layers: vec![layer_a.clone()],
             target: TargetArgs {
-                kind: "relationship".into(),
+                kind: "fact".into(),
                 iri: closure_rel.clone(),
             },
             add: vec![layer_c.clone()],
@@ -1035,7 +1040,7 @@ async fn run() -> Result<u32> {
         LayersArgs {
             layers: vec![layer_a.clone()],
             target: TargetArgs {
-                kind: "relationship".into(),
+                kind: "fact".into(),
                 iri: closure_rel.clone(),
             },
             add: vec![layer_c.clone()],
@@ -1139,7 +1144,7 @@ async fn run() -> Result<u32> {
             FeedbackArgs {
                 layers: vec![layer_a.clone()],
                 target: TargetArgs {
-                    kind: "relationship".into(),
+                    kind: "fact".into(),
                     iri: merge_survivor_relationship.clone(),
                 },
                 mode: "strengthen".into(),

@@ -769,7 +769,7 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("iri") {
         obj["iri"] = json!(v);
     }
-    obj["kind"] = json!("relationship");
+    obj["kind"] = json!("fact");
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
     }
@@ -793,7 +793,7 @@ fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("iri") {
         obj["iri"] = json!(v);
     }
-    obj["kind"] = json!("relationship");
+    obj["kind"] = json!("fact");
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
     }
@@ -1029,7 +1029,7 @@ pub async fn ensure_property_in_txn(
             r#"
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Property {iri: $iri})
-            ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = true,
+            ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = false,
               n.weight = 0, n.weightText = '0', n.layers = []
             ON MATCH SET n.name = coalesce(n.name, $name)
             SET n.mergeName = toLower(coalesce(n.name, $name)),
@@ -1238,7 +1238,7 @@ pub fn endpoint_json(node: &Node) -> Value {
             .get::<String>("datatype")
             .unwrap_or_else(|_| "xsd:string".into());
         return json!({
-            "kind": "node",
+            "kind": "literal",
             "iri": iri,
             "value": value,
             "datatype": datatype,
@@ -1253,6 +1253,35 @@ pub fn endpoint_json(node: &Node) -> Value {
         "labels": labels,
         "layers": node.get::<Vec<String>>("layers").unwrap_or_default(),
         "weight": node_weight(node),
+    })
+}
+
+/// Local predicate name for agent-facing `p` (IRI or already-local name).
+pub fn local_predicate_name(property: &str) -> String {
+    name_from_iri(property)
+}
+
+/// Agent-facing fact object: pasteable `target` plus local-name `p`.
+pub fn fact_envelope(
+    subject: Value,
+    property: &str,
+    object: Value,
+    relationship: &Value,
+    scope: &[String],
+    spike: Option<Value>,
+) -> Value {
+    let iri = relationship
+        .get("iri")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    json!({
+        "target": { "kind": "fact", "iri": iri },
+        "s": subject,
+        "p": local_predicate_name(property),
+        "o": object,
+        "scope": scope,
+        "spike": spike,
+        "weight": relationship.get("weight").cloned().unwrap_or(json!(0)),
     })
 }
 

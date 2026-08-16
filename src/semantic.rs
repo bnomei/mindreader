@@ -140,7 +140,7 @@ pub async fn memory_semantic_search(
     let mut facts_by_iri = HashMap::new();
     let mut direct_order = Vec::new();
     for fact in direct_facts {
-        if let Some(iri) = fact.pointer("/relationship/iri").and_then(Value::as_str) {
+        if let Some(iri) = crate::search::fact_handle_iri(&fact) {
             direct_order.push(iri.to_string());
             facts_by_iri.insert(iri.to_string(), fact);
         }
@@ -214,8 +214,9 @@ pub async fn memory_semantic_search(
         "query": text,
         "mode": "semantic",
         "facts": facts,
-        "spike": direct.get("spike").cloned().unwrap_or_else(|| json!([])),
-        "layers": layers,
+        "about": direct.get("about").cloned().unwrap_or_else(|| json!([])),
+        "scope": layers,
+        "semantic": true,
     }))
 }
 

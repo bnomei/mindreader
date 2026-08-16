@@ -5,6 +5,19 @@ versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-16
+
+### Changed
+
+- Replaced the twelve-tool MCP surface with seven job-shaped tools: `memory_recall`, `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, and `memory_unify`.
+- Agent-facing dialect is `node` / `fact` / `literal`. Visibility is `scope`. Fact results carry a pasteable `target`.
+- First use of a predicate creates a real global Property (`stub=false`). Class/Property catalog is `memory_recall` with `labels` Class or Property.
+- Walk filters (`around` + `p`) match predicate name or IRI, not Neo4j relationship type.
+
+### Removed
+
+- MCP registration of `memory_get`, `memory_search`, `memory_semantic_search`, `memory_traverse`, `memory_stats`, `memory_schema`, `memory_assert`, `memory_replace`, `memory_retract`, `memory_feedback`, `memory_layers`, and `memory_merge`. In-process stats remain for smoke and bench.
+
 ## [0.2.0] - 2026-08-16
 
 ### Changed
@@ -41,6 +54,7 @@ versions follow Semantic Versioning.
 - Reduced semantic activation recall to metadata plus the selected convergence vector and bounded embedding-provider retries, latency, and response-body memory.
 - Added crates.io and cargo-binstall distribution alongside the existing GitHub, npm, and container release channels.
 
-[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/bnomei/mindreader/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bnomei/mindreader/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bnomei/mindreader/releases/tag/v0.1.0

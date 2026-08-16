@@ -6,7 +6,7 @@ These instructions apply to the entire repository.
 
 ## Project contract
 
-Mindreader is a Rust stdio MCP server backed by Neo4j. It exposes exactly twelve memory tools and stores explicit graph triples with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, explicit supersession history, semantic recall, and intentional same-kind entity merging. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/writing-to-mindreader/SKILL.md` aligned with it.
+Mindreader is a Rust stdio MCP server backed by Neo4j. It exposes exactly seven memory tools (`memory_recall`, `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, `memory_unify`) and stores explicit graph triples with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, explicit supersession history, semantic recall, and intentional same-kind entity merging. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/writing-to-mindreader/SKILL.md` aligned with it.
 
 Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward compatibility, or add abstraction for hypothetical future requirements. Choose the simplest implementation that fully satisfies the current contract.
 
@@ -36,21 +36,21 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - Keep MCP initialization and `tools/list` independent of Neo4j availability. Database connection and bootstrap remain lazy for the stdio server.
 - Keep `NEO4J_PASSWORD` required and secrets environment-only. Never log credentials.
 - Parameterize user-provided Cypher values. Validate any identifier that must be interpolated, such as labels or relationship types.
-- Every scoped tool requires a validated `layers` array. `[]` means global-only; named layers form an OR union, and visible relationships require visible endpoints. Layer IDs use lowercase kebab-case colon namespaces.
+- Every scoped tool requires a validated `scope` array. `[]` means global-only; named layers form an OR union, and visible relationships require visible endpoints. Layer IDs use lowercase kebab-case colon namespaces. Graph storage still uses the `layers` property.
 - Empty record memberships mean global. An exact relationship has one identity across memberships; assertions merge memberships rather than duplicate the relationship.
-- `memory_schema` writes global schema-as-data or lists the Class/Property catalog with `list=true`. It and database-wide `memory_merge` are the only tools without a `layers` input.
-- `memory_feedback` changes a visible node or current relationship's shared signed weight by exactly `+1` or `-1`. Retrieval never changes weight automatically, weights do not decay, and search uses weight only within the same Spike category.
-- `memory_layers` records state-changing membership audits and must preserve relationship endpoint closure.
+- Class/Property nodes and schema-definition edges are always global (`layers=[]`, `stub=false`). `memory_recall` with `labels` Class and/or Property is the catalog. Database-wide `memory_unify` is the only MCP tool without a `scope` input.
+- `memory_judge` changes a visible node or current fact's shared signed weight by exactly `+1` or `-1` per rating. Retrieval never changes weight automatically, weights do not decay, and search uses weight only within the same Spike category.
+- `memory_place` records state-changing membership audits and must preserve relationship endpoint closure. `scope` is visibility; `add`/`remove` are the edit.
 - Retraction is soft: set `validTo`; do not hard-delete nodes or history.
-- Ordinary assertions are set-valued `facts[]` (1–20 triples, call-level `layers`). Reasserting the exact `(subject, property, object)` merges memberships or is a no-op; asserting another object preserves every current value. One Episode is recorded if any fact changed; all-noop rolls back with `episode: null`.
-- Corrections are explicit: `memory_replace` moves only the requested memberships off the selected old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in the same transaction.
+- Ordinary assertions are set-valued `facts[]` (1–20 triples, call-level `scope`). Reasserting the exact `(subject, property, object)` merges memberships or is a no-op; asserting another object preserves every current value. One Episode is recorded if any fact changed; all-noop rolls back with `episode: null`.
+- Corrections are explicit: `memory_revise` moves only the requested memberships off the selected fact handle, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in the same transaction.
 - `CONTRADICTS` and `SUPERSEDES` are system-owned. Client commands must not assert, replace, or retract them directly.
 - Keep `CONTRADICTS` multi-valued and idempotent per exact pair.
 - Every state-changing mutation records exactly one `Episode` and associates provenance with the changed records. No-op mutations record none.
 - Preserve the MCP host compatibility rule in `src/server.rs`: advertised input and output schemas remain plain tagged object schemas and contain no `anyOf`, `oneOf`, or `allOf`.
 - Recoverable tool failures return MCP `isError` structured results (`{ok:false,reason,message}`). Domain validation is not JSON-RPC `-32602`. Protocol errors stay for unknown-tool, unusable-server, and serde of required fields.
 - The 120/min burst-20 token bucket and 45s invoke timeout apply only to MCP `#[tool]` handlers via `Mindreader::invoke`. Never wrap `tools::*` or smoke in the limiter/timeout.
-- Keep the registered tool list synchronized across `src/server.rs`, its tests, `mcp.json`, and the README.
+- Keep the registered tool list synchronized across `src/server.rs`, its tests, `mcp.json`, and the README (exactly seven `memory_*` names).
 
 ## Working conventions
 

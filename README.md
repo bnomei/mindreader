@@ -7,7 +7,7 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It stores explicit graph triples (`subject -predicate-> object`) and serves exactly twelve tools over stdio for scoped retrieval, semantic recall, traversal, feedback, layer auditing, entity merging, schema management, and durable writes.
+Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It stores explicit graph triples (`subject -predicate-> object`) and serves exactly seven tools over stdio for recall, durable writes, corrections, withdrawal, explicit feedback, membership edits, and same-kind unification.
 
 Mindreader does not extract facts with a hidden language model or expose raw Cypher. Ordinary memory writes preserve history and record an `Episode`; explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`. Semantic search is optional and sends its query text to the selected OpenAI or xAI embedding API.
 
@@ -164,7 +164,7 @@ Run the binary without arguments to serve MCP. It also accepts `-h`/`--help` and
 
 ## Connect an MCP client
 
-Mindreader uses stdio transport. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all twelve tools in the [MCP tool reference](#mcp-tool-reference).
+Mindreader uses stdio transport. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all seven tools in the [MCP tool reference](#mcp-tool-reference).
 
 ### Local binary
 
@@ -195,7 +195,7 @@ Pin the package version in MCP configuration so the client always starts the sam
   "mcpServers": {
     "mindreader": {
       "command": "npx",
-      "args": ["-y", "@bnomei/mindreader@0.2.0"],
+      "args": ["-y", "@bnomei/mindreader@0.3.0"],
       "env": {
         "NEO4J_PASSWORD": "<NEO4J_PASSWORD>",
         "XAI_API_KEY": "<OPTIONAL_XAI_API_KEY>"
@@ -235,109 +235,109 @@ Run `docker compose up -d neo4j` before the client launches the Compose-backed s
 
 Start each session by recovering relevant context, then write only durable facts:
 
-1. Choose the request's `layers` visibility union, then call `memory_search` for exact names or `memory_semantic_search` for conceptual recall when you do not have an IRI.
+1. Choose the request's `scope` visibility union, then call `memory_recall` with `text` for exact names or `semantic:true` for conceptual recall when you do not have an IRI.
 2. Call `memory_get` for a returned IRI when you need the exact node or its immediate neighbors.
 3. Call `memory_traverse` when you need typed paths beyond one hop.
 4. Call `memory_schema` with `list=true` if the required Class or Property is missing from search, then write schema only when the catalog confirms it is absent.
-5. Call `memory_assert` once with `facts[]` for one or more durable, future-relevant triples (1–20).
+5. Call `memory_write` once with `facts[]` for one or more durable, future-relevant triples (1–20).
 6. Review any `mergeSuggestions`. They are fuzzy, advisory candidates rather than proof that two nodes are identical. Call `memory_merge` only after deciding the identities truly match.
 7. Search again to verify an important write. Correct with `memory_replace`; do not reassert.
 8. After using a retrieved node or relationship, call `memory_feedback` with `strengthen` if it helped or `weaken` if it did not.
 
 Do not store task chatter, acknowledgements, markdown dumps, or transient status as memory. The repository includes a reusable decision guide at [`skills/writing-to-mindreader/SKILL.md`](skills/writing-to-mindreader/SKILL.md).
 
-## Minimal assert, search, and traverse example
+## Minimal write, recall, and walk example
 
-### Assert one durable fact
+### Write one durable fact
 
-Call `memory_assert` with `facts[]` and an explicit visibility scope:
+Call `memory_write` with `facts[]` and an explicit visibility scope:
 
 ```json
 {
   "facts": [
     {
-      "s": { "kind": "entity", "name": "Alice" },
+      "s": { "kind": "node", "name": "Alice" },
       "p": "worksOn",
-      "o": { "kind": "entity", "name": "mindreader" }
+      "o": { "kind": "node", "name": "mindreader" }
     }
   ],
-  "layers": ["project:graph-memory"]
+  "scope": ["project:graph-memory"]
 }
 ```
 
-The response includes one Episode when any fact changed, plus per-item subject, object, and stable relationship IRIs.
+The response includes one Episode when any fact changed, plus per-item pasteable `target` handles.
 
-### Search by text
+### Recall by text
 
-Call `memory_search` with the same layer, or a broader OR union:
+Call `memory_recall` with the same scope, or a broader OR union:
 
 ```json
 {
   "text": "Alice",
-  "layers": ["project:graph-memory", "project:agent-runtime"]
+  "scope": ["project:graph-memory", "project:agent-runtime"]
 }
 ```
 
-The response's `facts` array contains current visible `ASSERTS` and `ABOUT` triples. Each fact includes stable endpoint and relationship IRIs that you can pass to `memory_get`, `memory_feedback`, or `memory_layers`.
+Each fact includes a `target` you can pass to `memory_revise`, `memory_withdraw`, `memory_judge`, or `memory_place`.
 
-### Traverse from a returned IRI
+### Walk from a returned IRI
 
-Call `memory_traverse` with a returned endpoint IRI:
+Call `memory_recall` with `around` and optional predicate names:
 
 ```json
 {
-  "from": "mindreader:element/alice",
+  "around": "mindreader:element/alice",
+  "p": ["worksOn"],
   "depth": 2,
-  "layers": ["project:graph-memory"]
+  "scope": ["project:graph-memory"]
 }
 ```
 
-Reasserting the same current triple returns `"noop": true`. Asserting a different object adds another current value. Use `memory_replace` when one exact current value is a correction of another.
+Reasserting the same current triple returns `"noop": true`. Asserting a different object adds another current value. Use `memory_revise` when one exact current value is a correction of another.
 
-After a returned relationship helps, strengthen its shared weight explicitly:
+After a returned fact helps, strengthen its shared weight explicitly:
 
 ```json
 {
-  "layers": ["project:graph-memory"],
-  "target": {
-    "kind": "relationship",
-    "iri": "mindreader:relationship/<returned-uuid>"
-  },
-  "mode": "strengthen"
+  "scope": ["project:graph-memory"],
+  "ratings": [
+    {
+      "target": {
+        "kind": "fact",
+        "iri": "mindreader:relationship/<returned-uuid>"
+      },
+      "mode": "strengthen"
+    }
+  ]
 }
 ```
 
-To audit its memberships independently of the fact value, use `memory_layers` with the same stable target and at least one `add` or `remove` entry.
+To audit its memberships independently of the fact value, use `memory_place` with the same stable target and at least one `add` or `remove` entry.
 
 ## MCP tool reference
 
-All tools return structured JSON. Recoverable failures return an MCP `isError` result with `{ok:false,reason,message}` rather than JSON-RPC `-32602`. Every scoped tool requires a `layers` array; the global `memory_schema` and permanent `memory_merge` operations do not. In the table, `@layers` is short for that request field. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers only apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected.
+All tools return structured JSON. Recoverable failures return an MCP `isError` result with `{ok:false,reason,message}` rather than JSON-RPC `-32602`. Every scoped tool requires a `scope` array; permanent `memory_unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers only apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
-| `memory_search` | `layers` | `text`, `labels`, `limit` (`20`, clamped to `1..100`) | Find current visible `ASSERTS` and `ABOUT` facts and ranked `ABOUT` context for their endpoints. The result limit is applied only after Spike, weight, relevance, and deterministic tie-break ranking. |
-| `memory_semantic_search` | non-empty `text` (at most 32 KiB UTF-8), `layers` | `labels`, `limit` (`20`, clamped to `1..100`) | Embed the query, blend direct matches with nearby remembered `ASSERTS` and `ABOUT` result bundles, and return current visible facts with a 1-based `rank`. |
-| `memory_get` | `iri`, `layers` | `hops` (`0`; only `1` includes neighbors) | Fetch a visible node and, optionally, its current visible one-hop relationships. |
-| `memory_traverse` | `from`, `layers` | `rels` (all fixed relationships), `depth` (`1`, clamped to `1..3`), `limit` (`50`, clamped to `1..200`) | Walk current visible typed relationships in either direction. |
-| `memory_stats` | `layers` | None | Report graph-model readiness, visible node/edge counts, database-wide episode count, and per-membership active edge totals. |
-| `memory_assert` | `facts[]` (1–20 triples), `layers` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships into each existing relationship identity. One Episode if any fact changed. |
-| `memory_replace` | tagged `s`, `p`, tagged `old`, tagged `new`, `layers` | `spike`, `contradicts` (`false`), `reason` | Move the selected memberships from one exact value to its correction atomically. |
-| `memory_retract` | tagged `target`, `layers` | `reason` | Remove selected memberships and soft-close a fact when its last membership is removed. |
-| `memory_feedback` | `layers`, tagged `target`, `mode` | None | Apply exactly `+1` (`strengthen`) or `-1` (`weaken`) to a visible node or current relationship's shared weight. |
-| `memory_layers` | `layers`, tagged `target` | `add`, `remove` (at least one entry across them) | Audit and atomically edit one node or current relationship's memberships. |
-| `memory_schema` | `kind` | `list` (`false`); write: `name` or `iri`, Class `subClassOf`, Property `subPropertyOf`/`domain`/`range` | `list=true` catalogs existing Class or Property records (no Episode). Without `list`, declare a Class or Property and its valid structural links as global records. |
-| `memory_merge` | same-kind `source`, `target` IRIs | None | Permanently merge two user-visible non-literal entities across every membership and historical relationship; the target IRI and name survive. Property merges also rewrite facts to the surviving predicate and consolidate exact duplicates. |
+| `memory_recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around` | `semantic`, `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `limit` (`1..=200`) | Recover visible facts, nodes, paths, or the Class/Property catalog. `semantic:true` sends query text to the embedding provider. |
+| `memory_write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships. One Episode if any fact changed. |
+| `memory_revise` | `scope`, fact `target`, `new` | `spike`, `contradicts`, `reason` | Move selected memberships from one current fact to its correction atomically. |
+| `memory_withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or a subject/predicate slice. |
+| `memory_judge` | `scope`, `ratings[]` | None | Apply exactly `+1` or `-1` to each visible node or current fact. |
+| `memory_place` | `scope`, `target` | `add`, `remove` (at least one) | Edit one node or current fact's memberships. `scope` is visibility. |
+| `memory_unify` | same-kind `source`, `target` IRIs | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |
 
-`memory_assert`, `memory_replace`, and `memory_schema` return `mergeSuggestions` when they create a user-visible entity with a fuzzy same-kind name match. Each suggestion includes the two names, its similarity, and a directly callable `merge: {source, target}` payload. The shorter name is recommended as the target; ties keep the pre-existing candidate. This direction is only a recommendation: inspect identity carefully and reverse or ignore it when appropriate. Names such as `007` and `007s` can be similar while still naming different entities.
+`memory_write` returns `next.unify` as `{source, target}` IRI strings when it creates a user-visible node with a fuzzy same-kind name match. The shorter name is recommended as the target. Reverse or ignore the pair when the names are similar but not identical.
 
-`memory_search` returns empty `facts` and `spike` arrays when both `text` and `labels` are absent or empty. A `labels` filter matches when any requested label occurs on either fact endpoint; semantic search applies the same endpoint-label rule to direct and recalled results.
+`memory_recall` rejects an empty query. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked `ASSERTS`.
 
 ### Assertion values
 
 Subjects and entity objects use an explicit `kind` tag and require `iri` or `name`:
 
 ```json
-{ "kind": "entity", "iri": "mindreader:element/alice", "labels": ["Element"] }
+{ "kind": "node", "iri": "mindreader:element/alice", "labels": ["Element"] }
 ```
 
 Literal objects use the `literal` tag:
@@ -356,10 +356,10 @@ An exact replacement identifies both values explicitly:
 
 ```json
 {
-  "s": { "kind": "entity", "name": "Alice" },
+  "s": { "kind": "node", "name": "Alice" },
   "p": "worksOn",
-  "old": { "kind": "entity", "name": "old-project" },
-  "new": { "kind": "entity", "name": "new-project" },
+  "old": { "kind": "node", "name": "old-project" },
+  "new": { "kind": "node", "name": "new-project" },
   "layers": ["project:graph-memory"],
   "reason": "corrected assignment"
 }

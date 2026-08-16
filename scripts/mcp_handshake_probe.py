@@ -178,18 +178,13 @@ def main() -> int:
 
 UNION_KEYS = {"anyOf", "oneOf", "allOf"}
 EXPECTED_TOOLS = {
-    "memory_assert",
-    "memory_feedback",
-    "memory_get",
-    "memory_layers",
-    "memory_merge",
-    "memory_replace",
-    "memory_retract",
-    "memory_schema",
-    "memory_search",
-    "memory_semantic_search",
-    "memory_stats",
-    "memory_traverse",
+    "memory_judge",
+    "memory_place",
+    "memory_recall",
+    "memory_revise",
+    "memory_unify",
+    "memory_withdraw",
+    "memory_write",
 }
 
 
@@ -211,7 +206,7 @@ def handshake_contract_ok(init: dict, listed: list) -> bool:
     if tools_cap.get("listChanged") not in (None, False):
         return False
     names = [tool.get("name") for tool in listed]
-    if set(names) != EXPECTED_TOOLS or len(names) != 12:
+    if set(names) != EXPECTED_TOOLS or len(names) != 7:
         return False
     for tool in listed:
         if not isinstance(tool.get("annotations"), dict):

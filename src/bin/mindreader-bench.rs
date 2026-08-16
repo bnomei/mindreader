@@ -188,7 +188,11 @@ async fn benchmark_search(
             .and_then(Value::as_array)
             .into_iter()
             .flatten()
-            .filter_map(|fact| fact.pointer("/relationship/iri").and_then(Value::as_str))
+            .filter_map(|fact| {
+                fact.pointer("/target/iri")
+                    .or_else(|| fact.pointer("/relationship/iri"))
+                    .and_then(Value::as_str)
+            })
             .map(str::to_string)
             .collect::<Vec<_>>();
         if sample == 0 {

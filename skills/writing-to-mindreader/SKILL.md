@@ -25,25 +25,24 @@ MCP server: `user-mindreader`. Always call `user-mindreader:<tool>`.
 
 ## Steps
 
-1. Choose `@layers`, the request's `layers` array. Use one or more named memberships for this work; use `[]` only for global memory.
-2. Use `user-mindreader:memory_search` for an exact name or relation. Use `user-mindreader:memory_semantic_search` for a concept when sending the query text to the configured OpenAI or xAI embedding API is acceptable. Multiple layers are an OR union. If the fact is already current, stop.
-3. If search does not show the Class or Property, call `user-mindreader:memory_schema` with `list=true` before writing schema.
-4. One `user-mindreader:memory_assert` call with `facts[]` (1–20 triples) and call-level `layers`. Use tagged entity/literal objects for each fact's `s` and `o`; `p` is a relation.
-5. Layer IDs use lowercase kebab-case colon namespaces, for example `project:graph-memory` or `analysis:hypothesis`. Colons are naming, not hierarchy.
-6. `spike=Knowledge` only if you would bet on it. Otherwise `Signal` (raw) or `Insight` (interpreted). Do not auto-promote.
-7. Add another valid value with `memory_assert`. Correct selected memberships of one exact old value with `memory_replace`; use `memory_retract` only to withdraw.
-8. If another visible membership has a different current `(s,p)`, set that fact's `contradicts=true`.
-9. Inspect `mergeSuggestions` and per-fact `propertyStub` on the `memory_assert` result. A suggestion is only a fuzzy same-kind name match, not proof of identity. If—and only if—the entities are truly identical, pass its `merge` payload to `memory_merge`; reverse `source` and `target` when the other IRI/name should survive.
-10. Search again for `s` or the topic. If the new fact is missing, fix the assert.
-11. After using a retrieved node or relationship, call `memory_feedback`: `strengthen` if it helped, `weaken` if it did not. Retrieval never updates weight itself.
+1. Choose `scope`, the request's visibility array. Use one or more named memberships for this work; use `[]` only for global memory.
+2. Use `user-mindreader:memory_recall` with `text` for an exact name. Set `semantic:true` for a concept when sending the query text to the configured embedding API is acceptable. Catalog Classes/Properties with `labels: ["Class"]` or `["Property"]`. If the fact is already current, stop.
+3. One `user-mindreader:memory_write` call with `facts[]` (1–20 triples) and call-level `scope`. Use tagged `node`/`literal` objects for each fact's `s` and `o`; `p` is a relation.
+4. Layer IDs use lowercase kebab-case colon namespaces, for example `project:graph-memory` or `analysis:hypothesis`. Colons are naming, not hierarchy.
+5. `spike=Knowledge` only if you would bet on it. Otherwise `Signal` (raw) or `Insight` (interpreted). Do not auto-promote.
+6. Add another valid value with `memory_write`. Correct one current fact by pasting its `target` into `memory_revise`. Use `memory_withdraw` only to withdraw.
+7. If another visible membership has a different current `(s,p)`, set that fact's `contradicts=true`.
+8. Inspect `next.unify` on the write result. A suggestion is only a fuzzy same-kind name match, not proof of identity. If—and only if—the nodes are truly identical, pass `{source,target}` to `memory_unify`.
+9. Recall again for `s` or the topic. If the new fact is missing, fix the write.
+10. After using a retrieved node or fact, call `memory_judge` with `strengthen` or `weaken`. Retrieval never updates weight itself.
 
 ## Examples
 
 Good:
 
 ```
-memory_assert facts=[{s:{kind:entity,name:Alice}, p=worksOn, o:{kind:entity,name:mindreader}, spike=Knowledge}] layers=[project:graph-memory]
-memory_assert facts=[{s:{kind:entity,name:Bob}, p=INSTANCE_OF, o:{kind:entity,iri:mindreader:class/Agent}}] layers=[]
+memory_write facts=[{s:{kind:node,name:Alice}, p=worksOn, o:{kind:node,name:mindreader}, spike=Knowledge}] scope=[project:graph-memory]
+memory_write facts=[{s:{kind:node,name:Bob}, p=INSTANCE_OF, o:{kind:node,iri:mindreader:class/Agent}}] scope=[]
 ```
 
 Bad:
@@ -57,17 +56,17 @@ s=Bob    p=notes  o="I am working on the MCP today"  # task status, not durable
 
 | Situation | Tool |
 | --- | --- |
-| No IRI yet | `user-mindreader:memory_search` |
-| Conceptual recall; external embedding is acceptable | `user-mindreader:memory_semantic_search` |
-| Have an IRI | `user-mindreader:memory_get` |
-| Walk typed edges | `user-mindreader:memory_traverse` |
-| Retrieved target helped or hurt | `user-mindreader:memory_feedback` |
-| Audit or correct memberships | `user-mindreader:memory_layers` |
-| New Class or Property after search and `list=true` miss | `user-mindreader:memory_schema` |
-| Confirmed duplicate entities | `user-mindreader:memory_merge` |
+| No IRI yet | `user-mindreader:memory_recall` with `text` |
+| Conceptual recall; external embedding is acceptable | `user-mindreader:memory_recall` with `semantic:true` |
+| Have an IRI | `user-mindreader:memory_recall` with `iris` |
+| Walk edges by predicate name | `user-mindreader:memory_recall` with `around` and `p` |
+| Catalog Class or Property | `user-mindreader:memory_recall` with `labels: ["Class"]` or `["Property"]` |
+| Retrieved target helped or hurt | `user-mindreader:memory_judge` |
+| Change memberships | `user-mindreader:memory_place` |
+| Confirmed duplicate nodes | `user-mindreader:memory_unify` |
 
-Every read filters nodes, relationships, and relationship endpoints through the same `@layers` scope. Empty stored memberships are global. One exact relationship identity is shared across memberships, so asserting it again merges memberships. Feedback is explicit `+1`/`-1`, shared across memberships, has no decay, and ranks results only within the same Spike category. Search's top-level `spike` context covers endpoints in the returned facts after the fact limit and is capped to that same requested limit.
+Every read filters nodes, facts, and endpoints through the same `scope`. Empty stored memberships are global. One exact fact identity is shared across memberships, so writing it again merges memberships. Judge is explicit `+1`/`-1`, shared across memberships, has no decay, and ranks results only within the same Spike category.
 
-Semantic search returns the same lightweight current facts with a 1-based `rank`. It blends direct results with nearby expiring bundles of relationship IRIs stored in Neo4j; it never bypasses the request's layers, labels, or endpoint closure. Calling it sends only the query text to the selected embedding provider. Reused visible bundles refresh their 30-day TTL, and sufficiently similar overlapping searches can converge, without creating an Episode or changing feedback weights.
+`memory_recall` with `semantic:true` returns the same lightweight current facts with a 1-based `rank`. It blends direct results with nearby expiring bundles stored in Neo4j; it never bypasses the request's scope or endpoint closure. Calling it sends only the query text to the selected embedding provider.
 
-`memory_merge` is global, permanent, and has no `layers` input. Source and target must have the same single canonical kind. It removes the source after moving all memberships and current and historical relationships to the target; the target IRI and name survive. Bootstrap-seeded Class and Property IRIs can only be targets. Property merges also rewrite predicate references and consolidate exact duplicate facts, but both Properties must use the same structural relationship representation; `CONTRADICTS` and `SUPERSEDES` cannot be merged. It creates one Episode but no alias. The shorter-name direction in `mergeSuggestions` is merely a default—similar strings such as `007` and `007s` may be distinct, so the agent must make the identity decision.
+`memory_unify` is global, permanent, and has no `scope` input. Source and target must have the same single canonical kind. It removes the source after moving all memberships and current and historical relationships to the target; the target IRI and name survive. The shorter-name direction in `next.unify` is only a default—similar strings such as `007` and `007s` may be distinct, so the agent must make the identity decision.

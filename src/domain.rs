@@ -136,7 +136,7 @@ impl PredicateRef {
     }
 }
 
-/// Wire-shape subject entity for MCP/tool arguments (`kind` must be `"entity"`).
+/// Wire-shape subject node for MCP/tool arguments (`kind` must be `"node"`).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EntityInput {
     pub kind: String,
@@ -148,7 +148,7 @@ pub struct EntityInput {
     pub labels: Vec<String>,
 }
 
-/// Wire-shape fact object: tagged entity or literal fields on one plain object schema.
+/// Wire-shape fact object: tagged node or literal fields on one plain object schema.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ObjectInput {
     pub kind: String,
@@ -174,9 +174,9 @@ pub struct EntityRef {
 
 impl EntityRef {
     pub fn from_input(input: EntityInput) -> Result<Self, DomainError> {
-        if input.kind != "entity" {
+        if input.kind != "node" {
             return Err(DomainError::InvalidInput(
-                "entity input kind must be \"entity\"".into(),
+                "node input kind must be \"node\"".into(),
             ));
         }
         validate_entity_parts(input.iri, input.name, input.labels)
@@ -210,10 +210,10 @@ pub enum ObjectValue {
 impl ObjectValue {
     pub fn from_input(input: ObjectInput) -> Result<Self, DomainError> {
         match input.kind.as_str() {
-            "entity" => {
+            "node" => {
                 if input.value.is_some() || input.datatype.is_some() {
                     return Err(DomainError::InvalidInput(
-                        "entity objects cannot contain value or datatype".into(),
+                        "node objects cannot contain value or datatype".into(),
                     ));
                 }
                 Ok(Self::Entity(validate_entity_parts(
@@ -240,7 +240,7 @@ impl ObjectValue {
                 Ok(Self::Literal { value, datatype })
             }
             other => Err(DomainError::InvalidInput(format!(
-                "object kind must be entity or literal, got {other:?}"
+                "object kind must be node or literal, got {other:?}"
             ))),
         }
     }
@@ -263,7 +263,7 @@ fn validate_entity_parts(
     let name = name.filter(|value| !value.trim().is_empty());
     if iri.is_none() && name.is_none() {
         return Err(DomainError::InvalidInput(
-            "entity input requires iri or name".into(),
+            "node input requires iri or name".into(),
         ));
     }
     if let Some(value) = &iri {
