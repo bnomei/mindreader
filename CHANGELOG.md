@@ -5,6 +5,15 @@ versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+### Changed
+
+- Batched fuzzy merge-candidate lookup into two set-oriented Neo4j queries instead of two Bolt round trips per newly created entity.
+- Fused embedding finiteness validation with squared-norm accumulation while preserving sequential floating-point order.
+
+### Added
+
+- Added Divan coverage for representative embedding dimensions from tiny through the supported maximum and expanded the live graph benchmark to 1/4/20 newly created merge candidates.
+
 ## [0.4.0] - 2026-08-16
 
 ### Changed

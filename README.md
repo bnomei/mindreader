@@ -606,7 +606,15 @@ Run the release-mode graph benchmark against a disposable database before changi
 cargo run --release --features developer-tools --bin mindreader-bench -- --config-dir PATH --entities 10000 --samples 30
 ```
 
-The benchmark refuses any database that is not pristine after model-v5 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions. Never point it at production or a database whose contents must be preserved.
+The benchmark refuses any database that is not pristine after model-v5 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions at 1/4/20 newly created entities. Never point it at production or a database whose contents must be preserved.
+
+Use Divan for graph-free CPU regressions:
+
+```bash
+cargo bench --bench cpu_hotspots
+```
+
+The normalization matrix covers dimensions 3, 256, 512, 1536, 3072, and 4096. Keep array work sequential unless a supported workload demonstrates a parallel crossover without changing deterministic output.
 
 ## Repository map
 
@@ -627,6 +635,7 @@ The benchmark refuses any database that is not pristine after model-v5 bootstrap
 | [`src/iri.rs`](src/iri.rs) | IRI detection, slugging, minting, and kind/label mappings. |
 | [`src/bin/mindreader-smoke.rs`](src/bin/mindreader-smoke.rs) | Live end-to-end graph behavior checks. |
 | [`src/bin/mindreader-bench.rs`](src/bin/mindreader-bench.rs) | Reproducible release-mode search, logical-lock, and merge-suggestion benchmarks. |
+| [`benches/cpu_hotspots.rs`](benches/cpu_hotspots.rs) | Divan microbenchmarks for graph-free CPU paths and supported workload bounds. |
 | [`scripts/mcp_handshake_probe.py`](scripts/mcp_handshake_probe.py) | Portable MCP initialize and tool-discovery diagnostic. |
 | [`mcp.json`](mcp.json) | Server metadata, transport, environment, and exported tool inventory. |
 

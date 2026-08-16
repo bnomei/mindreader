@@ -635,107 +635,135 @@ pub async fn merge_suggestions_in_txn(
     created_iris: &[String],
     layers: &[String],
 ) -> Result<Vec<Value>> {
+    if created_iris.is_empty() {
+        return Ok(Vec::new());
+    }
     let mut suggestions = Vec::new();
     let created_set = created_iris.iter().cloned().collect::<BTreeSet<_>>();
-    for created_iri in created_iris {
-        let created_name = fetch_one_txn(
-            txn,
-            query("MATCH (created:Entity {iri: $iri}) RETURN created.name AS name")
-                .param("iri", created_iri.clone()),
+    let created_specs = fetch_all_txn(
+        txn,
+        query(
+            "UNWIND $createdIris AS iri \
+             MATCH (created:Entity {iri: iri}) \
+             WHERE created.name IS NOT NULL AND created.name <> '' \
+             RETURN created.iri AS iri, created.name AS name",
         )
-        .await?
-        .and_then(|row| row.get::<String>("name").ok());
-        let Some(created_name) = created_name.filter(|name| !name.is_empty()) else {
-            continue;
-        };
-        let rows = fetch_all_txn(
-            txn,
-            query(
-                r#"
-                MATCH (created:Entity {iri: $iri})
-                CALL {
-                  CALL db.index.fulltext.queryNodes('merge_candidate_names', $nameQuery)
-                  YIELD node
-                  RETURN node AS candidate
-                  UNION
-                  MATCH (candidate:Entity)
-                  WHERE candidate.iri IN $createdIris
-                  RETURN candidate
-                }
-                WITH created, candidate
-                WHERE candidate <> created
-                  AND created.name IS NOT NULL AND candidate.name IS NOT NULL
-                  AND (size(coalesce(candidate.layers, [])) = 0
-                       OR any(layer IN coalesce(candidate.layers, []) WHERE layer IN $layers))
-                  AND none(label IN labels(created) WHERE label IN $forbidden)
-                  AND none(label IN labels(candidate) WHERE label IN $forbidden)
-                  AND size([label IN labels(created) WHERE label IN $canonicalKinds]) = 1
-                  AND size([label IN labels(candidate) WHERE label IN $canonicalKinds]) = 1
-                  AND all(label IN labels(created)
-                          WHERE NOT label IN $canonicalKinds OR label IN labels(candidate))
-                  AND all(label IN labels(candidate)
-                          WHERE NOT label IN $canonicalKinds OR label IN labels(created))
-                  AND apoc.text.fuzzyMatch(toLower(created.name), toLower(candidate.name))
-                WITH created, candidate,
-                     apoc.text.levenshteinSimilarity(toLower(created.name), toLower(candidate.name)) AS similarity
-                RETURN created.iri AS createdIri, created.name AS createdName,
-                       candidate.iri AS candidateIri, candidate.name AS candidateName,
-                       head([label IN labels(created) WHERE label IN $canonicalKinds]) AS canonicalKind,
-                       similarity
-                ORDER BY similarity DESC, size(candidate.name) ASC, candidate.iri ASC
-                LIMIT 3
-                "#,
-            )
-            .param("iri", created_iri.clone())
-            .param("nameQuery", lucene_fuzzy_term(&created_name))
-            .param("createdIris", created_iris.to_vec())
-            .param("layers", layers.to_vec())
-            .param(
-                "forbidden",
-                FORBIDDEN_ENTITY_LABELS
-                    .iter()
-                    .map(|label| label.to_string())
-                    .collect::<Vec<_>>(),
-            )
-            .param(
-                "canonicalKinds",
-                CANONICAL_KIND_LABELS
-                    .iter()
-                    .map(|label| label.to_string())
-                    .collect::<Vec<_>>(),
-            ),
-        )
-        .await?;
-        for row in rows {
-            let created_iri: String = row.get("createdIri")?;
-            let created_name: String = row.get("createdName")?;
-            let candidate_iri: String = row.get("candidateIri")?;
-            let candidate_name: String = row.get("candidateName")?;
-            let canonical_kind: String = row.get("canonicalKind")?;
-            if canonical_kind == "Property"
-                && require_compatible_property_merge(&created_iri, &candidate_iri).is_err()
-            {
-                continue;
+        .param("createdIris", created_iris.to_vec()),
+    )
+    .await?
+    .into_iter()
+    .map(|row| {
+        let iri = row.get::<String>("iri")?;
+        let name = row.get::<String>("name")?;
+        Ok(HashMap::from([
+            ("iri".to_string(), iri),
+            ("nameQuery".to_string(), lucene_fuzzy_term(&name)),
+        ]))
+    })
+    .collect::<Result<Vec<_>>>()?;
+    if created_specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = fetch_all_txn(
+        txn,
+        query(
+            r#"
+            UNWIND $created AS spec
+            MATCH (created:Entity {iri: spec.iri})
+            CALL {
+              WITH created, spec
+              CALL db.index.fulltext.queryNodes('merge_candidate_names', spec.nameQuery)
+              YIELD node
+              RETURN node AS candidate
+              UNION
+              WITH created, spec
+              MATCH (candidate:Entity)
+              WHERE candidate.iri IN $createdIris
+              RETURN candidate
             }
-            let candidate_was_created = created_set.contains(&candidate_iri);
-            let created_first_on_tie = candidate_was_created && created_iri < candidate_iri;
-            let created_is_target = is_bootstrap_seeded(&created_iri)
-                || (!is_bootstrap_seeded(&candidate_iri)
-                    && (created_name.chars().count() < candidate_name.chars().count()
-                        || (created_name.chars().count() == candidate_name.chars().count()
-                            && created_first_on_tie)));
-            let (source, source_name, target, target_name) = if created_is_target {
-                (candidate_iri, candidate_name, created_iri, created_name)
-            } else {
-                (created_iri, created_name, candidate_iri, candidate_name)
-            };
-            suggestions.push(json!({
-                "source": { "iri": source, "name": source_name },
-                "target": { "iri": target, "name": target_name },
-                "similarity": row.get::<f64>("similarity")?,
-                "merge": { "source": source, "target": target },
-            }));
+            WITH created, candidate
+            WHERE candidate <> created
+              AND candidate.name IS NOT NULL
+              AND (size(coalesce(candidate.layers, [])) = 0
+                   OR any(layer IN coalesce(candidate.layers, []) WHERE layer IN $layers))
+              AND none(label IN labels(created) WHERE label IN $forbidden)
+              AND none(label IN labels(candidate) WHERE label IN $forbidden)
+              AND size([label IN labels(created) WHERE label IN $canonicalKinds]) = 1
+              AND size([label IN labels(candidate) WHERE label IN $canonicalKinds]) = 1
+              AND all(label IN labels(created)
+                      WHERE NOT label IN $canonicalKinds OR label IN labels(candidate))
+              AND all(label IN labels(candidate)
+                      WHERE NOT label IN $canonicalKinds OR label IN labels(created))
+              AND apoc.text.fuzzyMatch(toLower(created.name), toLower(candidate.name))
+            WITH created, candidate,
+                 head([label IN labels(created) WHERE label IN $canonicalKinds]) AS canonicalKind,
+                 apoc.text.levenshteinSimilarity(
+                   toLower(created.name), toLower(candidate.name)
+                 ) AS similarity
+            ORDER BY created.iri ASC, similarity DESC,
+                     size(candidate.name) ASC, candidate.iri ASC
+            WITH created, collect({
+              candidateIri: candidate.iri,
+              candidateName: candidate.name,
+              canonicalKind: canonicalKind,
+              similarity: similarity
+            })[..3] AS candidates
+            UNWIND candidates AS candidate
+            RETURN created.iri AS createdIri, created.name AS createdName,
+                   candidate.candidateIri AS candidateIri,
+                   candidate.candidateName AS candidateName,
+                   candidate.canonicalKind AS canonicalKind,
+                   candidate.similarity AS similarity
+            "#,
+        )
+        .param("created", created_specs)
+        .param("createdIris", created_iris.to_vec())
+        .param("layers", layers.to_vec())
+        .param(
+            "forbidden",
+            FORBIDDEN_ENTITY_LABELS
+                .iter()
+                .map(|label| label.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .param(
+            "canonicalKinds",
+            CANONICAL_KIND_LABELS
+                .iter()
+                .map(|label| label.to_string())
+                .collect::<Vec<_>>(),
+        ),
+    )
+    .await?;
+    for row in rows {
+        let created_iri: String = row.get("createdIri")?;
+        let created_name: String = row.get("createdName")?;
+        let candidate_iri: String = row.get("candidateIri")?;
+        let candidate_name: String = row.get("candidateName")?;
+        let canonical_kind: String = row.get("canonicalKind")?;
+        if canonical_kind == "Property"
+            && require_compatible_property_merge(&created_iri, &candidate_iri).is_err()
+        {
+            continue;
         }
+        let candidate_was_created = created_set.contains(&candidate_iri);
+        let created_first_on_tie = candidate_was_created && created_iri < candidate_iri;
+        let created_is_target = is_bootstrap_seeded(&created_iri)
+            || (!is_bootstrap_seeded(&candidate_iri)
+                && (created_name.chars().count() < candidate_name.chars().count()
+                    || (created_name.chars().count() == candidate_name.chars().count()
+                        && created_first_on_tie)));
+        let (source, source_name, target, target_name) = if created_is_target {
+            (candidate_iri, candidate_name, created_iri, created_name)
+        } else {
+            (created_iri, created_name, candidate_iri, candidate_name)
+        };
+        suggestions.push(json!({
+            "source": { "iri": source, "name": source_name },
+            "target": { "iri": target, "name": target_name },
+            "similarity": row.get::<f64>("similarity")?,
+            "merge": { "source": source, "target": target },
+        }));
     }
     suggestions.sort_by(|left, right| {
         right["similarity"]

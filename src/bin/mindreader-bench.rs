@@ -12,6 +12,7 @@ use mindreader::operation_error;
 use mindreader::search::{self, SearchArgs};
 use neo4rs::{query, Graph};
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -90,7 +91,12 @@ fn summary(mut timings_ms: Vec<f64>) -> Value {
     })
 }
 
-async fn seed(graph: &Graph, prefix: &str, layer: &str, entities: i64) -> Result<(String, String)> {
+async fn seed(
+    graph: &Graph,
+    prefix: &str,
+    layer: &str,
+    entities: i64,
+) -> Result<Vec<(String, String)>> {
     graph
         .run(
             query(
@@ -128,26 +134,43 @@ async fn seed(graph: &Graph, prefix: &str, layer: &str, entities: i64) -> Result
         .await
         .context("seed search benchmark facts")?;
 
-    let created_iri = format!("{prefix}/merge/spaceships");
-    let candidate_iri = format!("{prefix}/merge/spaceship");
+    let names = [
+        "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+        "juliett", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+        "sierra", "tango",
+    ];
+    let pairs = names
+        .iter()
+        .enumerate()
+        .map(|(index, name)| {
+            let created_iri = format!("{prefix}/merge/{index}/spaceships");
+            let candidate_iri = format!("{prefix}/merge/{index}/spaceship");
+            HashMap::from([
+                ("createdIri".to_string(), created_iri),
+                ("candidateIri".to_string(), candidate_iri),
+                ("createdName".to_string(), format!("{name} spaceships")),
+                ("candidateName".to_string(), format!("{name} spaceship")),
+            ])
+        })
+        .collect::<Vec<_>>();
     graph
         .run(
             query(
                 r#"
+                UNWIND $pairs AS pair
                 CREATE (:Entity:Element {
-                  iri: $createdIri, name: 'spaceships', searchText: 'spaceships',
-                  mergeName: 'spaceships',
+                  iri: pair.createdIri, name: pair.createdName,
+                  searchText: pair.createdName, mergeName: toLower(pair.createdName),
                   layers: [$layer], weight: 0, weightText: '0', createdAt: datetime()
                 })
                 CREATE (:Entity:Element {
-                  iri: $candidateIri, name: 'spaceship', searchText: 'spaceship',
-                  mergeName: 'spaceship',
+                  iri: pair.candidateIri, name: pair.candidateName,
+                  searchText: pair.candidateName, mergeName: toLower(pair.candidateName),
                   layers: [$layer], weight: 0, weightText: '0', createdAt: datetime()
                 })
                 "#,
             )
-            .param("createdIri", created_iri.clone())
-            .param("candidateIri", candidate_iri.clone())
+            .param("pairs", pairs.clone())
             .param("layer", layer.to_string()),
         )
         .await
@@ -158,7 +181,10 @@ async fn seed(graph: &Graph, prefix: &str, layer: &str, entities: i64) -> Result
         ))
         .await
         .context("refresh full-text indexes")?;
-    Ok((created_iri, candidate_iri))
+    Ok(pairs
+        .into_iter()
+        .map(|pair| (pair["createdIri"].clone(), pair["candidateIri"].clone()))
+        .collect())
 }
 
 async fn benchmark_search(
@@ -253,42 +279,55 @@ async fn benchmark_locks(graph: &Graph, layer: &str, samples: usize) -> Result<V
 
 async fn benchmark_suggestions(
     graph: &Graph,
-    created_iri: &str,
-    candidate_iri: &str,
+    pairs: &[(String, String)],
     layer: &str,
     samples: usize,
-) -> Result<(Value, Value)> {
-    let mut timings = Vec::with_capacity(samples);
-    let mut reference = Value::Null;
-    for sample in 0..samples {
-        let mut txn = graph.start_txn().await?;
-        let started = Instant::now();
-        let suggestions =
-            merge_suggestions_in_txn(&mut txn, &[created_iri.to_string()], &[layer.to_string()])
-                .await?;
-        timings.push(started.elapsed().as_secs_f64() * 1_000.0);
-        txn.rollback().await?;
-        let value = Value::Array(suggestions);
-        if sample == 0 {
-            reference = value;
-        } else if value != reference {
+) -> Result<Value> {
+    let mut results = serde_json::Map::new();
+    for batch_size in [1_usize, 4, 20] {
+        let selected = &pairs[..batch_size];
+        let created_iris = selected
+            .iter()
+            .map(|(created, _)| created.clone())
+            .collect::<Vec<_>>();
+        let mut timings = Vec::with_capacity(samples);
+        let mut reference = Value::Null;
+        for sample in 0..samples {
+            let mut txn = graph.start_txn().await?;
+            let started = Instant::now();
+            let suggestions =
+                merge_suggestions_in_txn(&mut txn, &created_iris, &[layer.to_string()]).await?;
+            timings.push(started.elapsed().as_secs_f64() * 1_000.0);
+            txn.rollback().await?;
+            let value = Value::Array(suggestions);
+            if sample == 0 {
+                reference = value;
+            } else if value != reference {
+                return Err(operation_error!(
+                    "merge suggestions returned nondeterministic output for batch size {batch_size}"
+                ));
+            }
+        }
+        let found_all = selected.iter().all(|(created_iri, candidate_iri)| {
+            reference.as_array().is_some_and(|suggestions| {
+                suggestions.iter().any(|suggestion| {
+                    suggestion.pointer("/source/iri").and_then(Value::as_str) == Some(created_iri)
+                        && suggestion.pointer("/target/iri").and_then(Value::as_str)
+                            == Some(candidate_iri)
+                })
+            })
+        });
+        if !found_all {
             return Err(operation_error!(
-                "merge suggestions returned nondeterministic output"
+                "merge benchmark missed an expected plural-to-singular pair for batch size {batch_size}: {reference}"
             ));
         }
+        results.insert(
+            batch_size.to_string(),
+            json!({ "latency": summary(timings), "output": reference }),
+        );
     }
-    let found_expected = reference.as_array().is_some_and(|suggestions| {
-        suggestions.iter().any(|suggestion| {
-            suggestion.pointer("/source/iri").and_then(Value::as_str) == Some(created_iri)
-                && suggestion.pointer("/target/iri").and_then(Value::as_str) == Some(candidate_iri)
-        })
-    });
-    if !found_expected {
-        return Err(operation_error!(
-            "merge benchmark did not recommend spaceships -> spaceship: {reference}"
-        ));
-    }
-    Ok((summary(timings), reference))
+    Ok(Value::Object(results))
 }
 
 #[tokio::main]
@@ -339,27 +378,21 @@ async fn run() -> Result<Value> {
     let prefix = format!("mindreader:benchmark/{tag}");
     let layer = format!("benchmark:performance-{tag}");
     let seeded = Instant::now();
-    let (created_iri, candidate_iri) = seed(&graph, &prefix, &layer, options.entities).await?;
+    let merge_pairs = seed(&graph, &prefix, &layer, options.entities).await?;
     let seed_ms = seeded.elapsed().as_secs_f64() * 1_000.0;
 
     let (search, search_order) =
         benchmark_search(&graph, &layer, &prefix, options.entities, options.samples).await?;
     let locks = benchmark_locks(&graph, &layer, options.samples).await?;
-    let (suggestions, suggestion_output) = benchmark_suggestions(
-        &graph,
-        &created_iri,
-        &candidate_iri,
-        &layer,
-        options.samples,
-    )
-    .await?;
+    let suggestions = benchmark_suggestions(&graph, &merge_pairs, &layer, options.samples).await?;
 
     Ok(json!({
         "workload": {
             "subjectEntities": options.entities,
             "objectEntities": options.entities,
-            "mergeCandidateEntities": 2,
-            "seededEntities": options.entities.saturating_mul(2).saturating_add(2),
+            "mergeCandidateEntities": merge_pairs.len().saturating_mul(2),
+            "seededEntities": options.entities.saturating_mul(2)
+                .saturating_add(i64::try_from(merge_pairs.len().saturating_mul(2)).unwrap_or(i64::MAX)),
             "facts": options.entities,
             "samples": options.samples,
             "warmups": WARMUPS,
@@ -371,10 +404,7 @@ async fn run() -> Result<Value> {
             "relationshipOrder": search_order,
         },
         "factLocksByFactCount": locks,
-        "mergeSuggestions": {
-            "latency": suggestions,
-            "output": suggestion_output,
-        },
+        "mergeSuggestionsByCreatedCount": suggestions,
     }))
 }
 

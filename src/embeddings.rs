@@ -356,12 +356,15 @@ pub fn normalize_vector(
             vector.len()
         ));
     }
-    if vector.iter().any(|value| !value.is_finite()) {
+    let squared_norm = vector.iter().try_fold(0.0, |sum, value| {
+        value.is_finite().then_some(sum + value * value)
+    });
+    let Some(squared_norm) = squared_norm else {
         return Err(embedding_error!(
             "{provider} returned a non-finite embedding value"
         ));
-    }
-    let norm = vector.iter().map(|value| value * value).sum::<f64>().sqrt();
+    };
+    let norm = squared_norm.sqrt();
     if !norm.is_finite() || norm == 0.0 {
         return Err(embedding_error!(
             "{provider} returned a zero-norm embedding"
