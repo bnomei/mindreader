@@ -6,10 +6,10 @@
 2. Start Neo4j (`docker compose up -d neo4j`) or use an existing instance.
 3. Run:
    - `cargo fmt --all -- --check`
-   - `cargo clippy --locked --all-targets -- -D warnings`
-   - `cargo test --locked --all-targets`
+   - `cargo clippy --locked --all-targets --all-features -- -D warnings`
+   - `cargo test --locked --all-targets --all-features`
    - `npm test --prefix npm/mindreader`
-   - `cargo run --bin mindreader-smoke` (when Neo4j is available)
+   - `cargo run --features developer-tools --bin mindreader-smoke` (when Neo4j is available)
 
 ## Graph model versioning
 
@@ -22,9 +22,10 @@ When introducing an incompatible model change, bump the model version, keep fres
 ## Release discipline
 
 - Treat user-visible behavior/tool-contract changes as SemVer-significant.
-- Update `CHANGELOG.md` and keep `Cargo.toml`, `mcp.json`, and
-  `npm/mindreader/package.json` on the same version.
+- Update `CHANGELOG.md` and keep `Cargo.toml`, `mcp.json`,
+  `npm/mindreader/package.json`, and the pinned README MCP example on the same version.
 - Push a `v<version>` tag only after CI passes. The release workflow validates the tagged commit,
-  builds and smoke-tests every platform archive, then publishes GitHub, GHCR, and npm releases.
-- Configure the repository's `NPM_TOKEN` secret before releasing. Missing npm credentials fail
-  the release instead of silently skipping a required distribution channel.
+  verifies the crates.io package, builds and smoke-tests every platform archive, then publishes
+  GitHub, crates.io, GHCR, and npm releases.
+- Configure the repository's `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` secrets before releasing.
+  Missing registry credentials fail the release instead of silently skipping a required channel.

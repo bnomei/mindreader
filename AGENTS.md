@@ -67,14 +67,14 @@ Run the checks appropriate to the change and fix every actionable failure:
 ```bash
 cargo fmt -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test --all-targets --all-features
 ```
 
 For changes that affect graph queries, persistence semantics, layers, configuration, or tool behavior, also start Neo4j and run the live smoke suite:
 
 ```bash
 docker compose up -d neo4j
-cargo run --bin mindreader-smoke
+cargo run --features developer-tools --bin mindreader-smoke
 ```
 
 The smoke test mutates the configured database and does not clean up its fixtures. Use a development or disposable database, never an unreviewed production target.

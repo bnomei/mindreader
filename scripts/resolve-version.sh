@@ -47,6 +47,11 @@ if [[ "$npm_version" != "$version" ]]; then
   exit 1
 fi
 
+if ! grep -Fq "\"@bnomei/mindreader@$version\"" README.md; then
+  echo "README.md does not pin the current package version $version in its MCP example" >&2
+  exit 1
+fi
+
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   echo "version=$version" >> "$GITHUB_OUTPUT"
 else

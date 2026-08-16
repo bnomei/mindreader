@@ -2,13 +2,33 @@
 name = "mindreader"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+authors = ["Bruno Meilick"]
+categories = ["command-line-utilities", "development-tools"]
 description = "Neo4j RDFS schema-as-data memory MCP server"
+documentation = "https://docs.rs/mindreader"
 homepage = "https://github.com/bnomei/mindreader"
+include = [
+  "/src/**",
+  "/Cargo.toml",
+  "/Cargo.lock",
+  "/README.md",
+  "/LICENSE",
+  "/CHANGELOG.md",
+  "/CONTRIBUTING.md",
+  "/mcp.json",
+  "/scripts/mcp_handshake_probe.py",
+  "/skills/writing-to-mindreader/SKILL.md",
+]
+keywords = ["mcp", "neo4j", "knowledge-graph", "memory", "semantic-search"]
 repository = "https://github.com/bnomei/mindreader"
 license = "MIT"
 readme = "README.md"
 rust-version = "1.89"
-publish = false
+publish = ["crates-io"]
+
+[features]
+developer-tools = []
 
 [lib]
 name = "mindreader"
@@ -21,10 +41,21 @@ path = "src/main.rs"
 [[bin]]
 name = "mindreader-smoke"
 path = "src/bin/mindreader-smoke.rs"
+required-features = ["developer-tools"]
 
 [[bin]]
 name = "mindreader-bench"
 path = "src/bin/mindreader-bench.rs"
+required-features = ["developer-tools"]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/mindreader-v{ version }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-url = "{ repo }/releases/download/v{ version }/mindreader-v{ version }-{ target }.zip"
+pkg-fmt = "zip"
 
 [dependencies]
 async-trait = "0.1.92"

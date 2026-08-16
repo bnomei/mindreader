@@ -57,7 +57,7 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
       - name: Run Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
   msrv:
     name: Rust 1.89 compatibility
@@ -75,7 +75,7 @@ jobs:
           shared-key: msrv-1.89-${{ runner.os }}-${{ runner.arch }}
           cache-on-failure: true
       - name: Check minimum supported Rust version
-        run: cargo check --locked --all-targets
+        run: cargo check --locked --all-targets --all-features
 
   test:
     name: Tests
@@ -92,9 +92,11 @@ jobs:
           save-if: ${{ github.event_name != 'pull_request' }}
           cache-on-failure: true
       - name: Run tests
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets --all-features
       - name: Run documentation tests
         run: cargo test --locked --doc
+      - name: Verify publishable package
+        run: cargo package --locked -p mindreader
       - name: Build release binary
         run: cargo build --locked --release --bin mindreader
       - name: Smoke offline CLI
