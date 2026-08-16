@@ -95,6 +95,10 @@ jobs:
         run: cargo test --locked --all-targets --all-features
       - name: Run documentation tests
         run: cargo test --locked --doc
+      - name: Verify Rust documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --locked --no-deps --all-features
       - name: Verify publishable package
         run: cargo package --locked -p mindreader
       - name: Build release binary

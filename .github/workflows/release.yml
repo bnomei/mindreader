@@ -106,6 +106,7 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --locked --all-targets --all-features -- -D warnings
           cargo test --locked --all-targets --all-features
+          RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --all-features
           cargo publish --dry-run --locked -p mindreader
       - name: Verify distribution contracts
         run: |

@@ -11,7 +11,7 @@ use neo4rs::{Error as Neo4jError, Neo4jErrorKind};
 use std::error::Error as StdError;
 use thiserror::Error;
 
-/// Crate-wide result alias using [`Error`].
+/// Crate-wide result alias using [`enum@Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Application error with preserved sources and retry-relevant variants.

@@ -1746,7 +1746,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
     }))
 }
 
-/// Soft-retract selected fact memberships by setting `validTo` (no hard deletes).
+/// Remove selected fact memberships and set `validTo` after the last one is removed.
 pub async fn memory_retract(graph: &Graph, args: RetractArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_retract_once(graph, args.clone()).await {
