@@ -93,6 +93,10 @@ fn target_schema() -> serde_json::Value {
     )
 }
 
+fn node_target_schema(description: &str) -> serde_json::Value {
+    target_schema_with_kinds(&["node"], description)
+}
+
 fn fact_target_schema() -> serde_json::Value {
     target_schema_with_kinds(
         &["fact"],
@@ -322,6 +326,7 @@ fn about_schema() -> Value {
 fn episode_schema() -> Value {
     json!({
         "type": ["object", "null"],
+        "additionalProperties": false,
         "properties": {
             "iri": { "type": "string" },
             "at": { "type": "string" },
@@ -402,27 +407,13 @@ fn review_schema() -> Value {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "source": {
-                            "type": "object",
-                            "properties": {
-                                "kind": { "type": "string", "enum": ["node"] },
-                                "iri": { "type": "string" },
-                                "name": { "type": ["string", "null"] }
-                            },
-                            "required": ["kind", "iri"]
-                        },
-                        "target": {
-                            "type": "object",
-                            "properties": {
-                                "kind": { "type": "string", "enum": ["node"] },
-                                "iri": { "type": "string" },
-                                "name": { "type": ["string", "null"] }
-                            },
-                            "required": ["kind", "iri"]
-                        },
+                        "source": node_target_schema("Pasteable absorbed node handle."),
+                        "sourceName": { "type": "string" },
+                        "target": node_target_schema("Pasteable surviving node handle."),
+                        "targetName": { "type": "string" },
                         "similarity": { "type": "number", "minimum": 0, "maximum": 1 }
                     },
-                    "required": ["source", "target", "similarity"]
+                    "required": ["source", "sourceName", "target", "targetName", "similarity"]
                 }
             },
             "alternatives": {
@@ -902,6 +893,7 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
             "description": "For around recall, paths[i] is the deterministic shortest witness path for facts[i].",
             "items": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "nodes": { "type": "array", "items": { "type": "string" } },
                     "edges": { "type": "array", "items": relationship_schema() }
@@ -941,6 +933,7 @@ fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
             "type": "array",
             "items": {
                 "type": "object",
+                "additionalProperties": false,
                 "properties": {
                     "nodes": { "type": "array", "items": { "type": "string" } },
                     "edges": { "type": "array", "items": relationship_schema() }
@@ -1281,6 +1274,36 @@ mod tests {
         }
     }
 
+    fn assert_object_schemas_are_closed(value: &Value, tool: &str) {
+        match value {
+            Value::Object(map) => {
+                let is_object = map
+                    .get("type")
+                    .is_some_and(|schema_type| match schema_type {
+                        Value::String(value) => value == "object",
+                        Value::Array(values) => values.iter().any(|value| value == "object"),
+                        _ => false,
+                    });
+                if is_object {
+                    assert_eq!(
+                        map.get("additionalProperties"),
+                        Some(&Value::Bool(false)),
+                        "tool {tool} contains an open object schema: {value}"
+                    );
+                }
+                for child in map.values() {
+                    assert_object_schemas_are_closed(child, tool);
+                }
+            }
+            Value::Array(values) => {
+                for child in values {
+                    assert_object_schemas_are_closed(child, tool);
+                }
+            }
+            _ => {}
+        }
+    }
+
     #[test]
     fn registers_eight_tools() {
         let names = Mindreader::registered_tool_names();
@@ -1569,6 +1592,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{} missing outputSchema", tool.name));
             let schema = Value::Object((**schema).clone());
             assert_no_union_keywords(&schema, &tool.name);
+            assert_object_schemas_are_closed(&schema, &tool.name);
             assert_eq!(
                 schema.get("type").and_then(Value::as_str),
                 Some("object"),

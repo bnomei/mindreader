@@ -1350,13 +1350,14 @@ async fn run() -> Result<u32> {
         ),
     );
 
+    let schema_property_iri = format!("mindreader:property/{property}");
     let schema_place = service
         .place(PlaceArgs {
             scope: Vec::new(),
             edits: vec![PlaceEdit {
                 target: TargetArgs {
                     kind: "node".into(),
-                    iri: format!("mindreader:property/{property}"),
+                    iri: schema_property_iri.clone(),
                 },
                 add: vec![layer_a.clone()],
                 remove: Vec::new(),
@@ -1460,6 +1461,44 @@ async fn run() -> Result<u32> {
             limit: Some(1),
         })
         .await?;
+    let catalog_before = service
+        .recall(RecallArgs {
+            scope: Vec::new(),
+            text: None,
+            iris: None,
+            labels: Some(vec!["Property".into()]),
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            history: None,
+            detail: None,
+            limit: Some(100),
+        })
+        .await?;
+    let judged_schema_iri = catalog_before
+        .pointer("/nodes/0/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| operation_error!("Property catalog has no first node: {catalog_before}"))?
+        .to_string();
+    let judged_schema_weight = catalog_before
+        .pointer("/nodes/0/weight")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| {
+            operation_error!("Property catalog has no first weight: {catalog_before}")
+        })?;
+    let schema_judgment = service
+        .judge(JudgeArgs {
+            scope: Vec::new(),
+            ratings: vec![JudgeRating {
+                target: TargetArgs {
+                    kind: "node".into(),
+                    iri: judged_schema_iri.clone(),
+                },
+                mode: "strengthen".into(),
+            }],
+        })
+        .await?;
     let catalog = service
         .recall(RecallArgs {
             scope: Vec::new(),
@@ -1531,6 +1570,10 @@ async fn run() -> Result<u32> {
     report.check(
         "memory_recall catalog emits pasteable node handles in the normalized schema",
         catalog.get("mode").and_then(Value::as_str) == Some("catalog")
+            && schema_judgment
+                .pointer("/items/0/after")
+                .and_then(Value::as_i64)
+                == Some(judged_schema_weight + 1)
             && catalog
                 .get("nodes")
                 .and_then(Value::as_array)
@@ -1544,8 +1587,21 @@ async fn run() -> Result<u32> {
                                     .get("scope")
                                     .and_then(Value::as_array)
                                     .is_some_and(Vec::is_empty)
+                                && node.get("stub").and_then(Value::as_bool) == Some(false)
+                                && node.get("weight").and_then(Value::as_i64).is_some()
                         })
-                }),
+                })
+            && catalog
+                .get("nodes")
+                .and_then(Value::as_array)
+                .and_then(|nodes| {
+                    nodes.iter().find(|node| {
+                        node.get("iri").and_then(Value::as_str) == Some(judged_schema_iri.as_str())
+                    })
+                })
+                .and_then(|node| node.get("weight"))
+                .and_then(Value::as_i64)
+                == Some(judged_schema_weight + 1),
         &catalog,
     );
 
@@ -1859,9 +1915,9 @@ async fn run() -> Result<u32> {
             .and_then(Value::as_array)
             .is_some_and(|items| {
                 items.iter().any(|item| {
-                    item.pointer("/source/name").and_then(Value::as_str)
+                    item.get("sourceName").and_then(Value::as_str)
                         == Some(same_txn_long_name.as_str())
-                        && item.pointer("/target/name").and_then(Value::as_str)
+                        && item.get("targetName").and_then(Value::as_str)
                             == Some(same_txn_short_name.as_str())
                 })
             }),

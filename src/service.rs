@@ -124,15 +124,22 @@ impl MemoryService {
                 let mut items = Vec::new();
                 if labels.iter().any(|label| label.trim() == "Class") {
                     let catalog = tools::list_schema_catalog(&self.graph, "class").await?;
-                    if let Some(nodes) = catalog.get("items").and_then(Value::as_array) {
-                        items.extend(nodes.iter().map(|node| catalog_node(node, "Class")));
-                    }
+                    let nodes = catalog
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| crate::operation_error!("Class catalog is missing items"))?;
+                    items.extend(nodes.iter().cloned());
                 }
                 if labels.iter().any(|label| label.trim() == "Property") {
                     let catalog = tools::list_schema_catalog(&self.graph, "property").await?;
-                    if let Some(nodes) = catalog.get("items").and_then(Value::as_array) {
-                        items.extend(nodes.iter().map(|node| catalog_node(node, "Property")));
-                    }
+                    let nodes =
+                        catalog
+                            .get("items")
+                            .and_then(Value::as_array)
+                            .ok_or_else(|| {
+                                crate::operation_error!("Property catalog is missing items")
+                            })?;
+                    items.extend(nodes.iter().cloned());
                 }
                 let truncated = items.len() > args.limit.unwrap_or(20) as usize;
                 items.truncate(args.limit.unwrap_or(20) as usize);
@@ -207,19 +214,4 @@ impl MemoryService {
     pub async fn unify(&self, args: UnifyArgs) -> Result<Value> {
         merge::memory_unify(&self.graph, args).await
     }
-}
-
-/// Always-global Class/Property catalog row (`layers=[]`) for `memory_recall` labels.
-fn catalog_node(value: &Value, label: &str) -> Value {
-    let iri = value.get("iri").cloned().unwrap_or(Value::Null);
-    json!({
-        "kind": "node",
-        "iri": iri.clone(),
-        "name": value.get("name").cloned().unwrap_or(Value::Null),
-        "labels": [label],
-        "scope": [],
-        "weight": 0,
-        "stub": value.get("stub").cloned().unwrap_or(Value::Bool(false)),
-        "target": { "kind": "node", "iri": iri },
-    })
 }

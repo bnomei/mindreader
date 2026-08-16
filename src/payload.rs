@@ -382,7 +382,7 @@ pub fn finish_mutation(
     result
 }
 
-/// Advisory unify row using the same node-handle dialect as `memory_unify`.
+/// Advisory unify row with exact pasteable handles and separate display names.
 pub fn unify_review_item(
     source: &str,
     source_name: &str,
@@ -391,8 +391,10 @@ pub fn unify_review_item(
     similarity: f64,
 ) -> Value {
     json!({
-        "source": { "kind": "node", "iri": source, "name": source_name },
-        "target": { "kind": "node", "iri": target, "name": target_name },
+        "source": { "kind": "node", "iri": source },
+        "sourceName": source_name,
+        "target": { "kind": "node", "iri": target },
+        "targetName": target_name,
         "similarity": similarity,
     })
 }
@@ -401,7 +403,7 @@ pub fn unify_review_item(
 mod tests {
     use super::{
         decorate_fact, finish_recall, handles_bag, nodes_from_facts, omit_iris_top_level_facts,
-        record_mutable, Detail,
+        record_mutable, unify_review_item, Detail,
     };
     use serde_json::json;
 
@@ -415,6 +417,15 @@ mod tests {
             &["project:x".into(), "team:y".into()]
         ));
         assert!(!record_mutable(&["project:x".into()], &["team:y".into()]));
+    }
+
+    #[test]
+    fn unify_review_handles_are_exactly_pasteable() {
+        let item = unify_review_item("element:a", "A", "element:b", "B", 0.9);
+        assert_eq!(item["source"], json!({"kind": "node", "iri": "element:a"}));
+        assert_eq!(item["target"], json!({"kind": "node", "iri": "element:b"}));
+        assert_eq!(item["sourceName"], "A");
+        assert_eq!(item["targetName"], "B");
     }
 
     #[test]

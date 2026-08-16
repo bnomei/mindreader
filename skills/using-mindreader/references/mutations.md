@@ -72,7 +72,7 @@ Removing a target's final named membership stores an empty membership list and m
 
 ## Review and unify identities
 
-`review.unify` contains fuzzy same-kind candidates, not proof. Ignore irrelevant suggestions. Call `mindreader:memory_unify` only when evidence independently establishes that two nodes are the same identity and which IRI/name should survive.
+`review.unify` contains fuzzy same-kind candidates, not proof. Use `sourceName` / `targetName` as display context, ignore irrelevant suggestions, and call `mindreader:memory_unify` only when evidence independently establishes that two nodes are the same identity and which IRI/name should survive.
 
 Paste `review.unify[].source` and `.target`, or `handles.unify[]`, as node handles. Unify has no `scope`, is database-wide and permanent, reconciles all memberships and history, and has no undo. The `target` survives; the source node is removed and no alias is created. If identity or direction remains uncertain, skip it.
 

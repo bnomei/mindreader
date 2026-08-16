@@ -394,7 +394,7 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 | `memory_place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
 | `memory_unify` | same-kind `source` and `target` node handles | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |
 
-Successful results include a `handles` bag. Fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. `memory_write` and `memory_revise` return neutral review queues. `review.unify` items use `{kind:"node", iri, name}` on `source` and `target` — the same dialect as `memory_unify`. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
+Successful results include a `handles` bag. Fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. `memory_write` and `memory_revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
 
 `memory_recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate filtering and deterministic ordering happen before the result limit. `iris` applies `limit` per requested IRI; `around` still uses one fact budget for the walk.
 

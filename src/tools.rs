@@ -293,6 +293,13 @@ struct WithdrawalPlan {
     pub reason: Option<String>,
 }
 
+struct WithdrawalResult {
+    scope: Vec<String>,
+    episode: Option<Episode>,
+    withdrawn_targets: Vec<Value>,
+    reason: Option<String>,
+}
+
 /// Pasteable handle: `kind` is `node` or `fact`, plus a stable IRI.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -725,7 +732,7 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
         let mut items = Vec::with_capacity(prepared.len());
         let mut alternatives = Vec::new();
         for fact in prepared {
-            let item = assert_prepared_fact_txn(&mut txn, fact, &layers, &episode).await?;
+            let item = write_prepared_fact_txn(&mut txn, fact, &layers, &episode).await?;
             any_changed |= !item.noop;
             created_iris.extend(item.created_iris);
             if !item.alternatives.is_empty() {
@@ -818,7 +825,7 @@ struct PreparedFactResult {
     alternatives: Vec<Value>,
 }
 
-async fn assert_prepared_fact_txn(
+async fn write_prepared_fact_txn(
     txn: &mut Txn,
     fact: PreparedWriteFact,
     layers: &[String],
@@ -1256,7 +1263,7 @@ async fn apply_withdrawal(
     graph: &Graph,
     args: WithdrawalPlan,
     expected_fact_iri: Option<&str>,
-) -> Result<Value> {
+) -> Result<WithdrawalResult> {
     for attempt in 0..3_u64 {
         match apply_withdrawal_once(graph, args.clone(), expected_fact_iri).await {
             Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
@@ -1272,7 +1279,7 @@ async fn apply_withdrawal_once(
     graph: &Graph,
     args: WithdrawalPlan,
     expected_fact_iri: Option<&str>,
-) -> Result<Value> {
+) -> Result<WithdrawalResult> {
     let layers = normalize_layers(args.layers)?;
     let scope = WithdrawalScope::parse(&args.target.kind)?;
     let subject = EntityRef::from_input(args.target.s)?;
@@ -1332,11 +1339,18 @@ async fn apply_withdrawal_once(
                       AND NOT type(r) IN $protected
                       AND NOT s:Class AND NOT s:Property
                       AND NOT o:Class AND NOT o:Property
+                      AND (size(s.layers) = 0
+                           OR any(layer IN s.layers WHERE layer IN $layers))
+                      AND (size(r.layers) = 0
+                           OR any(layer IN r.layers WHERE layer IN $layers))
+                      AND (size(o.layers) = 0
+                           OR any(layer IN o.layers WHERE layer IN $layers))
                     RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers
                     "#,
                 )
                 .param("s", subject_iri.clone())
-                .param("protected", protected),
+                .param("protected", protected)
+                .param("layers", layers.clone()),
             )
             .await?
         }
@@ -1359,18 +1373,25 @@ async fn apply_withdrawal_once(
                 format!(
                     "MATCH (s:Entity {{iri: $s}})-[r{rel}]->(o:Entity) \
                      WHERE r.validTo IS NULL {object_clause} {target_clause} \
+                       AND (size(s.layers) = 0 OR any(layer IN s.layers WHERE layer IN $layers)) \
+                       AND (size(r.layers) = 0 OR any(layer IN r.layers WHERE layer IN $layers)) \
+                       AND (size(o.layers) = 0 OR any(layer IN o.layers WHERE layer IN $layers)) \
                      RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers"
                 )
             } else {
                 format!(
                     "MATCH (s:Entity {{iri: $s}})-[r:ASSERTS]->(o:Entity) \
                      WHERE r.validTo IS NULL AND r.propertyIri = $p {object_clause} {target_clause} \
+                       AND (size(s.layers) = 0 OR any(layer IN s.layers WHERE layer IN $layers)) \
+                       AND (size(r.layers) = 0 OR any(layer IN r.layers WHERE layer IN $layers)) \
+                       AND (size(o.layers) = 0 OR any(layer IN o.layers WHERE layer IN $layers)) \
                      RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers"
                 )
             };
             let mut q = query(&cypher)
                 .param("s", subject_iri.clone())
-                .param("p", predicate.to_string());
+                .param("p", predicate.to_string())
+                .param("layers", layers.clone());
             if let Some(object) = &object_iri {
                 q = q.param("o", object.clone());
             }
@@ -1412,14 +1433,12 @@ async fn apply_withdrawal_once(
             .into());
         }
         txn.rollback().await?;
-        return Ok(json!({
-            "withdrawn": 0,
-            "soft": true,
-            "scope": layers,
-            "episode": Value::Null,
-            "reason": args.reason,
-            "withdrawnTargets": [],
-        }));
+        return Ok(WithdrawalResult {
+            scope: layers,
+            episode: None,
+            withdrawn_targets: Vec::new(),
+            reason: args.reason,
+        });
     }
     let episode =
         create_episode_in_txn(&mut txn, "memory_withdraw", args.reason.as_deref()).await?;
@@ -1430,14 +1449,12 @@ async fn apply_withdrawal_once(
             operation: "memory_withdraw",
             source,
         })?;
-    Ok(json!({
-        "withdrawn": changes.len(),
-        "soft": true,
-        "scope": layers,
-        "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
-        "reason": args.reason,
-        "withdrawnTargets": withdrawn_targets,
-    }))
+    Ok(WithdrawalResult {
+        scope: layers,
+        episode: Some(episode),
+        withdrawn_targets,
+        reason: args.reason,
+    })
 }
 
 fn schema_node_labels(labels: &[String]) -> bool {
@@ -2193,43 +2210,25 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
     };
     let expected_fact_iri = args.target.as_ref().map(|target| target.iri.as_str());
     let result = apply_withdrawal(graph, withdrawal, expected_fact_iri).await?;
-    let withdrawn = result
-        .get("withdrawn")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| operation_error!("memory_withdraw result is missing withdrawn count"))?;
-    let withdrawn_targets = result
-        .get("withdrawnTargets")
-        .and_then(Value::as_array)
-        .cloned()
-        .map(Value::Array)
-        .ok_or_else(|| operation_error!("memory_withdraw result is missing withdrawn targets"))?;
-    let withdrawn_facts = withdrawn_targets
-        .as_array()
-        .into_iter()
-        .flatten()
+    let withdrawn = result.withdrawn_targets.len();
+    let withdrawn_facts = result
+        .withdrawn_targets
+        .iter()
         .map(|target| json!({ "target": target }))
         .collect::<Vec<_>>();
-    let scope = result
-        .get("scope")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_withdraw result is missing scope"))?;
-    let episode = result
-        .get("episode")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_withdraw result is missing episode"))?;
-    let reason = result
-        .get("reason")
-        .cloned()
-        .ok_or_else(|| operation_error!("memory_withdraw result is missing reason"))?;
+    let episode = result.episode.map_or(
+        Value::Null,
+        |episode| json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool }),
+    );
     Ok(finish_mutation(
         json!({
             "ok": true,
-            "scope": scope,
+            "scope": result.scope,
             "noop": withdrawn == 0,
             "episode": episode,
             "withdrawn": withdrawn,
-            "withdrawnTargets": withdrawn_targets,
-            "reason": reason,
+            "withdrawnTargets": result.withdrawn_targets,
+            "reason": result.reason,
         }),
         &withdrawn_facts,
         &[],
@@ -2954,17 +2953,21 @@ pub async fn list_schema_catalog(graph: &Graph, kind: &str) -> Result<Value> {
             let name = row.get::<String>("name")?;
             let stub = row.get::<bool>("stub")?;
             let layers = row.get::<Vec<String>>("layers")?;
-            let _weight = row.get::<i64>("weight")?;
+            let weight = row.get::<i64>("weight")?;
             if stub || !layers.is_empty() {
                 return Err(operation_error!(
                     "schema catalog node {iri} must have stub=false and global scope"
                 ));
             }
             Ok(json!({
-                "kind": kind,
-                "iri": iri,
+                "kind": "node",
+                "iri": iri.clone(),
                 "name": name,
+                "labels": [label.clone()],
+                "scope": layers,
+                "weight": weight,
                 "stub": stub,
+                "target": { "kind": "node", "iri": iri },
             }))
         })
         .collect::<Result<Vec<_>>>()?;
