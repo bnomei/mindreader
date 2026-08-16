@@ -800,6 +800,7 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
         "nodes": { "type": "array", "items": node_schema() },
         "paths": {
             "type": "array",
+            "description": "For around recall, paths[i] is the deterministic shortest witness path for facts[i].",
             "items": {
                 "type": "object",
                 "properties": {
@@ -964,7 +965,7 @@ impl Mindreader {
     #[tool(
         name = "memory_recall",
         title = "Recall visible memory",
-        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, or around; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris; p and depth apply only to around, with predicates filtered before limiting. Class or Property labels read the global catalog.",
+        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, or around; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris; p and depth apply only to around, with predicates filtered before limiting and paths[i] giving the deterministic shortest witness for facts[i]. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)

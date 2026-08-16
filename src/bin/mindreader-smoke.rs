@@ -1419,6 +1419,19 @@ async fn run() -> Result<u32> {
             limit: Some(1),
         })
         .await?;
+    let witnessed_around = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone(), layer_c.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: Some(closure_subject.clone()),
+            hops: None,
+            p: Some(vec![property.clone()]),
+            depth: Some(1),
+            limit: Some(1),
+        })
+        .await?;
     let catalog = service
         .recall(RecallArgs {
             scope: Vec::new(),
@@ -1433,7 +1446,7 @@ async fn run() -> Result<u32> {
         })
         .await?;
     report.check(
-        "memory_recall preserves IRI order and misses, enforces one fact budget, and filters around before limit",
+        "memory_recall preserves IRI order and misses, enforces one fact budget, and returns filtered witness paths",
         recalled.get("mode").and_then(Value::as_str) == Some("iris")
             && lookup_order == recall_order.iter().map(String::as_str).collect::<Vec<_>>()
             && recalled
@@ -1450,8 +1463,31 @@ async fn run() -> Result<u32> {
             && filtered_around
                 .get("facts")
                 .and_then(Value::as_array)
-                .is_some_and(Vec::is_empty),
-        format!("iris={recalled} around={filtered_around}"),
+                .is_some_and(Vec::is_empty)
+            && witnessed_around
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| facts.len() == 1)
+            && witnessed_around
+                .get("paths")
+                .and_then(Value::as_array)
+                .is_some_and(|paths| {
+                    paths.len() == 1
+                        && paths[0]
+                            .get("nodes")
+                            .and_then(Value::as_array)
+                            .is_some_and(|nodes| {
+                                nodes.first().and_then(Value::as_str)
+                                    == Some(closure_subject.as_str())
+                            })
+                        && paths[0]
+                            .get("edges")
+                            .and_then(Value::as_array)
+                            .is_some_and(|edges| edges.len() == 1)
+                }),
+        format!(
+            "iris={recalled} filtered={filtered_around} witnessed={witnessed_around}"
+        ),
     );
     report.check(
         "memory_recall catalog emits pasteable node handles in the normalized schema",

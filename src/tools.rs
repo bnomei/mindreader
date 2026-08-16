@@ -560,6 +560,18 @@ fn plan_fact_membership_changes(
         .collect()
 }
 
+fn select_replace_current(
+    currents: &[CurrentFact],
+    selected_layers: &[String],
+    expected_fact_iri: Option<&str>,
+) -> Option<CurrentFact> {
+    currents
+        .iter()
+        .find(|current| expected_fact_iri.is_none_or(|iri| current.iri == iri))
+        .filter(|current| remove_memberships(&current.layers, selected_layers).is_some())
+        .cloned()
+}
+
 async fn find_current_pairs_txn(
     txn: &mut Txn,
     s: &str,
@@ -1744,8 +1756,16 @@ async fn change_fact_memberships_batch_txn(
 
 /// In-process replace by restated `s`/`p`/`old`; MCP prefers a fact handle.
 pub async fn memory_replace(graph: &Graph, args: ReplaceArgs) -> Result<Value> {
+    memory_replace_selected(graph, args, None).await
+}
+
+async fn memory_replace_selected(
+    graph: &Graph,
+    args: ReplaceArgs,
+    expected_fact_iri: Option<&str>,
+) -> Result<Value> {
     for attempt in 0..3_u64 {
-        match memory_replace_once(graph, args.clone()).await {
+        match memory_replace_once(graph, args.clone(), expected_fact_iri).await {
             Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
                 sleep(Duration::from_millis(25 * (attempt + 1))).await;
             }
@@ -1755,7 +1775,11 @@ pub async fn memory_replace(graph: &Graph, args: ReplaceArgs) -> Result<Value> {
     unreachable!("bounded retry loop always returns")
 }
 
-async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> {
+async fn memory_replace_once(
+    graph: &Graph,
+    args: ReplaceArgs,
+    expected_fact_iri: Option<&str>,
+) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let predicate = PredicateRef::parse(&args.p)?;
     reject_system_owned_predicate(predicate.iri())?;
@@ -1799,13 +1823,13 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
         &old_iri,
     )
     .await?;
-    let old_current = old_currents
-        .first()
-        .filter(|current| remove_memberships(&current.layers, &layers).is_some())
-        .cloned()
+    let old_current = select_replace_current(&old_currents, &layers, expected_fact_iri)
         .ok_or_else(|| {
+            let selected = expected_fact_iri
+                .map(|iri| format!("fact handle {iri}"))
+                .unwrap_or_else(|| format!("fact ({subject_iri}, {prop_iri}, {old_iri})"));
             DomainError::Precondition(format!(
-                "cannot replace the selected memberships of non-current fact ({subject_iri}, {prop_iri}, {old_iri})"
+                "cannot replace the selected memberships of non-current {selected}"
             ))
         })?;
     if old_iri == new_iri {
@@ -1953,8 +1977,16 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
 
 /// In-process soft retract; MCP `memory_withdraw` accepts a fact handle or subject.
 pub async fn memory_retract(graph: &Graph, args: RetractArgs) -> Result<Value> {
+    memory_retract_selected(graph, args, None).await
+}
+
+async fn memory_retract_selected(
+    graph: &Graph,
+    args: RetractArgs,
+    expected_fact_iri: Option<&str>,
+) -> Result<Value> {
     for attempt in 0..3_u64 {
-        match memory_retract_once(graph, args.clone()).await {
+        match memory_retract_once(graph, args.clone(), expected_fact_iri).await {
             Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
                 sleep(Duration::from_millis(25 * (attempt + 1))).await;
             }
@@ -1964,7 +1996,11 @@ pub async fn memory_retract(graph: &Graph, args: RetractArgs) -> Result<Value> {
     unreachable!("bounded retry loop always returns")
 }
 
-async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> {
+async fn memory_retract_once(
+    graph: &Graph,
+    args: RetractArgs,
+    expected_fact_iri: Option<&str>,
+) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let scope = RetractScope::parse(&args.target.kind)?;
     let subject = EntityRef::from_input(args.target.s)?;
@@ -2044,16 +2080,19 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
                 .as_ref()
                 .map(|_| "AND o.iri = $o")
                 .unwrap_or_default();
+            let target_clause = expected_fact_iri
+                .map(|_| "AND r.iri = $targetIri")
+                .unwrap_or_default();
             let cypher = if let Some(rel) = rel_clause {
                 format!(
                     "MATCH (s:Entity {{iri: $s}})-[r{rel}]->(o:Entity) \
-                     WHERE r.validTo IS NULL {object_clause} \
+                     WHERE r.validTo IS NULL {object_clause} {target_clause} \
                      RETURN id(r) AS rid, r.iri AS iri, coalesce(r.layers, []) AS layers"
                 )
             } else {
                 format!(
                     "MATCH (s:Entity {{iri: $s}})-[r:ASSERTS]->(o:Entity) \
-                     WHERE r.validTo IS NULL AND r.propertyIri = $p {object_clause} \
+                     WHERE r.validTo IS NULL AND r.propertyIri = $p {object_clause} {target_clause} \
                      RETURN id(r) AS rid, r.iri AS iri, coalesce(r.layers, []) AS layers"
                 )
             };
@@ -2062,6 +2101,9 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
                 .param("p", predicate.to_string());
             if let Some(object) = &object_iri {
                 q = q.param("o", object.clone());
+            }
+            if let Some(target_iri) = expected_fact_iri {
+                q = q.param("targetIri", target_iri.to_string());
             }
             fetch_all_txn(&mut txn, q).await?
         }
@@ -3093,13 +3135,20 @@ fn recall_around_query(depth: u32) -> String {
             AND (size(coalesce(pathRel.layers, [])) = 0
                  OR any(layer IN coalesce(pathRel.layers, []) WHERE layer IN $layers)))
         UNWIND relationships(path) AS r
-        WITH r, min(length(path)) AS distance
-        WITH distance, startNode(r) AS s, r, endNode(r) AS o,
-             coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
+        WITH path, r,
+             coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property,
+             length(path) AS distance,
+             [node IN nodes(path) | node.iri] AS pathNodes,
+             [pathRel IN relationships(path) | pathRel.iri] AS pathEdgeIris
         WHERE size($predicates) = 0 OR property IN $predicates
+        ORDER BY r.iri ASC, distance ASC, pathNodes ASC, pathEdgeIris ASC
+        WITH r, property, head(collect(path)) AS path,
+             head(collect(pathNodes)) AS witnessNodes, min(distance) AS distance
+        WITH distance, path, witnessNodes, startNode(r) AS s, r, endNode(r) AS o,
+             property
         ORDER BY distance ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
         LIMIT $limit
-        RETURN distance, s, r, o, property
+        RETURN distance, path, witnessNodes AS pathNodes, s, r, o, property
         "#
     )
 }
@@ -3172,10 +3221,13 @@ pub async fn memory_recall_around(
     .await?;
     let truncated = rows.len() > limit as usize;
     let mut facts = Vec::new();
+    let mut paths = Vec::new();
     let mut nodes_by_iri = HashMap::new();
     nodes_by_iri.insert(from.to_string(), node_json(&start));
     for row in rows.into_iter().take(limit as usize) {
-        let (Ok(subject), Ok(relationship), Ok(object), Ok(property)) = (
+        let (Ok(path), Ok(path_nodes), Ok(subject), Ok(relationship), Ok(object), Ok(property)) = (
+            row.get::<Path>("path"),
+            row.get::<Vec<String>>("pathNodes"),
             row.get::<Node>("s"),
             row.get::<Relation>("r"),
             row.get::<Node>("o"),
@@ -3187,6 +3239,13 @@ pub async fn memory_recall_around(
         let object_iri = object.get::<String>("iri").unwrap_or_default();
         nodes_by_iri.insert(subject_iri.clone(), node_json(&subject));
         nodes_by_iri.insert(object_iri.clone(), node_json(&object));
+        let (decoded_nodes, path_edges, _) = path_to_json(&path);
+        for node in decoded_nodes {
+            if let Some(iri) = node.get("iri").and_then(Value::as_str) {
+                nodes_by_iri.insert(iri.to_string(), node);
+            }
+        }
+        paths.push(json!({ "nodes": path_nodes, "edges": path_edges }));
         let relationship = rel_json(&relationship, &subject_iri, &object_iri);
         let memberships = relationship
             .get("scope")
@@ -3218,7 +3277,7 @@ pub async fn memory_recall_around(
         "from": from,
         "facts": facts,
         "nodes": nodes,
-        "paths": [],
+        "paths": paths,
         "about": [],
         "lookups": [],
         "truncated": truncated,
@@ -3315,7 +3374,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
     }
     let layers = normalize_layers(args.scope)?;
     let (s, p, old) = load_current_fact(graph, &args.target.iri, &layers).await?;
-    let result = memory_replace(
+    let result = memory_replace_selected(
         graph,
         ReplaceArgs {
             s,
@@ -3327,6 +3386,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
             contradicts: args.contradicts,
             reason: args.reason,
         },
+        Some(&args.target.iri),
     )
     .await?;
     let noop = result.get("noop").and_then(Value::as_bool).unwrap_or(false);
@@ -3423,7 +3483,8 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
             reason: args.reason,
         }
     };
-    let result = memory_retract(graph, retract).await?;
+    let expected_fact_iri = args.target.as_ref().map(|target| target.iri.as_str());
+    let result = memory_retract_selected(graph, retract, expected_fact_iri).await?;
     let retracted = result.get("retracted").and_then(Value::as_u64).unwrap_or(0);
     let withdrawn_targets = result
         .get("withdrawnTargets")
@@ -4111,11 +4172,11 @@ mod tests {
         assert_fact_lock_requests, effective_weight, merge_memberships,
         plan_fact_membership_changes, prepare_assert_fact, recall_around_query,
         reject_system_owned_predicate, remove_memberships, replace_fact_lock_requests,
-        retract_fact_lock_requests, schema_write_fields_present, validate_assert_args,
-        validate_judge_args, validate_schema_list_args, AssertArgs, AssertFact, CurrentFact,
-        FactMembershipChange, JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, SchemaArgs, TargetArgs,
-        CONTRADICTS_PROPERTY, LAYERS_PROPERTY, MAX_ASSERT_FACTS, PREDICATE_USAGE_PROPERTY,
-        RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
+        retract_fact_lock_requests, schema_write_fields_present, select_replace_current,
+        validate_assert_args, validate_judge_args, validate_schema_list_args, AssertArgs,
+        AssertFact, CurrentFact, FactMembershipChange, JudgeArgs, JudgeRating, PlaceArgs,
+        PlaceEdit, SchemaArgs, TargetArgs, CONTRADICTS_PROPERTY, LAYERS_PROPERTY, MAX_ASSERT_FACTS,
+        PREDICATE_USAGE_PROPERTY, RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
     };
     use crate::domain::{DomainError, EntityInput, ObjectInput};
     use crate::error::Error;
@@ -4142,6 +4203,9 @@ mod tests {
         let limit = around.find("LIMIT $limit").unwrap();
         assert!(around.contains("pathRels*1..3"));
         assert!(predicate_filter < limit);
+        assert!(around.contains("pathNodes ASC, pathEdgeIris ASC"));
+        assert!(around.contains("head(collect(path)) AS path"));
+        assert!(around.contains("RETURN distance, path, witnessNodes AS pathNodes"));
         assert!(
             around.contains("ORDER BY distance ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC")
         );
@@ -4160,6 +4224,30 @@ mod tests {
         assert_eq!(
             merge_memberships(&["project:b".into()], &["project:a".into()]),
             vec!["project:a".to_string(), "project:b".to_string()]
+        );
+    }
+
+    #[test]
+    fn fact_handle_selection_never_falls_through_to_a_reasserted_identity() {
+        let replacement = CurrentFact {
+            rel_id: 2,
+            iri: "fact:new".into(),
+            layers: vec!["project:a".into()],
+        };
+        assert!(select_replace_current(
+            std::slice::from_ref(&replacement),
+            &["project:a".into()],
+            Some("fact:retired"),
+        )
+        .is_none());
+        assert_eq!(
+            select_replace_current(
+                std::slice::from_ref(&replacement),
+                &["project:a".into()],
+                Some("fact:new"),
+            )
+            .map(|current| current.iri),
+            Some("fact:new".into())
         );
     }
 

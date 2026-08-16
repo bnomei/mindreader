@@ -305,6 +305,9 @@ Call `memory_recall` with `around` and optional predicate names:
 }
 ```
 
+For `around`, `paths[i]` is the deterministic shortest witness path for
+`facts[i]`; intermediate path edges do not consume the requested fact limit.
+
 Reasserting the same current triple returns `"noop": true`. Asserting a different object adds another current value. Use `memory_revise` when one exact current value is a correction of another.
 
 After a returned fact helps, strengthen its shared weight explicitly:
@@ -352,7 +355,7 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
-| `memory_recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around` | Selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, paths, or the Class/Property catalog. Never calls an embedding provider. `iris` accepts 1–20 node IRIs and preserves input order and misses. |
+| `memory_recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around` | Selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, paths, or the Class/Property catalog. Never calls an embedding provider. `iris` accepts 1–20 node IRIs and preserves input order and misses; `around` aligns each fact with a deterministic shortest witness path. |
 | `memory_recall_semantic` | `scope`, non-empty `text` | `labels[]`, `limit` (default `20`, max `100`) | Provider-backed conceptual recall with expiring semantic activations. Sends only query text to the configured embedding provider. |
 | `memory_write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships. One Episode if any fact changed. |
 | `memory_revise` | `scope`, fact `target`, `new` | `spike`, `contradicts`, `reason` | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
