@@ -1356,6 +1356,7 @@ pub fn fact_envelope(
         "scope": scope,
         "spike": spike,
         "weight": weight,
+        "current": true,
     }))
 }
 

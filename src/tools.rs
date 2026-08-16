@@ -777,7 +777,7 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
             return Err(error);
         }
     };
-    Ok(finish_mutation(
+    finish_mutation(
         json!({
             "ok": true,
             "noop": !changed,
@@ -794,7 +794,7 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
         &[],
         None,
         None,
-    ))
+    )
 }
 
 fn review_payloads(merge_suggestions: &[Value], alternatives: &[Value]) -> Value {
@@ -2141,7 +2141,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
         Value::Null,
         |episode| json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool }),
     );
-    Ok(finish_mutation(
+    finish_mutation(
         json!({
             "ok": true,
             "scope": result.scope,
@@ -2159,7 +2159,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
         &[],
         Some(current_target),
         Some(previous_target),
-    ))
+    )
 }
 
 /// MCP `memory_withdraw`: soft-withdraw by fact IRI or subject (optional predicate).
@@ -2220,7 +2220,7 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
         Value::Null,
         |episode| json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool }),
     );
-    Ok(finish_mutation(
+    finish_mutation(
         json!({
             "ok": true,
             "scope": result.scope,
@@ -2234,7 +2234,7 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
         &[],
         None,
         None,
-    ))
+    )
 }
 
 /// Map `strengthen`/`weaken` to a single +1 or -1 weight step.
@@ -2439,7 +2439,7 @@ async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
         .filter(|item| item.pointer("/target/kind").and_then(Value::as_str) == Some("node"))
         .filter_map(|item| item.get("target").cloned())
         .collect::<Vec<_>>();
-    Ok(finish_mutation(
+    finish_mutation(
         json!({
             "ok": true,
             "scope": scope,
@@ -2452,7 +2452,7 @@ async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
         &judge_nodes,
         None,
         None,
-    ))
+    )
 }
 
 /// Apply 1–20 explicit ratings atomically under one `memory_judge` Episode.
@@ -2897,7 +2897,7 @@ async fn memory_place_once(
         .filter(|item| item.pointer("/target/kind").and_then(Value::as_str) == Some("node"))
         .filter_map(|item| item.get("target").cloned())
         .collect::<Vec<_>>();
-    Ok(finish_mutation(
+    finish_mutation(
         json!({
             "ok": true,
             "scope": scope,
@@ -2912,7 +2912,7 @@ async fn memory_place_once(
         &place_nodes,
         None,
         None,
-    ))
+    )
 }
 
 /// Apply 1–20 membership edits atomically against their combined final state.

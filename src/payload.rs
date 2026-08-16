@@ -52,36 +52,129 @@ pub fn record_mutable(memberships: &[String], request_scope: &[String]) -> bool 
     }
 }
 
-fn memberships_of(value: &Value) -> Vec<String> {
-    value
+fn memberships_of(value: &Value) -> Result<Vec<String>> {
+    let scope = value
         .get("scope")
         .and_then(Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(Value::as_str)
+        .ok_or_else(|| crate::operation_error!("record is missing its scope array"))?;
+    scope
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
                 .map(str::to_string)
-                .collect()
+                .ok_or_else(|| crate::operation_error!("record scope contains a non-string value"))
         })
-        .unwrap_or_default()
+        .collect()
 }
 
 /// Mark a fact envelope as current/historical, rateable, and mutable in this request.
-pub fn decorate_fact(fact: &mut Value, request_scope: &[String], current: bool) {
-    let memberships = memberships_of(fact);
+pub fn decorate_fact(fact: &mut Value, request_scope: &[String], current: bool) -> Result<()> {
+    fact_target(fact)
+        .ok_or_else(|| crate::operation_error!("fact is missing its canonical target handle"))?;
+    for endpoint in ["s", "o"] {
+        let value = fact
+            .get(endpoint)
+            .ok_or_else(|| crate::operation_error!("fact is missing its {endpoint} endpoint"))?;
+        validate_endpoint(value)?;
+    }
+    nonempty_string(fact, "p", "fact")?;
+    let memberships = memberships_of(fact)?;
+    fact.get("weight")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| crate::operation_error!("fact is missing its integer weight"))?;
     fact["current"] = json!(current);
     fact["rateable"] = json!(current);
     fact["mutable"] = json!(current && record_mutable(&memberships, request_scope));
+    Ok(())
 }
 
 /// Mark a non-literal node as rateable and mutable in this request.
-pub fn decorate_node(node: &mut Value, request_scope: &[String]) {
+pub fn decorate_node(node: &mut Value, request_scope: &[String]) -> Result<()> {
+    validate_endpoint(node)?;
     if node.get("kind").and_then(Value::as_str) == Some("literal") {
-        return;
+        return Ok(());
     }
-    let memberships = memberships_of(node);
+    let memberships = memberships_of(node)?;
     node["rateable"] = json!(true);
     node["mutable"] = json!(record_mutable(&memberships, request_scope));
+    Ok(())
+}
+
+fn validate_endpoint(value: &Value) -> Result<()> {
+    match value.get("kind").and_then(Value::as_str) {
+        Some("literal") => {
+            nonempty_string(value, "iri", "literal endpoint")?;
+            value.get("value").and_then(Value::as_str).ok_or_else(|| {
+                crate::operation_error!("literal endpoint is missing its string value")
+            })?;
+            nonempty_string(value, "datatype", "literal endpoint")?;
+            memberships_of(value)?;
+            value.get("weight").and_then(Value::as_i64).ok_or_else(|| {
+                crate::operation_error!("literal endpoint is missing its integer weight")
+            })?;
+        }
+        Some("node") => {
+            let iri = nonempty_string(value, "iri", "node endpoint")?;
+            match value.get("name") {
+                Some(Value::String(_)) | Some(Value::Null) => {}
+                _ => {
+                    return Err(crate::operation_error!(
+                        "node endpoint is missing its string-or-null name"
+                    ));
+                }
+            }
+            string_array(value, "labels", "node endpoint")?;
+            memberships_of(value)?;
+            value.get("weight").and_then(Value::as_i64).ok_or_else(|| {
+                crate::operation_error!("node endpoint is missing its integer weight")
+            })?;
+            let target = value.get("target").ok_or_else(|| {
+                crate::operation_error!("node endpoint is missing its canonical target handle")
+            })?;
+            let target_iri = exact_handle_iri(target, "node", "node target")?;
+            if target_iri != iri {
+                return Err(crate::operation_error!(
+                    "node target IRI does not match the node IRI"
+                ));
+            }
+        }
+        _ => return Err(crate::operation_error!("endpoint has an invalid kind")),
+    }
+    Ok(())
+}
+
+fn nonempty_string<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a str> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| crate::operation_error!("{context} is missing non-empty {field}"))
+}
+
+fn string_array(value: &Value, field: &str, context: &str) -> Result<()> {
+    let values = value
+        .get(field)
+        .and_then(Value::as_array)
+        .ok_or_else(|| crate::operation_error!("{context} is missing its {field} array"))?;
+    if values.iter().any(|value| value.as_str().is_none()) {
+        return Err(crate::operation_error!(
+            "{context} {field} contains a non-string value"
+        ));
+    }
+    Ok(())
+}
+
+fn exact_handle_iri<'a>(value: &'a Value, kind: &str, context: &str) -> Result<&'a str> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| crate::operation_error!("{context} is not an object"))?;
+    if object.len() != 2 || value.get("kind").and_then(Value::as_str) != Some(kind) {
+        return Err(crate::operation_error!(
+            "{context} must contain exactly kind={kind:?} and iri"
+        ));
+    }
+    nonempty_string(value, "iri", context)
 }
 
 /// Unique non-literal subject/object nodes, first-seen order.
@@ -110,10 +203,9 @@ pub fn nodes_from_facts(facts: &[Value]) -> Vec<Value> {
 
 /// Pasteable fact handle from a result envelope (`target.kind=fact` plus IRI).
 pub fn fact_target(fact: &Value) -> Option<Value> {
-    fact.get("target").cloned().filter(|target| {
-        target.get("kind").and_then(Value::as_str) == Some("fact")
-            && target.get("iri").and_then(Value::as_str).is_some()
-    })
+    let target = fact.get("target")?;
+    exact_handle_iri(target, "fact", "fact target").ok()?;
+    Some(target.clone())
 }
 
 /// Pasteable node handle; literals have no unify/judge target.
@@ -121,36 +213,35 @@ pub fn node_target(node: &Value) -> Option<Value> {
     if node.get("kind").and_then(Value::as_str) == Some("literal") {
         return None;
     }
-    if let Some(target) = node.get("target").cloned().filter(|target| {
-        target.get("kind").and_then(Value::as_str) == Some("node")
-            && target.get("iri").and_then(Value::as_str).is_some()
-    }) {
-        return Some(target);
+    if exact_handle_iri(node, "node", "node handle").is_ok() {
+        return Some(node.clone());
     }
-    node.get("iri")
-        .and_then(Value::as_str)
-        .map(|iri| json!({ "kind": "node", "iri": iri }))
+    let iri = nonempty_string(node, "iri", "node").ok()?;
+    let target = node.get("target")?;
+    (exact_handle_iri(target, "node", "node target").ok()? == iri).then(|| target.clone())
 }
 
-fn unify_pairs(review_unify: &[Value]) -> Vec<Value> {
+fn unify_pairs(review_unify: &[Value]) -> Result<Vec<Value>> {
     let mut seen = HashSet::new();
     let mut pairs = Vec::new();
     for item in review_unify {
-        let Some(source) = item.pointer("/source/iri").and_then(Value::as_str) else {
-            continue;
-        };
-        let Some(target) = item.pointer("/target/iri").and_then(Value::as_str) else {
-            continue;
-        };
-        if !seen.insert((source.to_string(), target.to_string())) {
+        let source = item
+            .get("source")
+            .ok_or_else(|| crate::operation_error!("unify review item is missing source"))?;
+        let source_iri = exact_handle_iri(source, "node", "unify source")?;
+        let target = item
+            .get("target")
+            .ok_or_else(|| crate::operation_error!("unify review item is missing target"))?;
+        let target_iri = exact_handle_iri(target, "node", "unify target")?;
+        if !seen.insert((source_iri.to_string(), target_iri.to_string())) {
             continue;
         }
         pairs.push(json!({
-            "source": { "kind": "node", "iri": source },
-            "target": { "kind": "node", "iri": target },
+            "source": source,
+            "target": target,
         }));
     }
-    pairs
+    Ok(pairs)
 }
 
 fn push_unique_handle(handles: &mut Vec<Value>, seen: &mut HashSet<String>, handle: Value) {
@@ -169,7 +260,7 @@ pub fn handles_bag(
     current: Option<Value>,
     retired: Option<Value>,
     unify: &[Value],
-) -> Value {
+) -> Result<Value> {
     let mut fact_handles = Vec::new();
     let mut seen_facts = HashSet::new();
     for fact in facts {
@@ -191,134 +282,178 @@ pub fn handles_bag(
             }
         }
     }
-    json!({
+    Ok(json!({
         "facts": fact_handles,
         "nodes": node_handles,
         "current": current.unwrap_or(Value::Null),
         "retired": retired.unwrap_or(Value::Null),
-        "unify": unify_pairs(unify),
-    })
+        "unify": unify_pairs(unify)?,
+    }))
 }
 
 /// Facts plus lookup-local facts, first-seen by handle IRI, for the paste bag.
-fn collect_recall_facts(result: &Value) -> Vec<Value> {
+fn collect_recall_facts(result: &Value) -> Result<Vec<Value>> {
     let mut facts = result
         .get("facts")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| crate::operation_error!("recall result is missing its facts array"))?;
     let mut seen = facts
         .iter()
-        .filter_map(|fact| {
-            fact.pointer("/target/iri")
-                .and_then(Value::as_str)
-                .map(str::to_string)
+        .map(|fact| {
+            fact_target(fact)
+                .and_then(|target| {
+                    target
+                        .get("iri")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| crate::operation_error!("recall fact has an invalid target handle"))
         })
-        .collect::<HashSet<_>>();
-    if let Some(lookups) = result.get("lookups").and_then(Value::as_array) {
-        for lookup in lookups {
-            if let Some(lookup_facts) = lookup.get("facts").and_then(Value::as_array) {
-                for fact in lookup_facts {
-                    let Some(iri) = fact.pointer("/target/iri").and_then(Value::as_str) else {
-                        continue;
-                    };
-                    if seen.insert(iri.to_string()) {
-                        facts.push(fact.clone());
-                    }
-                }
+        .collect::<Result<HashSet<_>>>()?;
+    let lookups = result
+        .get("lookups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| crate::operation_error!("recall result is missing its lookups array"))?;
+    for lookup in lookups {
+        let lookup_facts = lookup
+            .get("facts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| crate::operation_error!("recall lookup is missing its facts array"))?;
+        for fact in lookup_facts {
+            let iri = fact
+                .pointer("/target/iri")
+                .and_then(Value::as_str)
+                .filter(|iri| !iri.is_empty())
+                .ok_or_else(|| crate::operation_error!("recall fact is missing its target IRI"))?;
+            if seen.insert(iri.to_string()) {
+                facts.push(fact.clone());
             }
         }
     }
-    facts
+    Ok(facts)
 }
 
-fn decorate_facts_in(value: &mut Value, request_scope: &[String]) {
-    if let Some(facts) = value.get_mut("facts").and_then(Value::as_array_mut) {
-        for fact in facts {
-            let current = fact.get("current").and_then(Value::as_bool).unwrap_or(true);
-            decorate_fact(fact, request_scope, current);
-        }
+fn decorate_facts_in(value: &mut Value, request_scope: &[String]) -> Result<()> {
+    let facts = value
+        .get_mut("facts")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| crate::operation_error!("recall payload is missing its facts array"))?;
+    for fact in facts {
+        let current = fact
+            .get("current")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| crate::operation_error!("fact is missing its current flag"))?;
+        decorate_fact(fact, request_scope, current)?;
     }
+    Ok(())
 }
 
-fn thin_endpoint(value: &Value) -> Value {
+fn required_field(value: &Value, field: &str, context: &str) -> Result<Value> {
+    value
+        .get(field)
+        .cloned()
+        .ok_or_else(|| crate::operation_error!("{context} is missing {field}"))
+}
+
+fn thin_endpoint(value: &Value) -> Result<Value> {
+    validate_endpoint(value)?;
     if value.get("kind").and_then(Value::as_str) == Some("literal") {
-        return json!({
+        return Ok(json!({
             "kind": "literal",
-            "iri": value.get("iri").cloned().unwrap_or(Value::Null),
-            "value": value.get("value").cloned().unwrap_or(Value::Null),
-            "datatype": value.get("datatype").cloned().unwrap_or(Value::Null),
-        });
+            "iri": required_field(value, "iri", "literal endpoint")?,
+            "value": required_field(value, "value", "literal endpoint")?,
+            "datatype": required_field(value, "datatype", "literal endpoint")?,
+        }));
     }
-    json!({
-        "kind": "node",
-        "iri": value.get("iri").cloned().unwrap_or(Value::Null),
-        "name": value.get("name").cloned().unwrap_or(Value::Null),
-        "target": value.get("target").cloned().unwrap_or(Value::Null),
-    })
+    let mut out = Map::from_iter([
+        ("kind".into(), json!("node")),
+        ("iri".into(), required_field(value, "iri", "node endpoint")?),
+        (
+            "target".into(),
+            required_field(value, "target", "node endpoint")?,
+        ),
+    ]);
+    if let Some(name) = value.get("name") {
+        out.insert("name".into(), name.clone());
+    }
+    Ok(Value::Object(out))
 }
 
-fn thin_fact(fact: &Value) -> Value {
+fn thin_fact(fact: &Value) -> Result<Value> {
     let mut out = Map::new();
-    for key in [
-        "target", "p", "scope", "spike", "weight", "current", "rateable", "mutable", "validTo",
-    ] {
+    for key in ["target", "p", "scope", "current", "rateable", "mutable"] {
+        out.insert(key.to_string(), required_field(fact, key, "fact")?);
+    }
+    for key in ["spike", "weight", "validTo"] {
         if let Some(value) = fact.get(key) {
             out.insert(key.to_string(), value.clone());
         }
     }
-    if let Some(subject) = fact.get("s") {
-        out.insert("s".into(), thin_endpoint(subject));
-    }
-    if let Some(object) = fact.get("o") {
-        out.insert("o".into(), thin_endpoint(object));
-    }
-    Value::Object(out)
+    let subject = fact
+        .get("s")
+        .ok_or_else(|| crate::operation_error!("fact is missing s"))?;
+    out.insert("s".into(), thin_endpoint(subject)?);
+    let object = fact
+        .get("o")
+        .ok_or_else(|| crate::operation_error!("fact is missing o"))?;
+    out.insert("o".into(), thin_endpoint(object)?);
+    Ok(Value::Object(out))
 }
 
-fn thin_node(node: &Value) -> Value {
+fn thin_node(node: &Value) -> Result<Value> {
     if node.get("kind").and_then(Value::as_str) == Some("literal") {
         return thin_endpoint(node);
     }
-    json!({
-        "kind": "node",
-        "iri": node.get("iri").cloned().unwrap_or(Value::Null),
-        "name": node.get("name").cloned().unwrap_or(Value::Null),
-        "labels": node.get("labels").cloned().unwrap_or_else(|| json!([])),
-        "scope": node.get("scope").cloned().unwrap_or_else(|| json!([])),
-        "target": node.get("target").cloned().unwrap_or(Value::Null),
-        "rateable": node.get("rateable").cloned().unwrap_or(json!(true)),
-        "mutable": node.get("mutable").cloned().unwrap_or(json!(false)),
-    })
+    validate_endpoint(node)?;
+    let mut out = Map::from_iter([
+        ("kind".into(), json!("node")),
+        ("iri".into(), required_field(node, "iri", "node")?),
+        ("labels".into(), required_field(node, "labels", "node")?),
+        ("scope".into(), required_field(node, "scope", "node")?),
+        ("target".into(), required_field(node, "target", "node")?),
+        ("rateable".into(), required_field(node, "rateable", "node")?),
+        ("mutable".into(), required_field(node, "mutable", "node")?),
+    ]);
+    if let Some(name) = node.get("name") {
+        out.insert("name".into(), name.clone());
+    }
+    Ok(Value::Object(out))
 }
 
 /// Stamp `detail` and, for `concise`, thin facts/nodes and clear `about`.
-fn apply_detail(result: &mut Value, detail: Detail) {
+fn apply_detail(result: &mut Value, detail: Detail) -> Result<()> {
     result["detail"] = json!(detail.as_str());
     if detail != Detail::Concise {
-        return;
+        return Ok(());
     }
-    if let Some(facts) = result.get("facts").and_then(Value::as_array) {
-        let thinned = facts.iter().map(thin_fact).collect::<Vec<_>>();
-        result["facts"] = json!(thinned);
-    }
-    if let Some(nodes) = result.get("nodes").and_then(Value::as_array) {
-        let thinned = nodes.iter().map(thin_node).collect::<Vec<_>>();
-        result["nodes"] = json!(thinned);
-    }
-    if let Some(lookups) = result.get_mut("lookups").and_then(Value::as_array_mut) {
-        for lookup in lookups {
-            if let Some(facts) = lookup.get("facts").and_then(Value::as_array) {
-                let thinned = facts.iter().map(thin_fact).collect::<Vec<_>>();
-                lookup["facts"] = json!(thinned);
-            }
-            if let Some(node) = lookup.get("node") {
-                lookup["node"] = thin_node(node);
-            }
+    let facts = result
+        .get("facts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| crate::operation_error!("recall result is missing its facts array"))?;
+    result["facts"] = Value::Array(facts.iter().map(thin_fact).collect::<Result<Vec<_>>>()?);
+    let nodes = result
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| crate::operation_error!("recall result is missing its nodes array"))?;
+    result["nodes"] = Value::Array(nodes.iter().map(thin_node).collect::<Result<Vec<_>>>()?);
+    let lookups = result
+        .get_mut("lookups")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| crate::operation_error!("recall result is missing its lookups array"))?;
+    for lookup in lookups {
+        let facts = lookup
+            .get("facts")
+            .and_then(Value::as_array)
+            .ok_or_else(|| crate::operation_error!("recall lookup is missing its facts array"))?;
+        lookup["facts"] = Value::Array(facts.iter().map(thin_fact).collect::<Result<Vec<_>>>()?);
+        if let Some(node) = lookup.get("node") {
+            lookup["node"] = thin_node(node)?;
         }
     }
     result["about"] = json!([]);
     result["paths"] = json!([]);
+    Ok(())
 }
 
 /// Drop top-level iris hops=1 `facts[]` for concise recall; keep lookup facts.
@@ -327,42 +462,47 @@ pub fn omit_iris_top_level_facts(result: &mut Value) {
 }
 
 /// Decorate a closed-world or semantic recall result and attach `handles`.
-pub fn finish_recall(mut result: Value, request_scope: &[String], detail: Detail) -> Value {
-    decorate_facts_in(&mut result, request_scope);
-    if let Some(lookups) = result.get_mut("lookups").and_then(Value::as_array_mut) {
-        for lookup in lookups {
-            decorate_facts_in(lookup, request_scope);
-            if let Some(node) = lookup.get_mut("node") {
-                decorate_node(node, request_scope);
-            }
+pub fn finish_recall(mut result: Value, request_scope: &[String], detail: Detail) -> Result<Value> {
+    decorate_facts_in(&mut result, request_scope)?;
+    let lookups = result
+        .get_mut("lookups")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| crate::operation_error!("recall result is missing its lookups array"))?;
+    for lookup in lookups {
+        decorate_facts_in(lookup, request_scope)?;
+        if let Some(node) = lookup.get_mut("node") {
+            decorate_node(node, request_scope)?;
         }
     }
     let facts = result
         .get("facts")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| crate::operation_error!("recall result is missing its facts array"))?;
     let nodes_empty = result
         .get("nodes")
         .and_then(Value::as_array)
-        .is_none_or(Vec::is_empty);
+        .ok_or_else(|| crate::operation_error!("recall result is missing its nodes array"))?
+        .is_empty();
     if nodes_empty && !facts.is_empty() {
         result["nodes"] = json!(nodes_from_facts(&facts));
     }
-    if let Some(nodes) = result.get_mut("nodes").and_then(Value::as_array_mut) {
-        for node in nodes {
-            decorate_node(node, request_scope);
-        }
+    let nodes = result
+        .get_mut("nodes")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| crate::operation_error!("recall result is missing its nodes array"))?;
+    for node in nodes {
+        decorate_node(node, request_scope)?;
     }
-    let collected = collect_recall_facts(&result);
+    let collected = collect_recall_facts(&result)?;
     let nodes = result
         .get("nodes")
         .and_then(Value::as_array)
         .cloned()
-        .unwrap_or_default();
-    result["handles"] = handles_bag(&collected, &nodes, None, None, &[]);
-    apply_detail(&mut result, detail);
-    result
+        .ok_or_else(|| crate::operation_error!("recall result is missing its nodes array"))?;
+    result["handles"] = handles_bag(&collected, &nodes, None, None, &[])?;
+    apply_detail(&mut result, detail)?;
+    Ok(result)
 }
 
 /// Attach `handles` to a mutation result using its existing review/target fields.
@@ -372,14 +512,14 @@ pub fn finish_mutation(
     nodes: &[Value],
     current: Option<Value>,
     retired: Option<Value>,
-) -> Value {
+) -> Result<Value> {
     let unify = result
         .pointer("/review/unify")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    result["handles"] = handles_bag(facts, nodes, current, retired, &unify);
-    result
+    result["handles"] = handles_bag(facts, nodes, current, retired, &unify)?;
+    Ok(result)
 }
 
 /// Advisory unify row with exact pasteable handles and separate display names.
@@ -456,11 +596,12 @@ mod tests {
                 "mode": "text",
                 "facts": [{
                     "target": {"kind":"fact","iri":"mindreader:relationship/a"},
-                    "s": {"kind":"node","iri":"mindreader:element/alice","name":"Alice","scope":["project:x"],"target":{"kind":"node","iri":"mindreader:element/alice"}},
+                    "s": {"kind":"node","iri":"mindreader:element/alice","name":"Alice","labels":["Element"],"scope":["project:x"],"weight":0,"target":{"kind":"node","iri":"mindreader:element/alice"}},
                     "p": "worksOn",
-                    "o": {"kind":"node","iri":"mindreader:element/mr","name":"mr","scope":["project:x"],"target":{"kind":"node","iri":"mindreader:element/mr"}},
+                    "o": {"kind":"node","iri":"mindreader:element/mr","name":"mr","labels":["Element"],"scope":["project:x"],"weight":0,"target":{"kind":"node","iri":"mindreader:element/mr"}},
                     "scope": ["project:x"],
-                    "weight": 0
+                    "weight": 0,
+                    "current": true
                 }],
                 "nodes": [],
                 "paths": [],
@@ -470,7 +611,8 @@ mod tests {
             }),
             &["project:x".into()],
             Detail::Concise,
-        );
+        )
+        .unwrap();
         assert_eq!(result["nodes"].as_array().unwrap().len(), 2);
         assert_eq!(
             result["handles"]["facts"][0]["iri"],
@@ -503,24 +645,109 @@ mod tests {
             None,
             None,
             &[json!({
-                "source": {"kind":"node","iri":"mindreader:element/a","name":"A"},
-                "target": {"kind":"node","iri":"mindreader:element/b","name":"B"},
+                "source": {"kind":"node","iri":"mindreader:element/a"},
+                "target": {"kind":"node","iri":"mindreader:element/b"},
                 "similarity": 0.9
             })],
-        );
+        )
+        .unwrap();
         assert_eq!(bag["unify"][0]["source"]["kind"], "node");
         assert_eq!(bag["unify"][0]["source"]["iri"], "mindreader:element/a");
         assert!(bag["unify"][0].get("name").is_none());
+
+        let malformed = handles_bag(
+            &[],
+            &[],
+            None,
+            None,
+            &[json!({
+                "source": {"kind":"node","iri":"mindreader:element/a","name":"legacy"},
+                "target": {"kind":"node","iri":"mindreader:element/b"}
+            })],
+        );
+        assert!(malformed.is_err());
     }
 
     #[test]
     fn decorate_fact_marks_global_visible_fact_immutable_under_named_scope() {
         let mut fact = json!({
             "target": {"kind":"fact","iri":"mindreader:relationship/a"},
-            "scope": []
+            "s": {"kind":"node","iri":"mindreader:element/a","name":"A","labels":["Element"],"scope":[],"weight":0,"target":{"kind":"node","iri":"mindreader:element/a"}},
+            "p": "value",
+            "o": {"kind":"literal","iri":"mindreader:literal/one","value":"1","datatype":"xsd:string","scope":[],"weight":0},
+            "scope": [],
+            "weight": 0
         });
-        decorate_fact(&mut fact, &["project:x".into()], true);
+        decorate_fact(&mut fact, &["project:x".into()], true).unwrap();
         assert_eq!(fact["mutable"], false);
         assert_eq!(fact["rateable"], true);
+    }
+
+    #[test]
+    fn malformed_recall_records_fail_closed() {
+        let valid = json!({
+            "ok": true,
+            "mode": "text",
+            "facts": [{
+                "target": {"kind":"fact","iri":"mindreader:relationship/a"},
+                "s": {"kind":"node","iri":"mindreader:element/a","name":"A","labels":["Element"],"scope":[],"weight":0,"target":{"kind":"node","iri":"mindreader:element/a"}},
+                "p": "knows",
+                "o": {"kind":"node","iri":"mindreader:element/b","name":"B","labels":["Element"],"scope":[],"weight":0,"target":{"kind":"node","iri":"mindreader:element/b"}},
+                "scope": [],
+                "current": true,
+                "weight": 0
+            }],
+            "nodes": [],
+            "paths": [],
+            "about": [],
+            "lookups": [],
+            "scope": []
+        });
+
+        let mut missing_scope = valid.clone();
+        missing_scope["facts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("scope");
+        assert!(finish_recall(missing_scope, &[], Detail::Detailed).is_err());
+
+        let mut missing_current = valid.clone();
+        missing_current["facts"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("current");
+        assert!(finish_recall(missing_current, &[], Detail::Detailed).is_err());
+
+        let mut missing_target = valid.clone();
+        missing_target["facts"][0]["s"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target");
+        assert!(finish_recall(missing_target, &[], Detail::Detailed).is_err());
+
+        let mut mismatched_target = valid.clone();
+        mismatched_target["facts"][0]["s"]["target"]["iri"] = json!("mindreader:element/wrong");
+        assert!(finish_recall(mismatched_target, &[], Detail::Detailed).is_err());
+
+        let mut decorated_fact_target = valid.clone();
+        decorated_fact_target["facts"][0]["target"]["name"] = json!("legacy decoration");
+        assert!(finish_recall(decorated_fact_target, &[], Detail::Detailed).is_err());
+
+        let mut malformed_literal = valid.clone();
+        malformed_literal["facts"][0]["o"] = json!({
+            "kind": "literal",
+            "iri": "mindreader:literal/one",
+            "value": "1",
+            "scope": [],
+            "weight": 0
+        });
+        assert!(finish_recall(malformed_literal, &[], Detail::Detailed).is_err());
+
+        let mut missing_labels = valid;
+        missing_labels["facts"][0]["s"]
+            .as_object_mut()
+            .unwrap()
+            .remove("labels");
+        assert!(finish_recall(missing_labels, &[], Detail::Concise).is_err());
     }
 }

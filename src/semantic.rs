@@ -278,7 +278,7 @@ pub async fn memory_semantic_search(
     )
     .await?;
 
-    Ok(crate::payload::finish_recall(
+    crate::payload::finish_recall(
         json!({
             "ok": true,
             "mode": "semantic",
@@ -292,7 +292,7 @@ pub async fn memory_semantic_search(
         }),
         &layers,
         crate::payload::Detail::parse(args.detail.as_deref())?,
-    ))
+    )
 }
 
 /// Reciprocal-rank contribution from one ordered list, gated to resolved facts.

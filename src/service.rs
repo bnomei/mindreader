@@ -182,7 +182,7 @@ impl MemoryService {
         if has_iris && detail == crate::payload::Detail::Concise {
             crate::payload::omit_iris_top_level_facts(&mut result);
         }
-        Ok(crate::payload::finish_recall(result, &scope, detail))
+        crate::payload::finish_recall(result, &scope, detail)
     }
 
     /// MCP `memory_write`: batched set-valued triples under one `scope`.

@@ -354,7 +354,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     consolidate_current_duplicates(txn, target_iri, property_merge, &episode).await?;
     let node = node_json(&merged_node)?;
     let current = node.get("target").cloned();
-    Ok(finish_mutation(
+    finish_mutation(
         json!({
             "ok": true,
             "noop": false,
@@ -369,7 +369,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
         &[node],
         current,
         None,
-    ))
+    )
 }
 
 /// Minimum Levenshtein similarity for advisory unify suggestions.
