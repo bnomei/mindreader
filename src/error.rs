@@ -4,8 +4,9 @@
 //! variants for configuration, domain validation, Neo4j, embeddings, and
 //! concurrent mutation. Transient Neo4j errors are classified for bounded
 //! retries. The MCP adapter maps recoverable application failures to
-//! `CallToolResult` structured errors (`isError` with `{ok:false,reason,message}`);
-//! domain validation is not JSON-RPC `-32602`.
+//! `CallToolResult` structured errors (`isError` with
+//! `{ok:false,reason,message,retryable,outcome}`); domain validation is not
+//! JSON-RPC `-32602`.
 
 use crate::domain::DomainError;
 use neo4rs::{Error as Neo4jError, Neo4jErrorKind};
@@ -55,6 +56,12 @@ pub enum Error {
     Operation(String),
     #[error("concurrent mutation changed {0}")]
     ConcurrentMutation(String),
+    #[error("{operation} commit outcome is unknown: {source}")]
+    AmbiguousCommit {
+        operation: &'static str,
+        #[source]
+        source: Neo4jError,
+    },
     #[error("{message}: {source}")]
     Context {
         message: String,
@@ -74,22 +81,36 @@ impl Error {
 
     /// Walk the source chain for Neo4j transient kinds eligible for retry.
     pub fn is_transient_neo4j(&self) -> bool {
+        if matches!(self, Self::AmbiguousCommit { .. }) {
+            return false;
+        }
         let mut current: Option<&(dyn StdError + 'static)> = Some(self);
         while let Some(error) = current {
+            if error
+                .downcast_ref::<Error>()
+                .is_some_and(|error| matches!(error, Error::AmbiguousCommit { .. }))
+            {
+                return false;
+            }
             let direct = error.downcast_ref::<Neo4jError>();
             let wrapped = error.downcast_ref::<Error>().and_then(|error| match error {
                 Error::Neo4j(driver) => Some(driver),
                 _ => None,
             });
-            if direct.or(wrapped).is_some_and(|driver| {
-                matches!(driver, Neo4jError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
-            }) {
+            if direct.or(wrapped).is_some_and(neo4j_is_transient) {
                 return true;
             }
             current = error.source();
         }
         false
     }
+}
+
+fn neo4j_is_transient(error: &Neo4jError) -> bool {
+    matches!(error, Neo4jError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
+        // neo4rs 0.8 surfaces FAILURE received during PULL as an
+        // UnexpectedMessage string instead of its typed Neo4j variant.
+        || matches!(error, Neo4jError::UnexpectedMessage(message) if message.contains("Neo.TransientError."))
 }
 
 /// Adds operational context while retaining a typed source chain.
@@ -175,5 +196,13 @@ mod tests {
             wrapped.downcast_ref::<Error>(),
             Some(Error::Io(_))
         ));
+    }
+
+    #[test]
+    fn pull_failures_preserve_transient_retry_classification() {
+        let error = Error::Neo4j(Neo4jError::UnexpectedMessage(
+            "FAILURE code=Neo.TransientError.Transaction.DeadlockDetected".into(),
+        ));
+        assert!(error.is_transient_neo4j());
     }
 }

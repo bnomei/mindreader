@@ -12,7 +12,7 @@ use crate::graph::{
     structural_rel_for, Episode,
 };
 use crate::{
-    error::{Context, Error, Result},
+    error::{Error, Result},
     operation_error,
 };
 use neo4rs::{query, BoltType, Graph, Node, Relation, Txn};
@@ -118,7 +118,10 @@ async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
         Ok(node) => {
             txn.commit()
                 .await
-                .context("commit memory_merge transaction failed")?;
+                .map_err(|source| Error::AmbiguousCommit {
+                    operation: "memory_unify",
+                    source,
+                })?;
             Ok(node)
         }
         Err(error) => {
@@ -236,7 +239,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     let target_layers = target.get::<Vec<String>>("layers").unwrap_or_default();
     let layers = merge_memberships(&target_layers, &source_layers);
     let weight = node_weight(&target).saturating_add(node_weight(&source));
-    let episode = create_episode_in_txn(txn, "memory_merge", None).await?;
+    let episode = create_episode_in_txn(txn, "memory_unify", None).await?;
 
     let source_relationships = fetch_all_txn(
         txn,
@@ -344,6 +347,8 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     .await?;
     consolidate_current_duplicates(txn, target_iri, property_merge, &episode).await?;
     Ok(json!({
+        "ok": true,
+        "noop": false,
         "node": node_json(&merged_node),
         "episode": {
             "iri": episode.iri,

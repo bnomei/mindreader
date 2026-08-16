@@ -2,8 +2,8 @@
 //!
 //! This crate owns graph semantics. The stdio MCP adapter, smoke suite, and
 //! bench call these modules instead of writing their own Cypher or visibility
-//! policy. MCP exposes seven tools: recall, write, revise, withdraw, judge,
-//! place, and unify.
+//! policy. MCP exposes eight tools: ordinary and semantic recall, write,
+//! revise, withdraw, judge, place, and unify.
 //!
 //! Facts are explicit triples with Episode provenance, request `scope`
 //! (stored as `layers` memberships), signed feedback weights, soft retraction

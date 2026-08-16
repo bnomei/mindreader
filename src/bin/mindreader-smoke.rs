@@ -1,4 +1,4 @@
-//! Live Neo4j integration suite for the seven memory tools and graph contracts.
+//! Live Neo4j integration suite for the eight memory tools and graph contracts.
 //!
 //! Mutates the configured database and leaves fixtures in place; use a
 //! development or disposable instance only. Enabled with the `developer-tools`
@@ -15,11 +15,13 @@ use mindreader::graph::{
 };
 use mindreader::merge::{memory_merge, MergeArgs};
 use mindreader::operation_error;
-use mindreader::search::SearchArgs;
+use mindreader::search::{RecallArgs, SearchArgs};
 use mindreader::semantic::{memory_semantic_search, SemanticRuntime, SemanticSearchArgs};
+use mindreader::service::MemoryService;
 use mindreader::tools::{
-    self, AssertArgs, AssertFact, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs,
-    RetractTargetArgs, SchemaArgs, StatsArgs, TargetArgs,
+    self, AssertArgs, AssertFact, FeedbackArgs, GetArgs, JudgeArgs, JudgeRating, LayersArgs,
+    PlaceArgs, PlaceEdit, ReplaceArgs, RetractArgs, RetractTargetArgs, SchemaArgs, StatsArgs,
+    TargetArgs,
 };
 use mindreader::Mindreader;
 use neo4rs::{query, Graph};
@@ -228,7 +230,10 @@ fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
         .and_then(Value::as_array)?
         .iter()
         .position(|fact| {
-            fact.pointer("/relationship/iri").and_then(Value::as_str) == Some(relationship)
+            fact.pointer("/target/iri")
+                .or_else(|| fact.pointer("/relationship/iri"))
+                .and_then(Value::as_str)
+                == Some(relationship)
         })
 }
 
@@ -279,6 +284,28 @@ async fn relation_state(
     .transpose()
 }
 
+async fn node_layers(graph: &Graph, iri: &str) -> Result<Option<Vec<String>>> {
+    fetch_one(
+        graph,
+        query("MATCH (n:Entity {iri: $iri}) RETURN coalesce(n.layers, []) AS layers")
+            .param("iri", iri.to_string()),
+    )
+    .await?
+    .map(|row| row.get("layers").map_err(Into::into))
+    .transpose()
+}
+
+async fn episode_count(graph: &Graph, tool: &str) -> Result<i64> {
+    let row = fetch_one(
+        graph,
+        query("MATCH (e:Entity:Episode {tool: $tool}) RETURN count(e) AS count")
+            .param("tool", tool.to_string()),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("episode count returned no row for {tool}"))?;
+    Ok(row.get("count")?)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     match run().await {
@@ -317,9 +344,10 @@ async fn run() -> Result<u32> {
     let mut report = Report::new();
     let tool_names = Mindreader::registered_tool_names();
     report.check(
-        "MCP registers the seven-tool contract",
-        tool_names.len() == 7
+        "MCP registers the eight-tool contract",
+        tool_names.len() == 8
             && tool_names.contains(&"memory_recall".into())
+            && tool_names.contains(&"memory_recall_semantic".into())
             && tool_names.contains(&"memory_write".into())
             && tool_names.contains(&"memory_revise".into())
             && tool_names.contains(&"memory_unify".into()),
@@ -457,7 +485,7 @@ async fn run() -> Result<u32> {
     report.check(
         "schema writes remain global and provenance-backed",
         schema
-            .pointer("/node/layers")
+            .pointer("/node/scope")
             .and_then(Value::as_array)
             .is_some_and(Vec::is_empty)
             && schema
@@ -982,12 +1010,77 @@ async fn run() -> Result<u32> {
         ),
     );
 
+    let judge_episodes_before = episode_count(&graph, "memory_judge").await?;
+    let judged = tools::memory_judge(
+        &graph,
+        JudgeArgs {
+            scope: vec![layer_a.clone()],
+            ratings: vec![
+                JudgeRating {
+                    target: TargetArgs {
+                        kind: "fact".into(),
+                        iri: high_rel.clone(),
+                    },
+                    mode: "strengthen".into(),
+                },
+                JudgeRating {
+                    target: TargetArgs {
+                        kind: "fact".into(),
+                        iri: low_rel.clone(),
+                    },
+                    mode: "weaken".into(),
+                },
+            ],
+        },
+    )
+    .await?;
+    let judge_episodes_after = episode_count(&graph, "memory_judge").await?;
+    let high_after_batch = relation_state(&graph, &high_rel).await?;
+    let rollback = tools::memory_judge(
+        &graph,
+        JudgeArgs {
+            scope: vec![layer_a.clone()],
+            ratings: vec![
+                JudgeRating {
+                    target: TargetArgs {
+                        kind: "fact".into(),
+                        iri: high_rel.clone(),
+                    },
+                    mode: "strengthen".into(),
+                },
+                JudgeRating {
+                    target: TargetArgs {
+                        kind: "fact".into(),
+                        iri: format!("mindreader:relationship/missing-{tag}"),
+                    },
+                    mode: "strengthen".into(),
+                },
+            ],
+        },
+    )
+    .await;
+    report.check(
+        "memory_judge batches atomically under one Episode and rolls back mixed failures",
+        judged.pointer("/episode/tool").and_then(Value::as_str) == Some("memory_judge")
+            && judged
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.len() == 2)
+            && judge_episodes_after == judge_episodes_before + 1
+            && rollback.is_err()
+            && relation_state(&graph, &high_rel).await? == high_after_batch
+            && episode_count(&graph, "memory_judge").await? == judge_episodes_after,
+        format!(
+            "judged={judged} rollback={rollback:?} high={high_after_batch:?} episodes={judge_episodes_before}->{judge_episodes_after}"
+        ),
+    );
+
     let closure_token = format!("closure-{tag}");
     let closure = tools::memory_assert(
         &graph,
         assert_args(
             entity(format!("{closure_token}-subject")),
-            property,
+            property.clone(),
             object(format!("{closure_token}-object")),
             vec![layer_a.clone()],
         ),
@@ -1028,7 +1121,7 @@ async fn run() -> Result<u32> {
             layers: vec![layer_a.clone()],
             target: TargetArgs {
                 kind: "node".into(),
-                iri: closure_object,
+                iri: closure_object.clone(),
             },
             add: vec![layer_c.clone()],
             remove: Vec::new(),
@@ -1054,7 +1147,7 @@ async fn run() -> Result<u32> {
             layers: vec![layer_a.clone(), layer_c.clone()],
             target: TargetArgs {
                 kind: "node".into(),
-                iri: closure_subject,
+                iri: closure_subject.clone(),
             },
             add: Vec::new(),
             remove: vec![layer_a.clone()],
@@ -1068,9 +1161,197 @@ async fn run() -> Result<u32> {
             && object_add.get("noop").and_then(Value::as_bool) == Some(false)
             && relation_add.get("layers").and_then(Value::as_array).is_some_and(|values| values.len() == 2)
             && relation_state(&graph, &closure_rel).await?
-                == Some((vec![layer_a.clone(), layer_c], true, 0))
+                == Some((vec![layer_a.clone(), layer_c.clone()], true, 0))
             && invalid_endpoint_remove.is_err(),
         format!("premature={premature_relation_add:?} subject={subject_add} object={object_add} relation={relation_add} invalidRemove={invalid_endpoint_remove:?}"),
+    );
+
+    let place = tools::memory_assert(
+        &graph,
+        assert_args(
+            entity(format!("place-batch-{tag}-subject")),
+            property.clone(),
+            object(format!("place-batch-{tag}-object")),
+            vec![layer_a.clone()],
+        ),
+    )
+    .await?;
+    let place_subject = subject_iri(&place)?;
+    let place_object = object_result_iri(&place)?;
+    let place_fact = relationship_iri(&place)?;
+    let place_episodes_before = episode_count(&graph, "memory_place").await?;
+    let placed = tools::memory_place(
+        &graph,
+        PlaceArgs {
+            scope: vec![layer_a.clone()],
+            edits: [
+                ("node", place_subject.clone()),
+                ("node", place_object.clone()),
+                ("fact", place_fact.clone()),
+            ]
+            .into_iter()
+            .map(|(kind, iri)| PlaceEdit {
+                target: TargetArgs {
+                    kind: kind.into(),
+                    iri,
+                },
+                add: vec![layer_c.clone()],
+                remove: Vec::new(),
+            })
+            .collect(),
+        },
+    )
+    .await?;
+    let place_episodes_after = episode_count(&graph, "memory_place").await?;
+    let place_rollback = tools::memory_place(
+        &graph,
+        PlaceArgs {
+            scope: vec![layer_a.clone(), layer_c.clone()],
+            edits: vec![
+                PlaceEdit {
+                    target: TargetArgs {
+                        kind: "node".into(),
+                        iri: place_subject.clone(),
+                    },
+                    add: Vec::new(),
+                    remove: vec![layer_c.clone()],
+                },
+                PlaceEdit {
+                    target: TargetArgs {
+                        kind: "node".into(),
+                        iri: format!("mindreader:element/missing-{tag}"),
+                    },
+                    add: vec![layer_c.clone()],
+                    remove: Vec::new(),
+                },
+            ],
+        },
+    )
+    .await;
+    report.check(
+        "memory_place validates combined final closure, records one Episode, and rolls back mixed failures",
+        placed.pointer("/episode/tool").and_then(Value::as_str) == Some("memory_place")
+            && placed
+                .get("items")
+                .and_then(Value::as_array)
+                .is_some_and(|items| items.len() == 3)
+            && place_episodes_after == place_episodes_before + 1
+            && relation_state(&graph, &place_fact).await?
+                == Some((vec![layer_a.clone(), layer_c.clone()], true, 0))
+            && place_rollback.is_err()
+            && node_layers(&graph, &place_subject).await?
+                == Some(vec![layer_a.clone(), layer_c.clone()])
+            && episode_count(&graph, "memory_place").await? == place_episodes_after,
+        format!(
+            "placed={placed} rollback={place_rollback:?} episodes={place_episodes_before}->{place_episodes_after}"
+        ),
+    );
+
+    let concurrent_place = tools::memory_assert(
+        &graph,
+        assert_args(
+            entity(format!("place-concurrent-{tag}-subject")),
+            property.clone(),
+            object(format!("place-concurrent-{tag}-object")),
+            vec![layer_a.clone()],
+        ),
+    )
+    .await?;
+    let concurrent_subject = subject_iri(&concurrent_place)?;
+    let concurrent_object = object_result_iri(&concurrent_place)?;
+    let concurrent_fact = relationship_iri(&concurrent_place)?;
+    tools::memory_place(
+        &graph,
+        PlaceArgs {
+            scope: vec![layer_a.clone()],
+            edits: vec![
+                PlaceEdit {
+                    target: TargetArgs {
+                        kind: "node".into(),
+                        iri: concurrent_subject.clone(),
+                    },
+                    add: vec![layer_b.clone()],
+                    remove: Vec::new(),
+                },
+                PlaceEdit {
+                    target: TargetArgs {
+                        kind: "node".into(),
+                        iri: concurrent_object,
+                    },
+                    add: vec![layer_b.clone()],
+                    remove: Vec::new(),
+                },
+            ],
+        },
+    )
+    .await?;
+    let fact_edit = PlaceArgs {
+        scope: vec![layer_a.clone(), layer_b.clone()],
+        edits: vec![PlaceEdit {
+            target: TargetArgs {
+                kind: "fact".into(),
+                iri: concurrent_fact.clone(),
+            },
+            add: vec![layer_b.clone()],
+            remove: vec![layer_a.clone()],
+        }],
+    };
+    let endpoint_edit = PlaceArgs {
+        scope: vec![layer_a.clone(), layer_b.clone()],
+        edits: vec![PlaceEdit {
+            target: TargetArgs {
+                kind: "node".into(),
+                iri: concurrent_subject.clone(),
+            },
+            add: Vec::new(),
+            remove: vec![layer_b.clone()],
+        }],
+    };
+    let (fact_edit_result, endpoint_edit_result) = tokio::join!(
+        tools::memory_place(&graph, fact_edit),
+        tools::memory_place(&graph, endpoint_edit),
+    );
+    let concurrent_successes =
+        usize::from(fact_edit_result.is_ok()) + usize::from(endpoint_edit_result.is_ok());
+    let concurrent_fact_layers = relation_state(&graph, &concurrent_fact)
+        .await?
+        .map(|state| state.0)
+        .unwrap_or_default();
+    let concurrent_subject_layers = node_layers(&graph, &concurrent_subject)
+        .await?
+        .unwrap_or_default();
+    report.check(
+        "concurrent fact and endpoint placement serializes closure decisions",
+        concurrent_successes == 1
+            && (concurrent_fact_layers.is_empty()
+                || concurrent_subject_layers.is_empty()
+                || concurrent_fact_layers
+                    .iter()
+                    .all(|layer| concurrent_subject_layers.contains(layer))),
+        format!(
+            "factEdit={fact_edit_result:?} endpointEdit={endpoint_edit_result:?} factLayers={concurrent_fact_layers:?} subjectLayers={concurrent_subject_layers:?}"
+        ),
+    );
+
+    let schema_place = tools::memory_place(
+        &graph,
+        PlaceArgs {
+            scope: Vec::new(),
+            edits: vec![PlaceEdit {
+                target: TargetArgs {
+                    kind: "node".into(),
+                    iri: format!("mindreader:property/{property}"),
+                },
+                add: vec![layer_a.clone()],
+                remove: Vec::new(),
+            }],
+        },
+    )
+    .await;
+    report.check(
+        "memory_place keeps Class and Property schema records global",
+        schema_place.is_err(),
+        format!("schemaPlace={schema_place:?}"),
     );
 
     let exact = tools::memory_get(
@@ -1093,6 +1374,104 @@ async fn run() -> Result<u32> {
                 })
             }),
         &exact,
+    );
+
+    let service = MemoryService::new(graph.clone(), &cfg)?;
+    let missing_iri = format!("mindreader:element/recall-missing-{tag}");
+    let recall_order = vec![
+        closure_object.clone(),
+        missing_iri.clone(),
+        closure_subject.clone(),
+    ];
+    let recalled = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone(), layer_c.clone()],
+            text: None,
+            iris: Some(recall_order.clone()),
+            labels: None,
+            around: None,
+            hops: Some(1),
+            p: None,
+            depth: None,
+            limit: Some(1),
+        })
+        .await?;
+    let lookup_order = recalled
+        .get("lookups")
+        .and_then(Value::as_array)
+        .map(|lookups| {
+            lookups
+                .iter()
+                .filter_map(|lookup| lookup.get("iri").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let filtered_around = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone(), layer_c.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: Some(closure_subject.clone()),
+            hops: None,
+            p: Some(vec![format!("not-{property}")]),
+            depth: Some(1),
+            limit: Some(1),
+        })
+        .await?;
+    let catalog = service
+        .recall(RecallArgs {
+            scope: Vec::new(),
+            text: None,
+            iris: None,
+            labels: Some(vec!["Property".into()]),
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            limit: Some(100),
+        })
+        .await?;
+    report.check(
+        "memory_recall preserves IRI order and misses, enforces one fact budget, and filters around before limit",
+        recalled.get("mode").and_then(Value::as_str) == Some("iris")
+            && lookup_order == recall_order.iter().map(String::as_str).collect::<Vec<_>>()
+            && recalled
+                .get("lookups")
+                .and_then(Value::as_array)
+                .and_then(|lookups| lookups.get(1))
+                .and_then(|lookup| lookup.get("found"))
+                .and_then(Value::as_bool)
+                == Some(false)
+            && recalled
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| facts.len() <= 1)
+            && filtered_around
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+        format!("iris={recalled} around={filtered_around}"),
+    );
+    report.check(
+        "memory_recall catalog emits pasteable node handles in the normalized schema",
+        catalog.get("mode").and_then(Value::as_str) == Some("catalog")
+            && catalog
+                .get("nodes")
+                .and_then(Value::as_array)
+                .is_some_and(|nodes| {
+                    !nodes.is_empty()
+                        && nodes.iter().all(|node| {
+                            node.get("kind").and_then(Value::as_str) == Some("node")
+                                && node.pointer("/target/kind").and_then(Value::as_str)
+                                    == Some("node")
+                                && node
+                                    .get("scope")
+                                    .and_then(Value::as_array)
+                                    .is_some_and(Vec::is_empty)
+                        })
+                }),
+        &catalog,
     );
 
     let merge_short = tools::memory_assert(
@@ -1122,7 +1501,7 @@ async fn run() -> Result<u32> {
         relationship_iri(&merge_long)?,
     );
     let suggested = merge_long
-        .get("mergeSuggestions")
+        .pointer("/review/unify")
         .and_then(Value::as_array)
         .is_some_and(|items| {
             items.iter().any(|item| {
@@ -1170,7 +1549,7 @@ async fn run() -> Result<u32> {
                 .is_some_and(|(_, current, weight)| current && weight == 1),
         format!(
             "suggestions={} survivor={survivor} feedback={merge_feedback} removed={removed}",
-            merge_long["mergeSuggestions"],
+            merge_long["review"]["unify"],
         ),
     );
 
@@ -1189,7 +1568,7 @@ async fn run() -> Result<u32> {
     report.check(
         "merge suggestions include similar entities created in the same transaction",
         same_txn_merge
-            .get("mergeSuggestions")
+            .pointer("/review/unify")
             .and_then(Value::as_array)
             .is_some_and(|items| {
                 items.iter().any(|item| {
@@ -1199,7 +1578,7 @@ async fn run() -> Result<u32> {
                             == Some(same_txn_short_name.as_str())
                 })
             }),
-        &same_txn_merge["mergeSuggestions"],
+        &same_txn_merge["review"]["unify"],
     );
 
     let target_property_name = format!("mergeProperty{tag}");
@@ -1337,8 +1716,8 @@ async fn run() -> Result<u32> {
         },
     );
     let semantic_args = SemanticSearchArgs {
+        scope: vec![layer_a],
         text: semantic_text,
-        layers: vec![layer_a],
         labels: None,
         limit: Some(20),
     };

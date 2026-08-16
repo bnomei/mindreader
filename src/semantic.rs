@@ -1,16 +1,18 @@
 //! Semantic recall: embed a query and fuse it with remembered activations.
 //!
-//! Used when `memory_recall` sets `semantic:true`. Combines ranked direct
-//! `ASSERTS`/`ABOUT` hits with TTL activation bundles via reciprocal rank
-//! fusion, still under the request `scope`. Query text is sent to the
+//! Exposed separately from closed-world `memory_recall`. Combines ranked
+//! direct `ASSERTS`/`ABOUT` hits with TTL activation bundles via reciprocal
+//! rank fusion, still under the request `scope`. Query text is sent to the
 //! configured embedding provider; without a key this path fails as
-//! `missing_embedding`. Activations expire and may converge. This write is
-//! why recall is not advertised `readOnly`.
+//! `missing_embedding`. Activations expire and may converge, so this operation
+//! is intentionally not read-only.
 
 use crate::config::{Config, SemanticConfig};
 use crate::domain::DomainError;
 use crate::embeddings::{build_provider, normalize_vector, EmbeddingProvider};
-use crate::graph::{endpoint_json, fetch_all, fetch_one, rel_json, spike_label, SEMANTIC_INDEX};
+use crate::graph::{
+    endpoint_json, fact_envelope, fetch_all, fetch_one, rel_json, spike_label, SEMANTIC_INDEX,
+};
 use crate::layers::validate_layer_ids;
 use crate::search::{memory_search, SearchArgs};
 use crate::{
@@ -29,11 +31,12 @@ use std::sync::Arc;
 /// Maximum UTF-8 byte length accepted for semantic query text.
 pub const MAX_SEMANTIC_TEXT_BYTES: usize = 32 * 1024;
 
-/// In-process semantic args; MCP maps `memory_recall` `text`+`semantic:true` here.
+/// Arguments for the side-effectful `memory_recall_semantic` operation.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticSearchArgs {
+    pub scope: Vec<String>,
     pub text: String,
-    pub layers: Vec<String>,
     #[serde(default)]
     pub labels: Option<Vec<String>>,
     #[serde(default)]
@@ -88,17 +91,50 @@ fn validate_semantic_text(text: &str) -> Result<String> {
     let text = text.trim();
     if text.is_empty() {
         return Err(DomainError::InvalidInput(
-            "memory_semantic_search text must not be empty".into(),
+            "memory_recall_semantic text must not be empty".into(),
         )
         .into());
     }
     if text.len() > MAX_SEMANTIC_TEXT_BYTES {
         return Err(DomainError::InvalidInput(format!(
-            "memory_semantic_search text must not exceed {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes"
+            "memory_recall_semantic text must not exceed {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes"
         ))
         .into());
     }
     Ok(text.to_string())
+}
+
+/// Validate the semantic recall wire contract before embedding or graph work.
+pub fn validate_semantic_search_args(args: &SemanticSearchArgs) -> Result<()> {
+    validate_layer_ids(args.scope.clone())?;
+    validate_semantic_text(&args.text)?;
+    if let Some(labels) = &args.labels {
+        if labels.iter().any(|label| label.trim().is_empty()) {
+            return Err(DomainError::InvalidInput(
+                "memory_recall_semantic labels must contain non-empty labels".into(),
+            )
+            .into());
+        }
+        let mut seen = HashSet::new();
+        for label in labels {
+            if !seen.insert(label.trim()) {
+                return Err(DomainError::InvalidInput(format!(
+                    "memory_recall_semantic labels contains duplicate label {:?}",
+                    label.trim()
+                ))
+                .into());
+            }
+        }
+    }
+    if let Some(limit) = args.limit {
+        if !(1..=100).contains(&limit) {
+            return Err(DomainError::InvalidInput(
+                "memory_recall_semantic limit must be 1..=100".into(),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 /// Embed the query, fuse ranked direct hits with activations, return current facts.
@@ -108,6 +144,7 @@ pub async fn memory_semantic_search(
     secrets_path: PathBuf,
     args: SemanticSearchArgs,
 ) -> Result<Value> {
+    validate_semantic_search_args(&args)?;
     let runtime = runtime.ok_or_else(|| {
         embedding_error!(
             "semantic search requires OPENAI_API_KEY or XAI_API_KEY in {} or the process environment",
@@ -115,12 +152,12 @@ pub async fn memory_semantic_search(
         )
     })?;
     let text = validate_semantic_text(&args.text)?;
-    let layers = validate_layer_ids(args.layers)?
+    let layers = validate_layer_ids(args.scope)?
         .into_iter()
         .map(|layer| layer.into_string())
         .collect::<Vec<_>>();
     let labels = args.labels.unwrap_or_default();
-    let limit = args.limit.unwrap_or(20).clamp(1, 100) as usize;
+    let limit = args.limit.unwrap_or(20) as usize;
     let embedding = runtime.provider.embed(&text).await?;
 
     let direct_args = SearchArgs {
@@ -185,6 +222,7 @@ pub async fn memory_semantic_search(
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.0.cmp(&right.0))
     });
+    let truncated = ranked.len() > limit;
     ranked.truncate(limit);
     let result_refs = ranked
         .iter()
@@ -200,6 +238,29 @@ pub async fn memory_semantic_search(
             })
         })
         .collect::<Vec<_>>();
+    let endpoint_iris = facts
+        .iter()
+        .flat_map(|fact| {
+            [
+                fact.pointer("/s/iri").and_then(Value::as_str),
+                fact.pointer("/o/iri").and_then(Value::as_str),
+            ]
+        })
+        .flatten()
+        .collect::<HashSet<_>>();
+    let about = direct
+        .get("about")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|item| {
+            item.get("about")
+                .and_then(Value::as_str)
+                .is_some_and(|iri| endpoint_iris.contains(iri))
+        })
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
 
     persist_activation(
         graph,
@@ -212,12 +273,15 @@ pub async fn memory_semantic_search(
     .await?;
 
     Ok(json!({
-        "query": text,
+        "ok": true,
         "mode": "semantic",
         "facts": facts,
-        "about": direct.get("about").cloned().unwrap_or_else(|| json!([])),
+        "nodes": [],
+        "paths": [],
+        "about": about,
+        "lookups": [],
         "scope": layers,
-        "semantic": true,
+        "truncated": truncated,
     }))
 }
 
@@ -340,19 +404,18 @@ async fn resolve_facts(
             .unwrap_or(0)
             .saturating_add(relation["weight"].as_i64().unwrap_or(0))
             .saturating_add(o_json["weight"].as_i64().unwrap_or(0));
-        facts.push((
-            iri,
-            json!({
-                "s": s_json,
-                "p": p,
-                "o": o_json,
-                "relationship": relation,
-                "layers": r.get::<Vec<String>>("layers").unwrap_or_default(),
-                "spike": spike_label(&subject_labels),
-                "score": 0.0,
-                "effectiveWeight": effective_weight,
-            }),
-        ));
+        let scope = r.get::<Vec<String>>("layers").unwrap_or_default();
+        let mut fact = fact_envelope(
+            s_json,
+            &p,
+            o_json,
+            &relation,
+            &scope,
+            spike_label(&subject_labels).map(Value::String),
+        );
+        fact["score"] = json!(0.0);
+        fact["effectiveWeight"] = json!(effective_weight);
+        facts.push((iri, fact));
     }
     Ok(facts)
 }
@@ -530,6 +593,27 @@ mod tests {
             validate_semantic_text(&"é".repeat(MAX_SEMANTIC_TEXT_BYTES / 2 + 1)).unwrap_err(),
             crate::error::Error::Domain(DomainError::InvalidInput(_))
         ));
+    }
+
+    #[test]
+    fn semantic_args_validate_scope_labels_and_limit() {
+        let args = SemanticSearchArgs {
+            scope: vec!["project:mindreader".into()],
+            text: "recall".into(),
+            labels: Some(vec!["Element".into()]),
+            limit: Some(100),
+        };
+        assert!(validate_semantic_search_args(&args).is_ok());
+        assert!(validate_semantic_search_args(&SemanticSearchArgs {
+            limit: Some(101),
+            ..args.clone()
+        })
+        .is_err());
+        assert!(validate_semantic_search_args(&SemanticSearchArgs {
+            labels: Some(vec!["Element".into(), " Element ".into()]),
+            ..args
+        })
+        .is_err());
     }
 
     #[test]

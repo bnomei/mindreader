@@ -1,4 +1,4 @@
-//! Graph mutations and in-process helpers behind the seven MCP writers.
+//! Graph mutations and in-process helpers behind five MCP mutation handlers.
 //!
 //! MCP calls `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`,
 //! and `memory_place` here. Older names (`memory_assert`, `memory_replace`, …)
@@ -27,16 +27,14 @@ use crate::merge::merge_suggestions_in_txn;
 #[cfg(test)]
 use crate::search::SearchArgs;
 use crate::{
-    error::{Context, Error, Result},
+    error::{Error, Result},
     operation_error,
 };
 use neo4rs::{query, Graph, Node, Path, Relation, Txn};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-#[cfg(test)]
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
@@ -463,16 +461,23 @@ pub struct JudgeArgs {
     pub ratings: Vec<JudgeRating>,
 }
 
-/// Membership edit: `scope` is visibility; `add`/`remove` are the edit.
+/// One membership edit inside an atomic `memory_place` batch.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct PlaceArgs {
-    pub scope: Vec<String>,
+pub struct PlaceEdit {
     pub target: TargetArgs,
     #[serde(default)]
     pub add: Vec<String>,
     #[serde(default)]
     pub remove: Vec<String>,
+}
+
+/// Atomic membership edits: `scope` is visibility; `edits` are the change.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PlaceArgs {
+    pub scope: Vec<String>,
+    pub edits: Vec<PlaceEdit>,
 }
 
 fn node_spec(entity: EntityRef) -> NodeSpec {
@@ -1477,7 +1482,10 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
             if value.0 {
                 txn.commit()
                     .await
-                    .context("commit memory_write transaction failed")?;
+                    .map_err(|source| Error::AmbiguousCommit {
+                        operation: "memory_write",
+                        source,
+                    })?;
             } else {
                 txn.rollback().await?;
             }
@@ -1489,6 +1497,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         }
     };
     Ok(json!({
+        "ok": true,
         "noop": !changed,
         "scope": layers,
         "episode": if changed {
@@ -1496,28 +1505,27 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         } else {
             Value::Null
         },
-        "mergeSuggestions": merge_suggestions,
-        "next": next_payloads(&merge_suggestions, &items),
+        "review": review_payloads(&merge_suggestions, &items),
         "facts": items,
     }))
 }
 
-fn next_payloads(merge_suggestions: &[Value], facts: &[Value]) -> Value {
-    let unify = merge_suggestions
-        .iter()
-        .filter_map(|suggestion| suggestion.get("merge").cloned())
-        .collect::<Vec<_>>();
-    let revise = facts
+fn review_payloads(merge_suggestions: &[Value], facts: &[Value]) -> Value {
+    let alternatives = facts
         .iter()
         .filter(|fact| {
             fact.get("conflicts")
                 .and_then(Value::as_array)
                 .is_some_and(|conflicts| !conflicts.is_empty())
         })
-        .filter_map(|fact| fact.get("target").cloned())
-        .map(|target| json!({ "target": target }))
+        .map(|fact| {
+            json!({
+                "target": fact.get("target").cloned().unwrap_or(Value::Null),
+                "conflicts": fact.get("conflicts").cloned().unwrap_or_else(|| json!([])),
+            })
+        })
         .collect::<Vec<_>>();
-    json!({ "unify": unify, "revise": revise })
+    json!({ "unify": merge_suggestions, "alternatives": alternatives })
 }
 
 struct PreparedFactResult {
@@ -1823,7 +1831,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
         let (new_object, new_object_is_literal) = merge_object_in_txn(&mut txn, new_value).await?;
         let (_, property_created, property) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
         let episode =
-            create_episode_in_txn(&mut txn, "memory_replace", args.reason.as_deref()).await?;
+            create_episode_in_txn(&mut txn, "memory_revise", args.reason.as_deref()).await?;
         apply_node_memberships_txn(&mut txn, &subject, &layers).await?;
         apply_node_memberships_txn(&mut txn, &new_object, &layers).await?;
         change_fact_memberships_txn(
@@ -1915,7 +1923,10 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
         Ok(value) => {
             txn.commit()
                 .await
-                .context("commit memory_replace transaction failed")?;
+                .map_err(|source| Error::AmbiguousCommit {
+                    operation: "memory_revise",
+                    source,
+                })?;
             value
         }
         Err(error) => {
@@ -2066,6 +2077,15 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
         })
         .collect::<Result<Vec<_>>>()?;
     let changes = plan_fact_membership_changes(&currents, &layers);
+    let withdrawn_targets = changes
+        .iter()
+        .filter_map(|change| {
+            currents
+                .iter()
+                .find(|current| current.rel_id == change.rel_id)
+                .map(|current| json!({ "kind": "fact", "iri": current.iri }))
+        })
+        .collect::<Vec<_>>();
     if changes.is_empty() {
         txn.rollback().await?;
         return Ok(json!({
@@ -2074,19 +2094,25 @@ async fn memory_retract_once(graph: &Graph, args: RetractArgs) -> Result<Value> 
             "layers": layers,
             "episode": Value::Null,
             "reason": args.reason,
+            "withdrawnTargets": [],
         }));
     }
-    let episode = create_episode_in_txn(&mut txn, "memory_retract", args.reason.as_deref()).await?;
+    let episode =
+        create_episode_in_txn(&mut txn, "memory_withdraw", args.reason.as_deref()).await?;
     change_fact_memberships_batch_txn(&mut txn, &changes, &episode, args.reason.as_deref()).await?;
     txn.commit()
         .await
-        .context("commit memory_retract transaction failed")?;
+        .map_err(|source| Error::AmbiguousCommit {
+            operation: "memory_withdraw",
+            source,
+        })?;
     Ok(json!({
         "retracted": changes.len(),
         "soft": true,
         "layers": layers,
         "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
         "reason": args.reason,
+        "withdrawnTargets": withdrawn_targets,
     }))
 }
 
@@ -2227,7 +2253,7 @@ async fn memory_feedback_once(graph: &Graph, args: FeedbackArgs) -> Result<Value
         .unwrap_or_else(|_| before_text.clone());
     let before = before_text.parse::<i64>().unwrap_or(0);
     let after = after_text.parse::<i64>().unwrap_or(before);
-    let episode = create_episode_in_txn(&mut txn, "memory_feedback", Some(&args.mode)).await?;
+    let episode = create_episode_in_txn(&mut txn, "memory_judge", Some(&args.mode)).await?;
     txn.run(
         query(
             "MATCH (e:Entity:Episode {iri: $episode}) \
@@ -2260,7 +2286,10 @@ async fn memory_feedback_once(graph: &Graph, args: FeedbackArgs) -> Result<Value
     .await?;
     txn.commit()
         .await
-        .context("commit memory_feedback transaction failed")?;
+        .map_err(|source| Error::AmbiguousCommit {
+            operation: "memory_judge",
+            source,
+        })?;
     Ok(json!({
         "target": args.target,
         "mode": args.mode,
@@ -2451,7 +2480,7 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
             .into());
         }
     }
-    let episode = create_episode_in_txn(&mut txn, "memory_layers", None).await?;
+    let episode = create_episode_in_txn(&mut txn, "memory_place", None).await?;
     txn.run(
         query(
             "MATCH (e:Entity:Episode {iri: $episode}) \
@@ -2501,7 +2530,10 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
     .ok_or_else(|| DomainError::Precondition("layer target changed concurrently".into()))?;
     txn.commit()
         .await
-        .context("commit memory_layers transaction failed")?;
+        .map_err(|source| Error::AmbiguousCommit {
+            operation: "memory_place",
+            source,
+        })?;
     Ok(json!({
         "noop": false,
         "target": args.target,
@@ -2539,7 +2571,7 @@ async fn memory_schema_list(graph: &Graph, args: SchemaArgs) -> Result<Value> {
         "MATCH (n:Entity:{label}) \
          RETURN n.iri AS iri, n.name AS name, coalesce(n.stub, false) AS stub \
          ORDER BY n.name, n.iri \
-         LIMIT 100"
+         LIMIT 101"
     );
     let items = fetch_all(graph, query(&cypher))
         .await?
@@ -2800,7 +2832,10 @@ async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
             if value.0.is_some() {
                 txn.commit()
                     .await
-                    .context("commit memory_schema transaction failed")?;
+                    .map_err(|source| Error::AmbiguousCommit {
+                        operation: "memory_write",
+                        source,
+                    })?;
             } else {
                 txn.rollback().await?;
             }
@@ -2898,71 +2933,178 @@ pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> R
     Ok(row.and_then(|row| row.get::<i64>("n").ok()).unwrap_or(0))
 }
 
-/// `memory_recall` `iris` path: node payloads, and neighbor facts when `hops=1`.
+const RECALL_IRI_NODES_QUERY: &str = r#"
+UNWIND range(0, size($iris) - 1) AS inputIndex
+WITH inputIndex, $iris[inputIndex] AS iri
+OPTIONAL MATCH (n:Entity {iri: iri})
+WHERE size(coalesce(n.layers, [])) = 0
+   OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers)
+RETURN inputIndex, iri, n
+ORDER BY inputIndex ASC
+"#;
+
+const RECALL_IRI_FACTS_QUERY: &str = r#"
+UNWIND range(0, size($iris) - 1) AS inputIndex
+MATCH (root:Entity {iri: $iris[inputIndex]})-[r]-(other:Entity)
+WHERE (size(coalesce(root.layers, [])) = 0
+       OR any(layer IN coalesce(root.layers, []) WHERE layer IN $layers))
+  AND r.validTo IS NULL
+  AND (size(coalesce(r.layers, [])) = 0
+       OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
+  AND (size(coalesce(other.layers, [])) = 0
+       OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
+WITH r, min(inputIndex) AS inputIndex
+WITH inputIndex, r, startNode(r) AS s, endNode(r) AS o,
+     coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
+ORDER BY inputIndex ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
+LIMIT $limit
+RETURN inputIndex, s, r, o, property
+"#;
+
+/// `memory_recall` `iris` path: ordered lookups plus a globally bounded fact set.
 pub async fn memory_recall_iris(
     graph: &Graph,
     iris: Vec<String>,
     scope: Vec<String>,
     hops: u32,
+    fact_limit: u32,
 ) -> Result<Value> {
-    let mut nodes = Vec::new();
-    let mut facts = Vec::new();
-    for iri in iris
+    let layers = normalize_layers(scope)?;
+    if !(1..=20).contains(&iris.len()) {
+        return Err(DomainError::InvalidInput(
+            "memory_recall iris must contain 1..=20 node IRIs".into(),
+        )
+        .into());
+    }
+    if hops > 1 {
+        return Err(DomainError::InvalidInput("memory_recall hops must be 0 or 1".into()).into());
+    }
+    if !(1..=100).contains(&fact_limit) {
+        return Err(DomainError::InvalidInput("memory_recall limit must be 1..=100".into()).into());
+    }
+    let iris = iris
         .into_iter()
         .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    let mut lookups = iris
+        .iter()
+        .map(|iri| json!({ "iri": iri, "found": false, "facts": [] }))
+        .collect::<Vec<_>>();
+    let mut nodes = Vec::with_capacity(iris.len());
+    for row in fetch_all(
+        graph,
+        query(RECALL_IRI_NODES_QUERY)
+            .param("iris", iris.clone())
+            .param("layers", layers.clone()),
+    )
+    .await?
     {
-        let got = memory_get(
+        let Ok(index) = row.get::<i64>("inputIndex") else {
+            continue;
+        };
+        let Ok(node) = row.get::<Node>("n") else {
+            continue;
+        };
+        let index = index as usize;
+        let node = node_json(&node);
+        nodes.push(node.clone());
+        if let Some(lookup) = lookups.get_mut(index) {
+            lookup["found"] = json!(true);
+            lookup["node"] = node;
+        }
+    }
+
+    let mut facts = Vec::new();
+    let mut truncated = false;
+    if hops == 1 {
+        let rows = fetch_all(
             graph,
-            GetArgs {
-                iri,
-                layers: scope.clone(),
-                hops: Some(hops),
-            },
+            query(RECALL_IRI_FACTS_QUERY)
+                .param("iris", iris)
+                .param("layers", layers.clone())
+                .param("limit", i64::from(fact_limit.saturating_add(1))),
         )
         .await?;
-        if let Some(node) = got.get("node").cloned() {
-            nodes.push(node);
-        }
-        if hops == 1 {
-            if let Some(neighbors) = got.get("neighbors").and_then(Value::as_array) {
-                for neighbor in neighbors {
-                    let Some(edge) = neighbor.get("edge") else {
-                        continue;
-                    };
-                    let property = edge
-                        .get("propertyIri")
-                        .and_then(Value::as_str)
-                        .unwrap_or("");
-                    let mut fact = crate::graph::fact_envelope(
-                        json!({ "kind": "node", "iri": edge.get("from").cloned().unwrap_or(Value::Null) }),
-                        property,
-                        json!({ "kind": "node", "iri": edge.get("to").cloned().unwrap_or(Value::Null) }),
-                        edge,
-                        &scope,
-                        None,
-                    );
-                    if let Some(node) = neighbor.get("node") {
-                        if neighbor.get("direction").and_then(Value::as_str) == Some("out") {
-                            fact["o"] = node.clone();
-                        } else {
-                            fact["s"] = node.clone();
-                        }
-                    }
-                    facts.push(fact);
-                }
+        truncated = rows.len() > fact_limit as usize;
+        for row in rows.into_iter().take(fact_limit as usize) {
+            let (Ok(index), Ok(subject), Ok(relationship), Ok(object), Ok(property)) = (
+                row.get::<i64>("inputIndex"),
+                row.get::<Node>("s"),
+                row.get::<Relation>("r"),
+                row.get::<Node>("o"),
+                row.get::<String>("property"),
+            ) else {
+                continue;
+            };
+            let subject_iri = subject.get::<String>("iri").unwrap_or_default();
+            let object_iri = object.get::<String>("iri").unwrap_or_default();
+            let relationship = rel_json(&relationship, &subject_iri, &object_iri);
+            let memberships = relationship
+                .get("scope")
+                .and_then(Value::as_array)
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let fact = crate::graph::fact_envelope(
+                endpoint_json(&subject),
+                &property,
+                endpoint_json(&object),
+                &relationship,
+                &memberships,
+                None,
+            );
+            if let Some(lookup_facts) = lookups
+                .get_mut(index as usize)
+                .and_then(|lookup| lookup.get_mut("facts"))
+                .and_then(Value::as_array_mut)
+            {
+                lookup_facts.push(fact.clone());
             }
+            facts.push(fact);
         }
     }
     Ok(json!({
-        "scope": normalize_layers(scope)?,
-        "semantic": false,
+        "ok": true,
+        "mode": "iris",
+        "scope": layers,
+        "lookups": lookups,
         "facts": facts,
         "nodes": nodes,
+        "paths": [],
+        "about": [],
+        "truncated": truncated,
     }))
 }
 
-/// `memory_recall` `around` path: walk current edges and filter by predicate name or IRI.
+fn recall_around_query(depth: u32) -> String {
+    format!(
+        r#"
+        MATCH path = (start:Entity {{iri: $from}})-[pathRels*1..{depth}]-(x:Entity)
+        WHERE all(n IN nodes(path) WHERE
+          size(coalesce(n.layers, [])) = 0
+          OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers))
+          AND all(pathRel IN relationships(path) WHERE
+            type(pathRel) IN $rels AND pathRel.validTo IS NULL
+            AND (size(coalesce(pathRel.layers, [])) = 0
+                 OR any(layer IN coalesce(pathRel.layers, []) WHERE layer IN $layers)))
+        UNWIND relationships(path) AS r
+        WITH r, min(length(path)) AS distance
+        WITH distance, startNode(r) AS s, r, endNode(r) AS o,
+             coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
+        WHERE size($predicates) = 0 OR property IN $predicates
+        ORDER BY distance ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
+        LIMIT $limit
+        RETURN distance, s, r, o, property
+        "#
+    )
+}
+
+/// `memory_recall` `around` path with predicate filtering before a deterministic fact limit.
 pub async fn memory_recall_around(
     graph: &Graph,
     from: &str,
@@ -2972,54 +3114,114 @@ pub async fn memory_recall_around(
     limit: u32,
 ) -> Result<Value> {
     use crate::domain::PredicateRef;
-    let wanted = predicates
+    if !(1..=3).contains(&depth) {
+        return Err(DomainError::InvalidInput("memory_recall depth must be 1..=3".into()).into());
+    }
+    if !(1..=100).contains(&limit) {
+        return Err(DomainError::InvalidInput("memory_recall limit must be 1..=100".into()).into());
+    }
+    let layers = normalize_layers(scope)?;
+    let mut wanted = predicates
         .into_iter()
         .map(|value| PredicateRef::parse(value).map(|predicate| predicate.iri().to_string()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    let walked = memory_traverse(
+    wanted.sort();
+    wanted.dedup();
+    let start_row = fetch_one(
         graph,
-        TraverseArgs {
-            from: from.to_string(),
-            layers: scope.clone(),
-            rels: None,
-            depth: Some(depth),
-            limit: Some(limit),
-        },
+        query(
+            "MATCH (n:Entity {iri: $iri}) \
+             WHERE size(coalesce(n.layers, [])) = 0 \
+                OR any(layer IN coalesce(n.layers, []) WHERE layer IN $layers) \
+             RETURN n",
+        )
+        .param("iri", from.to_string())
+        .param("layers", layers.clone()),
     )
     .await?;
+    let Some(start_row) = start_row else {
+        return Ok(json!({
+            "ok": true,
+            "mode": "around",
+            "scope": layers,
+            "from": from,
+            "facts": [],
+            "nodes": [],
+            "paths": [],
+            "about": [],
+            "lookups": [],
+            "truncated": false,
+        }));
+    };
+    let start: Node = start_row.get("n")?;
+    let rows = fetch_all(
+        graph,
+        query(&recall_around_query(depth))
+            .param("from", from.to_string())
+            .param("layers", layers.clone())
+            .param(
+                "rels",
+                FIXED_RELS
+                    .iter()
+                    .map(|relationship| (*relationship).to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .param("predicates", wanted)
+            .param("limit", i64::from(limit.saturating_add(1))),
+    )
+    .await?;
+    let truncated = rows.len() > limit as usize;
     let mut facts = Vec::new();
-    if let Some(edges) = walked.get("edges").and_then(Value::as_array) {
-        for edge in edges {
-            let property = edge
-                .get("propertyIri")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-                .unwrap_or_else(|| {
-                    format!(
-                        "mindreader:property/{}",
-                        edge.get("type").and_then(Value::as_str).unwrap_or_default()
-                    )
-                });
-            if !wanted.is_empty() && !wanted.iter().any(|iri| iri == &property) {
-                continue;
-            }
-            facts.push(crate::graph::fact_envelope(
-                json!({ "kind": "node", "iri": edge.get("from").cloned().unwrap_or(Value::Null) }),
-                &property,
-                json!({ "kind": "node", "iri": edge.get("to").cloned().unwrap_or(Value::Null) }),
-                edge,
-                &scope,
-                None,
-            ));
-        }
+    let mut nodes_by_iri = HashMap::new();
+    nodes_by_iri.insert(from.to_string(), node_json(&start));
+    for row in rows.into_iter().take(limit as usize) {
+        let (Ok(subject), Ok(relationship), Ok(object), Ok(property)) = (
+            row.get::<Node>("s"),
+            row.get::<Relation>("r"),
+            row.get::<Node>("o"),
+            row.get::<String>("property"),
+        ) else {
+            continue;
+        };
+        let subject_iri = subject.get::<String>("iri").unwrap_or_default();
+        let object_iri = object.get::<String>("iri").unwrap_or_default();
+        nodes_by_iri.insert(subject_iri.clone(), node_json(&subject));
+        nodes_by_iri.insert(object_iri.clone(), node_json(&object));
+        let relationship = rel_json(&relationship, &subject_iri, &object_iri);
+        let memberships = relationship
+            .get("scope")
+            .and_then(Value::as_array)
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        facts.push(crate::graph::fact_envelope(
+            endpoint_json(&subject),
+            &property,
+            endpoint_json(&object),
+            &relationship,
+            &memberships,
+            None,
+        ));
     }
+    let mut nodes = nodes_by_iri.into_iter().collect::<Vec<_>>();
+    nodes.sort_by(|left, right| left.0.cmp(&right.0));
+    let nodes = nodes.into_iter().map(|(_, node)| node).collect::<Vec<_>>();
     Ok(json!({
-        "scope": normalize_layers(scope)?,
-        "semantic": false,
+        "ok": true,
+        "mode": "around",
+        "scope": layers,
         "from": from,
         "facts": facts,
-        "nodes": walked.get("nodes").cloned().unwrap_or_else(|| json!([])),
-        "paths": walked.get("paths").cloned().unwrap_or_else(|| json!([])),
+        "nodes": nodes,
+        "paths": [],
+        "about": [],
+        "lookups": [],
+        "truncated": truncated,
     }))
 }
 
@@ -3113,7 +3315,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
     }
     let layers = normalize_layers(args.scope)?;
     let (s, p, old) = load_current_fact(graph, &args.target.iri, &layers).await?;
-    let mut result = memory_replace(
+    let result = memory_replace(
         graph,
         ReplaceArgs {
             s,
@@ -3127,16 +3329,52 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
         },
     )
     .await?;
-    if let Some(object) = result.as_object_mut() {
-        if let Some(layers) = object.remove("layers") {
-            object.insert("scope".into(), layers);
-        }
-        object.insert(
-            "target".into(),
-            json!({ "kind": "fact", "iri": args.target.iri }),
-        );
-    }
-    Ok(result)
+    let noop = result.get("noop").and_then(Value::as_bool).unwrap_or(false);
+    let current_iri = result
+        .pointer("/relationship/iri")
+        .and_then(Value::as_str)
+        .unwrap_or(&args.target.iri)
+        .to_string();
+    let current_target = json!({ "kind": "fact", "iri": current_iri });
+    let conflicts = result
+        .get("conflicts")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let merge_suggestions = result
+        .get("mergeSuggestions")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let fact = if noop {
+        Value::Null
+    } else {
+        json!({
+            "target": current_target,
+            "s": result.get("s").cloned().unwrap_or(Value::Null),
+            "p": result.get("p").cloned().unwrap_or(Value::Null),
+            "o": result.get("new").cloned().unwrap_or(Value::Null),
+            "scope": result.get("layers").cloned().unwrap_or_else(|| json!([])),
+            "spike": result.get("spike").cloned().unwrap_or(Value::Null),
+            "conflicts": conflicts,
+        })
+    };
+    Ok(json!({
+        "ok": true,
+        "scope": result.get("layers").cloned().unwrap_or_else(|| json!([])),
+        "noop": noop,
+        "episode": result.get("episode").cloned().unwrap_or(Value::Null),
+        "target": current_target,
+        "previousTarget": args.target,
+        "fact": fact,
+        "review": {
+            "unify": merge_suggestions,
+            "alternatives": if conflicts.as_array().is_some_and(|values| !values.is_empty()) {
+                json!([{ "target": current_target, "conflicts": conflicts }])
+            } else {
+                json!([])
+            },
+        },
+    }))
 }
 
 /// MCP `memory_withdraw`: soft-retract by fact IRI or subject (optional predicate).
@@ -3185,79 +3423,673 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
             reason: args.reason,
         }
     };
-    let mut result = memory_retract(graph, retract).await?;
-    if let Some(object) = result.as_object_mut() {
-        if let Some(layers) = object.remove("layers") {
-            object.insert("scope".into(), layers);
-        }
-        if let Some(target) = args.target {
-            object.insert(
-                "targets".into(),
-                json!([{ "kind": "fact", "iri": target.iri }]),
-            );
-        }
-    }
-    Ok(result)
+    let result = memory_retract(graph, retract).await?;
+    let retracted = result.get("retracted").and_then(Value::as_u64).unwrap_or(0);
+    let withdrawn_targets = result
+        .get("withdrawnTargets")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Ok(json!({
+        "ok": true,
+        "scope": result.get("layers").cloned().unwrap_or_else(|| json!([])),
+        "noop": retracted == 0,
+        "episode": result.get("episode").cloned().unwrap_or(Value::Null),
+        "retracted": retracted,
+        "withdrawnTargets": withdrawn_targets,
+        "reason": result.get("reason").cloned().unwrap_or(Value::Null),
+    }))
 }
 
-/// MCP `memory_judge`: sequential ±1 ratings; each rating currently records its own Episode.
-pub async fn memory_judge(graph: &Graph, args: JudgeArgs) -> Result<Value> {
+fn judge_delta(mode: &str) -> Result<i64> {
+    match mode {
+        "strengthen" => Ok(1),
+        "weaken" => Ok(-1),
+        _ => Err(DomainError::InvalidInput(
+            "memory_judge mode must be strengthen or weaken".into(),
+        )
+        .into()),
+    }
+}
+
+fn validate_judge_args(args: &JudgeArgs) -> Result<()> {
     if args.ratings.is_empty() || args.ratings.len() > MAX_ASSERT_FACTS {
         return Err(DomainError::InvalidInput(format!(
             "memory_judge ratings must contain between 1 and {MAX_ASSERT_FACTS} items"
         ))
         .into());
     }
-    let scope = args.scope.clone();
-    let mut results = Vec::new();
-    let mut last_episode = Value::Null;
-    for rating in args.ratings {
+    validate_layer_ids(args.scope.clone())?;
+    let mut seen = HashSet::new();
+    for rating in &args.ratings {
         validate_target(&rating.target)?;
-        let result = memory_feedback(
-            graph,
-            FeedbackArgs {
-                layers: scope.clone(),
-                target: rating.target,
-                mode: rating.mode,
-            },
+        judge_delta(&rating.mode)?;
+        if !seen.insert((rating.target.kind.clone(), rating.target.iri.clone())) {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_judge contains duplicate target {}:{}",
+                rating.target.kind, rating.target.iri
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+async fn apply_judge_rating_txn(
+    txn: &mut Txn,
+    scope: &[String],
+    rating: &JudgeRating,
+) -> Result<(i64, i64)> {
+    let delta = judge_delta(&rating.mode)?;
+    let strengthen = delta > 0;
+    let update = if rating.target.kind == "node" {
+        fetch_one_txn(
+            txn,
+            query(
+                r#"
+                MATCH (target:Entity {iri: $iri})
+                WHERE size(coalesce(target.layers, [])) = 0
+                   OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope)
+                WITH target, coalesce(target.weight, 0) AS before
+                WHERE ($strengthen AND before < $max) OR (NOT $strengthen AND before > $min)
+                SET target.weight = CASE WHEN $strengthen THEN before + 1 ELSE before - 1 END,
+                    target.weightText = toString(CASE WHEN $strengthen THEN before + 1 ELSE before - 1 END)
+                RETURN toString(before) AS before, target.weightText AS after
+                "#,
+            )
+            .param("iri", rating.target.iri.clone())
+            .param("scope", scope.to_vec())
+            .param("strengthen", strengthen)
+            .param("max", i64::MAX)
+            .param("min", i64::MIN),
+        )
+        .await?
+    } else {
+        fetch_one_txn(
+            txn,
+            query(
+                r#"
+                MATCH (s:Entity)-[target]->(o:Entity)
+                WHERE target.iri = $iri AND target.validTo IS NULL
+                  AND (size(coalesce(s.layers, [])) = 0 OR any(layer IN coalesce(s.layers, []) WHERE layer IN $scope))
+                  AND (size(coalesce(target.layers, [])) = 0 OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope))
+                  AND (size(coalesce(o.layers, [])) = 0 OR any(layer IN coalesce(o.layers, []) WHERE layer IN $scope))
+                WITH target, coalesce(target.weight, 0) AS before
+                WHERE ($strengthen AND before < $max) OR (NOT $strengthen AND before > $min)
+                SET target.weight = CASE WHEN $strengthen THEN before + 1 ELSE before - 1 END,
+                    target.weightText = toString(CASE WHEN $strengthen THEN before + 1 ELSE before - 1 END)
+                RETURN toString(before) AS before, target.weightText AS after
+                "#,
+            )
+            .param("iri", rating.target.iri.clone())
+            .param("scope", scope.to_vec())
+            .param("strengthen", strengthen)
+            .param("max", i64::MAX)
+            .param("min", i64::MIN),
+        )
+        .await?
+    };
+    let update = update.ok_or_else(|| {
+        DomainError::Precondition(format!(
+            "judge target {}:{} is missing, hidden, historical, or at the weight boundary",
+            rating.target.kind, rating.target.iri
+        ))
+    })?;
+    let before: i64 = update
+        .get::<String>("before")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0);
+    let after: i64 = update
+        .get::<String>("after")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(before.saturating_add(delta));
+    Ok((before, after))
+}
+
+async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
+    let scope = normalize_layers(args.scope)?;
+    let locks = args
+        .ratings
+        .iter()
+        .map(|rating| {
+            (
+                rating.target.iri.clone(),
+                "mindreader:property/weight".into(),
+                FACT_LOCK_SCOPE.into(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut txn = graph.start_txn().await?;
+    let result = async {
+        acquire_fact_locks_in_txn(&mut txn, &locks).await?;
+        let mut items = Vec::with_capacity(args.ratings.len());
+        for (index, rating) in args.ratings.iter().enumerate() {
+            let (before, after) = apply_judge_rating_txn(&mut txn, &scope, rating).await?;
+            items.push(json!({
+                "index": index,
+                "target": rating.target,
+                "mode": rating.mode,
+                "delta": judge_delta(&rating.mode)?,
+                "before": before,
+                "after": after,
+                "status": "changed",
+            }));
+        }
+        let episode = create_episode_in_txn(&mut txn, "memory_judge", None).await?;
+        let target_iris = args
+            .ratings
+            .iter()
+            .map(|rating| rating.target.iri.clone())
+            .collect::<Vec<_>>();
+        let target_kinds = args
+            .ratings
+            .iter()
+            .map(|rating| rating.target.kind.clone())
+            .collect::<Vec<_>>();
+        let modes = args
+            .ratings
+            .iter()
+            .map(|rating| rating.mode.clone())
+            .collect::<Vec<_>>();
+        txn.run(
+            query(
+                "MATCH (e:Entity:Episode {iri: $episode}) \
+                 SET e.batchSize = $batchSize, e.targetIris = $targetIris, \
+                     e.targetKinds = $targetKinds, e.modes = $modes",
+            )
+            .param("episode", episode.iri.clone())
+            .param("batchSize", items.len() as i64)
+            .param("targetIris", target_iris)
+            .param("targetKinds", target_kinds)
+            .param("modes", modes),
         )
         .await?;
-        if let Some(episode) = result.get("episode").cloned() {
-            last_episode = episode;
+        for rating in &args.ratings {
+            let target_match = if rating.target.kind == "node" {
+                "MATCH (target:Entity {iri: $iri})"
+            } else {
+                "MATCH ()-[target]->() WHERE target.iri = $iri"
+            };
+            txn.run(
+                query(&format!(
+                    "{target_match} SET target.weightUpdatedAt = datetime(), \
+                     target.feedbackEpisodeId = $episode"
+                ))
+                .param("iri", rating.target.iri.clone())
+                .param("episode", episode.iri.clone()),
+            )
+            .await?;
         }
-        results.push(result);
+        Ok::<_, Error>((episode, items))
     }
+    .await;
+    let (episode, items) = match result {
+        Ok(value) => {
+            txn.commit()
+                .await
+                .map_err(|source| Error::AmbiguousCommit {
+                    operation: "memory_judge",
+                    source,
+                })?;
+            value
+        }
+        Err(error) => {
+            let _ = txn.rollback().await;
+            return Err(error);
+        }
+    };
     Ok(json!({
-        "scope": normalize_layers(scope)?,
-        "ratings": results,
-        "episode": last_episode,
+        "ok": true,
+        "scope": scope,
+        "noop": false,
+        "episode": { "iri": episode.iri, "at": episode.at, "tool": episode.tool },
+        "summary": { "requested": items.len(), "changed": items.len(), "noop": 0 },
+        "items": items,
     }))
 }
 
-/// MCP `memory_place`: edit stored memberships while `scope` only filters visibility.
-pub async fn memory_place(graph: &Graph, args: PlaceArgs) -> Result<Value> {
-    validate_target(&args.target)?;
-    let mut result = memory_layers(
-        graph,
-        LayersArgs {
-            layers: args.scope,
-            target: args.target,
-            add: args.add,
-            remove: args.remove,
-        },
-    )
-    .await?;
-    if let Some(object) = result.as_object_mut() {
-        if let Some(scope) = object.remove("scope") {
-            object.insert("visibility".into(), scope);
-        }
-        if let Some(layers) = object.remove("layers") {
-            if !object.contains_key("memberships") {
-                object.insert("memberships".into(), layers);
+/// Apply 1–20 explicit ratings atomically under one `memory_judge` Episode.
+pub async fn memory_judge(graph: &Graph, args: JudgeArgs) -> Result<Value> {
+    validate_judge_args(&args)?;
+    for attempt in 0..3_u64 {
+        match memory_judge_once(graph, args.clone()).await {
+            Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
+                sleep(Duration::from_millis(25 * (attempt + 1))).await;
             }
+            result => return result,
         }
     }
-    Ok(result)
+    unreachable!("bounded retry loop always returns")
+}
+
+#[derive(Clone)]
+struct NormalizedPlaceEdit {
+    index: usize,
+    target: TargetArgs,
+    add: Vec<String>,
+    remove: Vec<String>,
+}
+
+struct PlannedPlaceEdit {
+    normalized: NormalizedPlaceEdit,
+    before: Vec<String>,
+    after: Vec<String>,
+    added: Vec<String>,
+    removed: Vec<String>,
+}
+
+fn normalize_place_args(args: PlaceArgs) -> Result<(Vec<String>, Vec<NormalizedPlaceEdit>)> {
+    if args.edits.is_empty() || args.edits.len() > MAX_ASSERT_FACTS {
+        return Err(DomainError::InvalidInput(format!(
+            "memory_place edits must contain between 1 and {MAX_ASSERT_FACTS} items"
+        ))
+        .into());
+    }
+    let scope = normalize_layers(args.scope)?;
+    let mut seen = HashSet::new();
+    let mut edits = Vec::with_capacity(args.edits.len());
+    for (index, edit) in args.edits.into_iter().enumerate() {
+        validate_target(&edit.target)?;
+        if !seen.insert((edit.target.kind.clone(), edit.target.iri.clone())) {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_place contains duplicate target {}:{}",
+                edit.target.kind, edit.target.iri
+            ))
+            .into());
+        }
+        let add = normalize_layers(edit.add)?;
+        let remove = normalize_layers(edit.remove)?;
+        if add.is_empty() && remove.is_empty() {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_place edit {index} requires at least one add or remove layer"
+            ))
+            .into());
+        }
+        if add.iter().any(|layer| remove.contains(layer)) {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_place edit {index} adds and removes the same layer"
+            ))
+            .into());
+        }
+        edits.push(NormalizedPlaceEdit {
+            index,
+            target: edit.target,
+            add,
+            remove,
+        });
+    }
+    Ok((scope, edits))
+}
+
+async fn load_place_memberships_txn(
+    txn: &mut Txn,
+    scope: &[String],
+    target: &TargetArgs,
+) -> Result<Vec<String>> {
+    let row = if target.kind == "node" {
+        fetch_one_txn(
+            txn,
+            query(
+                r#"
+                MATCH (target:Entity {iri: $iri})
+                WHERE size(coalesce(target.layers, [])) = 0
+                   OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope)
+                WITH target
+                WHERE NOT target:Class AND NOT target:Property
+                RETURN coalesce(target.layers, []) AS memberships
+                "#,
+            )
+            .param("iri", target.iri.clone())
+            .param("scope", scope.to_vec()),
+        )
+        .await?
+    } else {
+        fetch_one_txn(
+            txn,
+            query(
+                r#"
+                MATCH (s:Entity)-[target]->(o:Entity)
+                WHERE target.iri = $iri AND target.validTo IS NULL
+                  AND NOT s:Class AND NOT s:Property
+                  AND NOT o:Class AND NOT o:Property
+                  AND (size(coalesce(s.layers, [])) = 0 OR any(layer IN coalesce(s.layers, []) WHERE layer IN $scope))
+                  AND (size(coalesce(target.layers, [])) = 0 OR any(layer IN coalesce(target.layers, []) WHERE layer IN $scope))
+                  AND (size(coalesce(o.layers, [])) = 0 OR any(layer IN coalesce(o.layers, []) WHERE layer IN $scope))
+                RETURN coalesce(target.layers, []) AS memberships
+                "#,
+            )
+            .param("iri", target.iri.clone())
+            .param("scope", scope.to_vec()),
+        )
+        .await?
+    };
+    row.map(|row| row.get::<Vec<String>>("memberships").unwrap_or_default())
+        .ok_or_else(|| {
+            DomainError::Precondition(format!(
+                "place target {}:{} is missing, hidden, or historical",
+                target.kind, target.iri
+            ))
+            .into()
+        })
+}
+
+async fn acquire_place_closure_locks_txn(
+    txn: &mut Txn,
+    edits: &[NormalizedPlaceEdit],
+) -> Result<()> {
+    let node_iris = edits
+        .iter()
+        .filter(|edit| edit.target.kind == "node")
+        .map(|edit| edit.target.iri.clone())
+        .collect::<Vec<_>>();
+    let fact_iris = edits
+        .iter()
+        .filter(|edit| edit.target.kind == "fact")
+        .map(|edit| edit.target.iri.clone())
+        .collect::<Vec<_>>();
+    let rows = fetch_all_txn(
+        txn,
+        query(
+            r#"
+            MATCH (s:Entity)-[r]->(o:Entity)
+            WHERE r.validTo IS NULL
+              AND (s.iri IN $nodeIris OR o.iri IN $nodeIris OR r.iri IN $factIris)
+            RETURN s.iri AS sIri, r.iri AS rIri, o.iri AS oIri
+            "#,
+        )
+        .param("nodeIris", node_iris)
+        .param("factIris", fact_iris),
+    )
+    .await?;
+    let mut iris = edits
+        .iter()
+        .map(|edit| edit.target.iri.clone())
+        .collect::<Vec<_>>();
+    for row in rows {
+        iris.push(row.get("sIri")?);
+        iris.push(row.get("rIri")?);
+        iris.push(row.get("oIri")?);
+    }
+    iris.sort();
+    iris.dedup();
+    let locks = iris
+        .into_iter()
+        .map(|iri| (iri, LAYERS_PROPERTY.into(), FACT_LOCK_SCOPE.into()))
+        .collect::<Vec<_>>();
+    acquire_fact_locks_in_txn(txn, &locks).await
+}
+
+fn planned_memberships(before: &[String], edit: &NormalizedPlaceEdit) -> PlannedPlaceEdit {
+    let mut after = before
+        .iter()
+        .filter(|layer| !edit.remove.contains(layer))
+        .cloned()
+        .collect::<Vec<_>>();
+    after.extend(edit.add.iter().cloned());
+    after.sort();
+    after.dedup();
+    let added = after
+        .iter()
+        .filter(|layer| !before.contains(layer))
+        .cloned()
+        .collect();
+    let removed = before
+        .iter()
+        .filter(|layer| !after.contains(layer))
+        .cloned()
+        .collect();
+    PlannedPlaceEdit {
+        normalized: edit.clone(),
+        before: before.to_vec(),
+        after,
+        added,
+        removed,
+    }
+}
+
+async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit]) -> Result<()> {
+    let node_iris = planned
+        .iter()
+        .filter(|edit| edit.normalized.target.kind == "node")
+        .map(|edit| edit.normalized.target.iri.clone())
+        .collect::<Vec<_>>();
+    let fact_iris = planned
+        .iter()
+        .filter(|edit| edit.normalized.target.kind == "fact")
+        .map(|edit| edit.normalized.target.iri.clone())
+        .collect::<Vec<_>>();
+    let after = planned
+        .iter()
+        .map(|edit| (edit.normalized.target.iri.clone(), edit.after.clone()))
+        .collect::<HashMap<_, _>>();
+    let rows = fetch_all_txn(
+        txn,
+        query(
+            r#"
+            MATCH (s:Entity)-[r]->(o:Entity)
+            WHERE r.validTo IS NULL
+              AND (s.iri IN $nodeIris OR o.iri IN $nodeIris OR r.iri IN $factIris)
+            RETURN s.iri AS sIri, coalesce(s.layers, []) AS sLayers,
+                   r.iri AS rIri, coalesce(r.layers, []) AS rLayers,
+                   o.iri AS oIri, coalesce(o.layers, []) AS oLayers
+            "#,
+        )
+        .param("nodeIris", node_iris)
+        .param("factIris", fact_iris),
+    )
+    .await?;
+    for row in rows {
+        let s_iri: String = row.get("sIri")?;
+        let r_iri: String = row.get("rIri")?;
+        let o_iri: String = row.get("oIri")?;
+        let s_layers = after
+            .get(&s_iri)
+            .cloned()
+            .unwrap_or(row.get::<Vec<String>>("sLayers").unwrap_or_default());
+        let r_layers = after
+            .get(&r_iri)
+            .cloned()
+            .unwrap_or(row.get::<Vec<String>>("rLayers").unwrap_or_default());
+        let o_layers = after
+            .get(&o_iri)
+            .cloned()
+            .unwrap_or(row.get::<Vec<String>>("oLayers").unwrap_or_default());
+        if !membership_allows(&s_layers, &r_layers) || !membership_allows(&o_layers, &r_layers) {
+            return Err(DomainError::Precondition(format!(
+                "memory_place final state would expose fact {r_iri} while an endpoint is hidden"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
+
+async fn memory_place_once(
+    graph: &Graph,
+    scope: Vec<String>,
+    edits: Vec<NormalizedPlaceEdit>,
+) -> Result<Value> {
+    let locks = edits
+        .iter()
+        .map(|edit| {
+            (
+                edit.target.iri.clone(),
+                LAYERS_PROPERTY.into(),
+                FACT_LOCK_SCOPE.into(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut txn = graph.start_txn().await?;
+    let result = async {
+        acquire_fact_locks_in_txn(&mut txn, &locks).await?;
+        acquire_place_closure_locks_txn(&mut txn, &edits).await?;
+        let mut planned = Vec::with_capacity(edits.len());
+        for edit in &edits {
+            let before = load_place_memberships_txn(&mut txn, &scope, &edit.target).await?;
+            planned.push(planned_memberships(&before, edit));
+        }
+        let changed = planned
+            .iter()
+            .filter(|edit| edit.before != edit.after)
+            .count();
+        if changed == 0 {
+            return Ok::<_, Error>((None, planned));
+        }
+        validate_place_closure_txn(&mut txn, &planned).await?;
+        let episode = create_episode_in_txn(&mut txn, "memory_place", None).await?;
+        let changed_edits = planned
+            .iter()
+            .filter(|edit| edit.before != edit.after)
+            .collect::<Vec<_>>();
+        txn.run(
+            query(
+                "MATCH (e:Entity:Episode {iri: $episode}) \
+                 SET e.batchSize = $batchSize, e.targetIris = $targetIris, \
+                     e.targetKinds = $targetKinds, e.beforeLayersJson = $beforeLayersJson, \
+                     e.afterLayersJson = $afterLayersJson, e.addedLayersJson = $addedLayersJson, \
+                     e.removedLayersJson = $removedLayersJson",
+            )
+            .param("episode", episode.iri.clone())
+            .param("batchSize", changed_edits.len() as i64)
+            .param(
+                "targetIris",
+                changed_edits
+                    .iter()
+                    .map(|edit| edit.normalized.target.iri.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "targetKinds",
+                changed_edits
+                    .iter()
+                    .map(|edit| edit.normalized.target.kind.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .param(
+                "beforeLayersJson",
+                changed_edits
+                    .iter()
+                    .map(|edit| serde_json::to_string(&edit.before))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            )
+            .param(
+                "afterLayersJson",
+                changed_edits
+                    .iter()
+                    .map(|edit| serde_json::to_string(&edit.after))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            )
+            .param(
+                "addedLayersJson",
+                changed_edits
+                    .iter()
+                    .map(|edit| serde_json::to_string(&edit.added))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            )
+            .param(
+                "removedLayersJson",
+                changed_edits
+                    .iter()
+                    .map(|edit| serde_json::to_string(&edit.removed))
+                    .collect::<std::result::Result<Vec<_>, _>>()?,
+            ),
+        )
+        .await?;
+        for edit in &changed_edits {
+            let target_match = if edit.normalized.target.kind == "node" {
+                "MATCH (target:Entity {iri: $iri})"
+            } else {
+                "MATCH ()-[target]->() WHERE target.iri = $iri AND target.validTo IS NULL"
+            };
+            fetch_one_txn(
+                &mut txn,
+                query(&format!(
+                    "{target_match} SET target.layers = $memberships, \
+                     target.layersUpdatedAt = datetime(), target.layerEpisodeId = $episode \
+                     RETURN target.iri AS iri"
+                ))
+                .param("iri", edit.normalized.target.iri.clone())
+                .param("memberships", edit.after.clone())
+                .param("episode", episode.iri.clone()),
+            )
+            .await?
+            .ok_or_else(|| {
+                DomainError::Precondition(format!(
+                    "place target {} changed concurrently",
+                    edit.normalized.target.iri
+                ))
+            })?;
+        }
+        Ok((Some(episode), planned))
+    }
+    .await;
+    let (episode, planned) = match result {
+        Ok((None, planned)) => {
+            txn.rollback().await?;
+            (None, planned)
+        }
+        Ok((Some(episode), planned)) => {
+            txn.commit()
+                .await
+                .map_err(|source| Error::AmbiguousCommit {
+                    operation: "memory_place",
+                    source,
+                })?;
+            (Some(episode), planned)
+        }
+        Err(error) => {
+            let _ = txn.rollback().await;
+            return Err(error);
+        }
+    };
+    let changed = planned
+        .iter()
+        .filter(|edit| edit.before != edit.after)
+        .count();
+    let items = planned
+        .into_iter()
+        .map(|edit| {
+            let status = if edit.before == edit.after {
+                "noop"
+            } else {
+                "changed"
+            };
+            json!({
+                "index": edit.normalized.index,
+                "target": edit.normalized.target,
+                "status": status,
+                "before": edit.before,
+                "memberships": edit.after,
+                "added": edit.added,
+                "removed": edit.removed,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "ok": true,
+        "scope": scope,
+        "noop": changed == 0,
+        "episode": episode.map(|episode| json!({
+            "iri": episode.iri, "at": episode.at, "tool": episode.tool
+        })).unwrap_or(Value::Null),
+        "summary": { "requested": items.len(), "changed": changed, "noop": items.len() - changed },
+        "items": items,
+    }))
+}
+
+/// Apply 1–20 membership edits atomically against their combined final state.
+pub async fn memory_place(graph: &Graph, args: PlaceArgs) -> Result<Value> {
+    let (scope, edits) = normalize_place_args(args)?;
+    for attempt in 0..3_u64 {
+        match memory_place_once(graph, scope.clone(), edits.clone()).await {
+            Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
+                sleep(Duration::from_millis(25 * (attempt + 1))).await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded retry loop always returns")
 }
 
 /// Class/Property catalog used by `memory_recall` (global schema-as-data).
@@ -3277,11 +4109,13 @@ pub async fn list_schema_catalog(graph: &Graph, kind: &str) -> Result<Value> {
 mod tests {
     use super::{
         assert_fact_lock_requests, effective_weight, merge_memberships,
-        plan_fact_membership_changes, prepare_assert_fact, reject_system_owned_predicate,
-        remove_memberships, replace_fact_lock_requests, retract_fact_lock_requests,
-        schema_write_fields_present, validate_assert_args, validate_schema_list_args, AssertArgs,
-        AssertFact, CurrentFact, FactMembershipChange, SchemaArgs, TargetArgs,
+        plan_fact_membership_changes, prepare_assert_fact, recall_around_query,
+        reject_system_owned_predicate, remove_memberships, replace_fact_lock_requests,
+        retract_fact_lock_requests, schema_write_fields_present, validate_assert_args,
+        validate_judge_args, validate_schema_list_args, AssertArgs, AssertFact, CurrentFact,
+        FactMembershipChange, JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, SchemaArgs, TargetArgs,
         CONTRADICTS_PROPERTY, LAYERS_PROPERTY, MAX_ASSERT_FACTS, PREDICATE_USAGE_PROPERTY,
+        RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
     };
     use crate::domain::{DomainError, EntityInput, ObjectInput};
     use crate::error::Error;
@@ -3293,6 +4127,24 @@ mod tests {
         assert!(spike_rank(Some("Insight")) > spike_rank(Some("Pattern")));
         assert!(spike_rank(Some("Pattern")) > spike_rank(Some("Signal")));
         assert!(spike_rank(Some("Signal")) > spike_rank(None));
+    }
+
+    #[test]
+    fn recall_queries_are_set_oriented_bounded_and_deterministic() {
+        assert!(RECALL_IRI_NODES_QUERY.contains("UNWIND range(0, size($iris) - 1)"));
+        assert!(RECALL_IRI_NODES_QUERY.contains("ORDER BY inputIndex ASC"));
+        assert!(RECALL_IRI_FACTS_QUERY.contains("WITH r, min(inputIndex) AS inputIndex"));
+        assert!(RECALL_IRI_FACTS_QUERY.contains("ORDER BY inputIndex ASC"));
+        assert!(RECALL_IRI_FACTS_QUERY.contains("LIMIT $limit"));
+
+        let around = recall_around_query(3);
+        let predicate_filter = around.find("property IN $predicates").unwrap();
+        let limit = around.find("LIMIT $limit").unwrap();
+        assert!(around.contains("pathRels*1..3"));
+        assert!(predicate_filter < limit);
+        assert!(
+            around.contains("ORDER BY distance ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC")
+        );
     }
 
     #[test]
@@ -3309,6 +4161,71 @@ mod tests {
             merge_memberships(&["project:b".into()], &["project:a".into()]),
             vec!["project:a".to_string(), "project:b".to_string()]
         );
+    }
+
+    #[test]
+    fn judge_batch_prevalidates_modes_and_duplicate_targets() {
+        let target = TargetArgs {
+            kind: "fact".into(),
+            iri: "mindreader:relationship/one".into(),
+        };
+        let valid = JudgeArgs {
+            scope: vec!["project:x".into()],
+            ratings: vec![JudgeRating {
+                target: target.clone(),
+                mode: "strengthen".into(),
+            }],
+        };
+        assert!(validate_judge_args(&valid).is_ok());
+        let duplicate = JudgeArgs {
+            scope: valid.scope.clone(),
+            ratings: vec![valid.ratings[0].clone(), valid.ratings[0].clone()],
+        };
+        assert!(validate_judge_args(&duplicate).is_err());
+        let invalid_mode = JudgeArgs {
+            scope: valid.scope,
+            ratings: vec![JudgeRating {
+                target,
+                mode: "maybe".into(),
+            }],
+        };
+        assert!(validate_judge_args(&invalid_mode).is_err());
+    }
+
+    #[test]
+    fn place_batch_rejects_duplicates_and_normalizes_each_edit() {
+        let target = TargetArgs {
+            kind: "node".into(),
+            iri: "mindreader:element/alice".into(),
+        };
+        let args = PlaceArgs {
+            scope: vec!["project:x".into()],
+            edits: vec![PlaceEdit {
+                target: target.clone(),
+                add: vec!["project:b".into(), "project:a".into(), "project:b".into()],
+                remove: Vec::new(),
+            }],
+        };
+        let (scope, edits) = super::normalize_place_args(args).expect("valid place batch");
+        assert_eq!(scope, vec!["project:x"]);
+        assert_eq!(edits[0].add, vec!["project:a", "project:b"]);
+
+        let duplicate = PlaceArgs {
+            scope: vec![],
+            edits: vec![
+                PlaceEdit {
+                    target: target.clone(),
+                    add: vec!["project:a".into()],
+                    remove: Vec::new(),
+                },
+                PlaceEdit {
+                    target,
+                    add: vec!["project:b".into()],
+                    remove: Vec::new(),
+                },
+            ],
+        };
+        assert!(super::normalize_place_args(duplicate).is_err());
     }
 
     #[test]

@@ -181,6 +181,7 @@ EXPECTED_TOOLS = {
     "memory_judge",
     "memory_place",
     "memory_recall",
+    "memory_recall_semantic",
     "memory_revise",
     "memory_unify",
     "memory_withdraw",
@@ -206,9 +207,11 @@ def handshake_contract_ok(init: dict, listed: list) -> bool:
     if tools_cap.get("listChanged") not in (None, False):
         return False
     names = [tool.get("name") for tool in listed]
-    if set(names) != EXPECTED_TOOLS or len(names) != 7:
+    if set(names) != EXPECTED_TOOLS or len(names) != 8:
         return False
     for tool in listed:
+        if not isinstance(tool.get("title"), str) or not tool["title"].strip():
+            return False
         if not isinstance(tool.get("annotations"), dict):
             return False
         if contains_union(tool.get("inputSchema")) or contains_union(tool.get("outputSchema")):

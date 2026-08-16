@@ -12,6 +12,7 @@ use crate::error::{Error, Result};
 use crate::graph::{
     endpoint_json, fact_envelope, fetch_all, node_json, rel_json, spike_label, spike_rank,
 };
+use crate::iri::is_iri;
 use crate::layers::validate_layer_ids;
 use neo4rs::{query, Graph, Node, Relation};
 use schemars::JsonSchema;
@@ -45,8 +46,6 @@ pub struct RecallArgs {
     #[serde(default)]
     pub around: Option<String>,
     #[serde(default)]
-    pub semantic: bool,
-    #[serde(default)]
     pub hops: Option<u32>,
     #[serde(default)]
     pub p: Option<Vec<String>>,
@@ -64,28 +63,8 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let iris = args
-        .iris
-        .as_ref()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .count()
-        })
-        .unwrap_or(0);
-    let labels = args
-        .labels
-        .as_ref()
-        .map(|values| {
-            values
-                .iter()
-                .map(|value| value.trim())
-                .filter(|value| !value.is_empty())
-                .count()
-        })
-        .unwrap_or(0);
+    let iris = args.iris.as_ref().map(Vec::len).unwrap_or(0);
+    let labels = args.labels.as_ref().map(Vec::len).unwrap_or(0);
     let around = args
         .around
         .as_deref()
@@ -101,10 +80,80 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
         )
         .into());
     }
-    if args.semantic && text.is_none() {
-        return Err(
-            DomainError::InvalidInput("memory_recall semantic:true requires text".into()).into(),
-        );
+    let selector = if text.is_some() {
+        "text"
+    } else if iris > 0 {
+        "iris"
+    } else if labels > 0 {
+        "labels"
+    } else {
+        "around"
+    };
+    if selector != "iris" && args.hops.is_some() {
+        return Err(DomainError::InvalidInput(format!(
+            "memory_recall hops applies only to the iris selector, not {selector}"
+        ))
+        .into());
+    }
+    if selector != "around" && args.p.is_some() {
+        return Err(DomainError::InvalidInput(format!(
+            "memory_recall p applies only to the around selector, not {selector}"
+        ))
+        .into());
+    }
+    if selector != "around" && args.depth.is_some() {
+        return Err(DomainError::InvalidInput(format!(
+            "memory_recall depth applies only to the around selector, not {selector}"
+        ))
+        .into());
+    }
+    if let Some(values) = &args.iris {
+        if !(1..=20).contains(&values.len()) {
+            return Err(DomainError::InvalidInput(
+                "memory_recall iris must contain 1..=20 node IRIs".into(),
+            )
+            .into());
+        }
+        let mut seen = HashSet::new();
+        for value in values {
+            let iri = value.trim();
+            if !is_iri(iri) || iri.starts_with("mindreader:relationship/") {
+                return Err(DomainError::InvalidInput(format!(
+                    "memory_recall iris accepts node IRIs, not {value:?}"
+                ))
+                .into());
+            }
+            if !seen.insert(iri) {
+                return Err(DomainError::InvalidInput(format!(
+                    "memory_recall iris contains duplicate IRI {iri:?}"
+                ))
+                .into());
+            }
+        }
+    }
+    if let Some(values) = &args.labels {
+        if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+            return Err(DomainError::InvalidInput(
+                "memory_recall labels must contain non-empty labels".into(),
+            )
+            .into());
+        }
+    }
+    if let Some(values) = &args.p {
+        if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
+            return Err(DomainError::InvalidInput(
+                "memory_recall p must contain non-empty predicates".into(),
+            )
+            .into());
+        }
+    }
+    if let Some(iri) = around {
+        if !is_iri(iri) || iri.starts_with("mindreader:relationship/") {
+            return Err(DomainError::InvalidInput(format!(
+                "memory_recall around requires a node IRI, not {iri:?}"
+            ))
+            .into());
+        }
     }
     if let Some(hops) = args.hops {
         if hops != 0 && hops != 1 {
@@ -121,9 +170,9 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
         }
     }
     if let Some(limit) = args.limit {
-        if limit == 0 || limit > 200 {
+        if limit == 0 || limit > 100 {
             return Err(Error::from(DomainError::InvalidInput(
-                "memory_recall limit must be 1..=200".into(),
+                "memory_recall limit must be 1..=100".into(),
             )));
         }
     }
@@ -412,20 +461,25 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
     let trimmed = args.text.unwrap_or_default().trim().to_string();
     if trimmed.is_empty() && labels.is_empty() {
         return Ok(json!({
-            "query": Value::Null,
-            "mode": "wakeup",
+            "ok": true,
+            "mode": "labels",
             "facts": [],
-            "spike": [],
-            "layers": layers,
+            "nodes": [],
+            "paths": [],
+            "about": [],
+            "lookups": [],
+            "scope": layers,
+            "truncated": false,
         }));
     }
 
     let text_mode = !trimmed.is_empty();
+    let query_limit = limit.saturating_add(1);
     let mut ranked = query(&ranked_query(text_mode))
         .param("layers", layers.clone())
         .param("labels", labels.clone())
         .param("labelCount", labels.len() as i64)
-        .param("limit", limit)
+        .param("limit", query_limit)
         .param("minWeight", i64::MIN)
         .param("maxWeight", i64::MAX);
     if text_mode {
@@ -433,7 +487,6 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
     }
 
     let mut facts = Vec::new();
-    let mut element_iris = HashSet::new();
     for row in fetch_all(graph, ranked).await? {
         let (Ok(subject), Ok(relationship), Ok(object)) = (
             row.get::<Node>("s"),
@@ -444,10 +497,6 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
         };
         let subject_iri = subject.get::<String>("iri").unwrap_or_default();
         let object_iri = object.get::<String>("iri").unwrap_or_default();
-        element_iris.insert(subject_iri.clone());
-        if object.labels().contains(&"Element") {
-            element_iris.insert(object_iri.clone());
-        }
         let effective_weight = row
             .get::<String>("effectiveWeight")
             .ok()
@@ -456,7 +505,7 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
         let property = row.get::<String>("property")?;
         let relationship = rel_json(&relationship, &subject_iri, &object_iri);
         let scope = relationship
-            .get("layers")
+            .get("scope")
             .cloned()
             .unwrap_or_else(|| json!([]));
         let scope_vec = scope
@@ -481,6 +530,23 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
         fact["effectiveWeight"] = json!(effective_weight);
         facts.push(fact);
     }
+    let truncated = facts.len() > limit as usize;
+    facts.truncate(limit as usize);
+    let mut element_iris = HashSet::new();
+    for fact in &facts {
+        if let Some(iri) = fact.pointer("/s/iri").and_then(Value::as_str) {
+            element_iris.insert(iri.to_string());
+        }
+        let object_is_element = fact
+            .pointer("/o/labels")
+            .and_then(Value::as_array)
+            .is_some_and(|labels| labels.iter().any(|label| label == "Element"));
+        if object_is_element {
+            if let Some(iri) = fact.pointer("/o/iri").and_then(Value::as_str) {
+                element_iris.insert(iri.to_string());
+            }
+        }
+    }
     let spike = spike_context(
         graph,
         &layers,
@@ -489,12 +555,15 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
     )
     .await?;
     Ok(json!({
-        "query": if trimmed.is_empty() { Value::Null } else { json!(trimmed) },
-        "mode": "wakeup",
+        "ok": true,
+        "mode": if text_mode { "text" } else { "labels" },
         "facts": facts,
+        "nodes": [],
+        "paths": [],
         "about": spike,
+        "lookups": [],
         "scope": layers,
-        "semantic": false,
+        "truncated": truncated,
     }))
 }
 
@@ -521,7 +590,6 @@ mod tests {
             iris: None,
             labels: None,
             around: None,
-            semantic: false,
             hops: None,
             p: None,
             depth: None,
@@ -535,10 +603,46 @@ mod tests {
         args.around = None;
         args.hops = Some(2);
         assert!(validate_recall_args(&args).is_err());
-        args.hops = Some(1);
-        args.semantic = true;
-        assert!(validate_recall_args(&args).is_ok());
         args.text = None;
+        args.iris = Some(vec!["mindreader:element/alice".into()]);
+        args.hops = Some(1);
+        assert!(validate_recall_args(&args).is_ok());
+        args.iris = Some(vec!["mindreader:relationship/fact".into()]);
         assert!(validate_recall_args(&args).is_err());
+    }
+
+    #[test]
+    fn recall_args_reject_selector_inapplicable_fields_and_bad_bounds() {
+        let base = RecallArgs {
+            scope: vec![],
+            text: Some("Alice".into()),
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            limit: Some(20),
+        };
+        assert!(validate_recall_args(&base).is_ok());
+        assert!(validate_recall_args(&RecallArgs {
+            hops: Some(1),
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate_recall_args(&RecallArgs {
+            limit: Some(101),
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate_recall_args(&RecallArgs {
+            text: None,
+            iris: Some(vec![
+                "mindreader:element/alice".into(),
+                " mindreader:element/alice ".into(),
+            ]),
+            ..base
+        })
+        .is_err());
     }
 }

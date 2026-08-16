@@ -733,8 +733,9 @@ pub fn node_json(node: &Node) -> Value {
         .collect();
     let iri = node.get::<String>("iri").unwrap_or_default();
     let name = node.get::<String>("name").ok();
+    let is_literal = labels.iter().any(|label| label == "Literal");
     let mut obj = json!({
-        "kind": "node",
+        "kind": if is_literal { "literal" } else { "node" },
         "iri": iri,
         "name": name,
         "labels": labels,
@@ -751,8 +752,11 @@ pub fn node_json(node: &Node) -> Value {
     if let Ok(v) = node.get::<String>("tool") {
         obj["tool"] = json!(v);
     }
-    obj["layers"] = json!(node.get::<Vec<String>>("layers").unwrap_or_default());
+    obj["scope"] = json!(node.get::<Vec<String>>("layers").unwrap_or_default());
     obj["weight"] = json!(node_weight(node));
+    if !is_literal {
+        obj["target"] = json!({ "kind": "node", "iri": iri });
+    }
     obj
 }
 
@@ -776,7 +780,7 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("reason") {
         obj["reason"] = json!(v);
     }
-    obj["layers"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
+    obj["scope"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
     obj["weight"] = json!(relation_weight(rel));
     obj
 }
@@ -800,7 +804,7 @@ fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("reason") {
         obj["reason"] = json!(v);
     }
-    obj["layers"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
+    obj["scope"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
     obj["weight"] = json!(unbounded_relation_weight(rel));
     obj
 }
@@ -1242,7 +1246,7 @@ pub fn endpoint_json(node: &Node) -> Value {
             "iri": iri,
             "value": value,
             "datatype": datatype,
-            "layers": node.get::<Vec<String>>("layers").unwrap_or_default(),
+            "scope": node.get::<Vec<String>>("layers").unwrap_or_default(),
             "weight": node_weight(node),
         });
     }
@@ -1251,8 +1255,9 @@ pub fn endpoint_json(node: &Node) -> Value {
         "iri": iri,
         "name": node.get::<String>("name").ok(),
         "labels": labels,
-        "layers": node.get::<Vec<String>>("layers").unwrap_or_default(),
+        "scope": node.get::<Vec<String>>("layers").unwrap_or_default(),
         "weight": node_weight(node),
+        "target": { "kind": "node", "iri": iri },
     })
 }
 

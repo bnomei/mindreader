@@ -1,19 +1,16 @@
 //! Typed application boundary shared by MCP and in-process adapters.
 //!
 //! [`MemoryService`] holds the Neo4j handle and optional embedding runtime.
-//! MCP uses `recall` / `write` / `revise` / `withdraw` / `judge` / `place` /
-//! `unify`. Smoke and bench still call the older get/search/assert helpers.
-//! This type does not own rate limits or `CallToolResult` mapping.
+//! MCP uses `recall` / `recall_semantic` / `write` / `revise` / `withdraw` /
+//! `judge` / `place` / `unify`. This type does not own rate limits or
+//! `CallToolResult` mapping.
 
 use crate::config::Config;
 use crate::error::Result;
 use crate::merge::{self, MergeArgs};
 use crate::search::{self, is_schema_catalog_labels, validate_recall_args, RecallArgs, SearchArgs};
 use crate::semantic::{self, SemanticRuntime, SemanticSearchArgs};
-use crate::tools::{
-    self, AssertArgs, FeedbackArgs, GetArgs, JudgeArgs, LayersArgs, PlaceArgs, ReplaceArgs,
-    RetractArgs, ReviseArgs, SchemaArgs, StatsArgs, TraverseArgs, WithdrawArgs, WriteArgs,
-};
+use crate::tools::{self, JudgeArgs, PlaceArgs, ReviseArgs, WithdrawArgs, WriteArgs};
 use neo4rs::Graph;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -41,18 +38,8 @@ impl MemoryService {
         &self.graph
     }
 
-    /// In-process IRI lookup; MCP uses [`Self::recall`] with `iris`.
-    pub async fn get(&self, args: GetArgs) -> Result<Value> {
-        tools::memory_get(&self.graph, args).await
-    }
-
-    /// In-process ranked `ASSERTS`/`ABOUT` search; MCP uses [`Self::recall`].
-    pub async fn search(&self, args: SearchArgs) -> Result<Value> {
-        search::memory_search(&self.graph, args).await
-    }
-
-    /// In-process embedding fusion; MCP uses [`Self::recall`] with `semantic:true`.
-    pub async fn semantic_search(&self, args: SemanticSearchArgs) -> Result<Value> {
+    /// Side-effectful embedding fusion for MCP `memory_recall_semantic`.
+    pub async fn recall_semantic(&self, args: SemanticSearchArgs) -> Result<Value> {
         semantic::memory_semantic_search(
             &self.graph,
             self.semantic.as_ref(),
@@ -62,69 +49,10 @@ impl MemoryService {
         .await
     }
 
-    /// In-process unify; MCP `memory_unify` calls [`Self::unify`].
-    pub async fn merge(&self, args: MergeArgs) -> Result<Value> {
-        merge::memory_merge(&self.graph, args).await
-    }
-
-    /// In-process typed walk; MCP uses [`Self::recall`] with `around`.
-    pub async fn traverse(&self, args: TraverseArgs) -> Result<Value> {
-        tools::memory_traverse(&self.graph, args).await
-    }
-
-    /// Operator counters used by smoke and bench; not registered as an MCP tool.
-    pub async fn stats(&self, args: StatsArgs) -> Result<Value> {
-        tools::memory_stats(&self.graph, args).await
-    }
-
-    /// In-process batched assert; MCP `memory_write` calls [`Self::write`].
-    pub async fn assert(&self, args: AssertArgs) -> Result<Value> {
-        tools::memory_assert(&self.graph, args).await
-    }
-
-    /// In-process triple replace; MCP `memory_revise` resolves a fact handle first.
-    pub async fn replace(&self, args: ReplaceArgs) -> Result<Value> {
-        tools::memory_replace(&self.graph, args).await
-    }
-
-    /// In-process soft retract; MCP `memory_withdraw` wraps fact-handle or subject form.
-    pub async fn retract(&self, args: RetractArgs) -> Result<Value> {
-        tools::memory_retract(&self.graph, args).await
-    }
-
-    /// In-process schema write or catalog; MCP catalogs via [`Self::recall`] labels.
-    pub async fn declare_schema(&self, args: SchemaArgs) -> Result<Value> {
-        tools::memory_schema(&self.graph, args).await
-    }
-
-    /// In-process single-target ±1; MCP `memory_judge` batches ratings.
-    pub async fn feedback(&self, args: FeedbackArgs) -> Result<Value> {
-        tools::memory_feedback(&self.graph, args).await
-    }
-
-    /// In-process membership edit; MCP `memory_place` uses `scope` plus add/remove.
-    pub async fn layers(&self, args: LayersArgs) -> Result<Value> {
-        tools::memory_layers(&self.graph, args).await
-    }
-
-    /// MCP `memory_recall`: dispatch one selector to search, catalog, walk, or semantic fusion.
+    /// MCP `memory_recall`: dispatch one closed-world selector to search, catalog, or walk.
     pub async fn recall(&self, args: RecallArgs) -> Result<Value> {
         validate_recall_args(&args)?;
         let scope = args.scope.clone();
-        if args.semantic {
-            return semantic::memory_semantic_search(
-                &self.graph,
-                self.semantic.as_ref(),
-                self.secrets_path.clone(),
-                SemanticSearchArgs {
-                    text: args.text.unwrap_or_default(),
-                    layers: scope,
-                    labels: None,
-                    limit: args.limit,
-                },
-            )
-            .await;
-        }
         if let Some(around) = args
             .around
             .as_deref()
@@ -137,7 +65,7 @@ impl MemoryService {
                 scope,
                 args.p.unwrap_or_default(),
                 args.depth.unwrap_or(1),
-                args.limit.unwrap_or(50),
+                args.limit.unwrap_or(20),
             )
             .await;
         }
@@ -145,8 +73,14 @@ impl MemoryService {
             .iris
             .filter(|values| values.iter().any(|value| !value.trim().is_empty()))
         {
-            return tools::memory_recall_iris(&self.graph, iris, scope, args.hops.unwrap_or(0))
-                .await;
+            return tools::memory_recall_iris(
+                &self.graph,
+                iris,
+                scope,
+                args.hops.unwrap_or(0),
+                args.limit.unwrap_or(20),
+            )
+            .await;
         }
         if let Some(labels) = args
             .labels
@@ -157,20 +91,27 @@ impl MemoryService {
                 if labels.iter().any(|label| label.trim() == "Class") {
                     let catalog = tools::list_schema_catalog(&self.graph, "class").await?;
                     if let Some(nodes) = catalog.get("items").and_then(Value::as_array) {
-                        items.extend(nodes.iter().cloned());
+                        items.extend(nodes.iter().map(|node| catalog_node(node, "Class")));
                     }
                 }
                 if labels.iter().any(|label| label.trim() == "Property") {
                     let catalog = tools::list_schema_catalog(&self.graph, "property").await?;
                     if let Some(nodes) = catalog.get("items").and_then(Value::as_array) {
-                        items.extend(nodes.iter().cloned());
+                        items.extend(nodes.iter().map(|node| catalog_node(node, "Property")));
                     }
                 }
+                let truncated = items.len() > args.limit.unwrap_or(20) as usize;
+                items.truncate(args.limit.unwrap_or(20) as usize);
                 return Ok(json!({
+                    "ok": true,
+                    "mode": "catalog",
                     "scope": scope,
-                    "semantic": false,
                     "facts": [],
                     "nodes": items,
+                    "paths": [],
+                    "about": [],
+                    "lookups": [],
+                    "truncated": truncated,
                 }));
             }
             return search::memory_search(
@@ -225,4 +166,18 @@ impl MemoryService {
     pub async fn unify(&self, args: MergeArgs) -> Result<Value> {
         merge::memory_merge(&self.graph, args).await
     }
+}
+
+fn catalog_node(value: &Value, label: &str) -> Value {
+    let iri = value.get("iri").cloned().unwrap_or(Value::Null);
+    json!({
+        "kind": "node",
+        "iri": iri.clone(),
+        "name": value.get("name").cloned().unwrap_or(Value::Null),
+        "labels": [label],
+        "scope": [],
+        "weight": 0,
+        "stub": value.get("stub").cloned().unwrap_or(Value::Bool(false)),
+        "target": { "kind": "node", "iri": iri },
+    })
 }

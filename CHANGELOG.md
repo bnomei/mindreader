@@ -5,6 +5,20 @@ versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-16
+
+### Changed
+
+- Split closed-world `memory_recall` from the new provider-backed `memory_recall_semantic`; both default to 20 results and accept at most 100, while direct IRI recall accepts at most 20 node IRIs and preserves input order and misses.
+- Made `memory_judge.ratings[]` and `memory_place.edits[]` atomic 1–20 item batches. Each successful changing batch records one public-tool Episode, and an invalid item rolls back the whole batch.
+- Standardized successful results on `ok:true`, mutation no-op and Episode fields, and ordered batch summaries/items. Recoverable errors now state whether retry is safe and whether the mutation was definitely not applied.
+- Replaced prescriptive follow-up fields with neutral `review.unify` and `review.alternatives`; corrections return the current `target` and retired `previousTarget`, while withdrawals return `withdrawnTargets`.
+- Added concrete host-compatible schemas, top-level tool titles, explicit tool annotations, and field-level descriptions for all eight MCP tools.
+
+### Removed
+
+- Removed semantic mode from ordinary recall, scalar membership-edit payloads, legacy provenance names, and the remaining legacy result vocabulary. This release does not provide compatibility aliases.
+
 ## [0.3.0] - 2026-08-16
 
 ### Changed
@@ -16,22 +30,22 @@ versions follow Semantic Versioning.
 
 ### Removed
 
-- MCP registration of `memory_get`, `memory_search`, `memory_semantic_search`, `memory_traverse`, `memory_stats`, `memory_schema`, `memory_assert`, `memory_replace`, `memory_retract`, `memory_feedback`, `memory_layers`, and `memory_merge`. In-process stats remain for smoke and bench.
+- Removed the previous twelve-tool MCP surface. In-process statistics remain available to smoke and benchmark binaries.
 
 ## [0.2.0] - 2026-08-16
 
 ### Changed
 
-- `memory_assert` now takes required `facts[]` (1–20 triples) and call-level `layers`. Scalar top-level `s`/`p`/`o` is gone.
+- Assertions now take required `facts[]` (1–20 triples) and a call-level visibility array. Scalar top-level triples are gone.
 - Recoverable tool failures return structured `isError` results (`{ok:false,reason,message}`) instead of JSON-RPC `-32602` for domain errors.
-- `memory_schema` can list the Class/Property catalog with `list=true` (no Episode). Combining `list=true` with write fields is rejected before Cypher.
-- Node and relationship JSON include `kind`. `memory_merge` returns `{node, episode}`.
+- The Class/Property catalog can be listed without creating an Episode. Combining catalog reads with write fields is rejected before Cypher.
+- Node and relationship JSON include `kind`; unification returns the surviving node and Episode.
 - MCP advertise `2025-11-25`, negotiated versions `2024-11-05`…`2025-11-25` only, tools-only capabilities without `listChanged`.
 - MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after connect.
 
 ### Added
 
-- Tool annotations, advertised runtime clamps, and host-compatible `outputSchema` objects on all twelve tools.
+- Tool annotations, advertised runtime clamps, and host-compatible `outputSchema` objects on the complete MCP surface.
 
 ## [0.1.0] - 2026-08-15
 
@@ -39,9 +53,8 @@ versions follow Semantic Versioning.
 
 - Deterministic Neo4j-backed MCP memory server with provenance and supersession.
 - Cross-platform GitHub Release assets, npm launcher, shell installer, and GHCR image distribution.
-- `memory_feedback` for explicit strengthen/weaken signals and `memory_layers` for audited membership changes.
-- `memory_merge` with advisory same-kind duplicate suggestions and explicit source/target direction.
-- `memory_semantic_search` with provider embeddings and expiring, convergent Neo4j vector activations.
+- Explicit strengthen/weaken signals, audited membership changes, and intentional same-kind unification.
+- Provider embeddings with expiring, convergent Neo4j vector activations.
 
 ### Changed
 
@@ -54,7 +67,8 @@ versions follow Semantic Versioning.
 - Reduced semantic activation recall to metadata plus the selected convergence vector and bounded embedding-provider retries, latency, and response-body memory.
 - Added crates.io and cargo-binstall distribution alongside the existing GitHub, npm, and container release channels.
 
-[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/bnomei/mindreader/releases/tag/v0.4.0
 [0.3.0]: https://github.com/bnomei/mindreader/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bnomei/mindreader/releases/tag/v0.2.0
 [0.1.0]: https://github.com/bnomei/mindreader/releases/tag/v0.1.0

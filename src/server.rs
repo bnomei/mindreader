@@ -1,7 +1,8 @@
-//! MCP stdio adapter: seven tools, host-compatible schemas, lazy Neo4j.
+//! MCP stdio adapter: eight tools, host-compatible schemas, lazy Neo4j.
 //!
 //! Advertises `memory_recall`, `memory_write`, `memory_revise`,
-//! `memory_withdraw`, `memory_judge`, `memory_place`, and `memory_unify` as
+//! `memory_recall_semantic`, `memory_withdraw`, `memory_judge`, `memory_place`,
+//! and `memory_unify` as
 //! plain tagged object schemas (no `anyOf`/`oneOf`/`allOf`). Initialize and
 //! `tools/list` do not wait on Neo4j. Recoverable failures are structured
 //! `isError` results. The 120/min burst-20 limiter and 45s timeout apply only
@@ -13,7 +14,7 @@ use crate::error::{Error, Result as AppResult};
 use crate::graph;
 use crate::merge::MergeArgs;
 use crate::search::RecallArgs;
-use crate::semantic::MAX_SEMANTIC_TEXT_BYTES;
+use crate::semantic::{SemanticSearchArgs, MAX_SEMANTIC_TEXT_BYTES};
 use crate::service::MemoryService;
 use crate::tools::{JudgeArgs, PlaceArgs, ReviseArgs, WithdrawArgs, WriteArgs};
 use neo4rs::Error as Neo4jError;
@@ -41,14 +42,11 @@ fn object_schema(value: serde_json::Value) -> Arc<rmcp::model::JsonObject> {
     Arc::new(rmcp::model::object(value))
 }
 
-fn layers_schema() -> serde_json::Value {
-    scope_schema()
-}
-
 fn scope_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "array",
         "description": "Visibility union. [] selects global/unlayered records only. Named records match any requested layer. IDs use lowercase kebab-case with colon namespaces, for example project:mindreader or analysis:hypothesis; colons are naming, not hierarchy.",
+        "uniqueItems": true,
         "items": {
             "type": "string",
             "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*(?::[a-z0-9]+(?:-[a-z0-9]+)*)*$"
@@ -56,107 +54,67 @@ fn scope_schema() -> serde_json::Value {
     })
 }
 
-fn target_schema() -> serde_json::Value {
+fn layer_list_schema(description: &str) -> serde_json::Value {
+    let mut schema = scope_schema();
+    schema["description"] = Value::String(description.to_string());
+    schema
+}
+
+fn target_schema_with_kinds(kinds: &[&str], description: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "A pasteable node or fact handle from recall/write.",
+        "description": description,
+        "additionalProperties": false,
         "properties": {
-            "kind": { "type": "string", "enum": ["node", "fact"] },
+            "kind": { "type": "string", "enum": kinds },
             "iri": { "type": "string", "minLength": 1 }
         },
         "required": ["kind", "iri"]
     })
 }
 
-#[allow(dead_code)]
-fn schema_memory_get() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "iri": { "type": "string" },
-            "layers": layers_schema(),
-            "hops": { "type": "integer", "enum": [0, 1], "minimum": 0, "maximum": 1 }
-        },
-        "required": ["iri", "layers"]
-    }))
+fn target_schema() -> serde_json::Value {
+    target_schema_with_kinds(
+        &["node", "fact"],
+        "A pasteable current node or fact handle returned by Mindreader.",
+    )
 }
 
-#[allow(dead_code)]
-fn schema_memory_search() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "text": { "type": "string" },
-            "labels": { "type": "array", "items": { "type": "string" } },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
-            "layers": layers_schema()
-        },
-        "required": ["layers"]
-    }))
+fn fact_target_schema() -> serde_json::Value {
+    target_schema_with_kinds(
+        &["fact"],
+        "A pasteable current fact handle returned by recall, write, or revise.",
+    )
 }
 
-#[allow(dead_code)]
-fn schema_memory_semantic_search() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "text": {
-                "type": "string",
-                "minLength": 1,
-                "description": format!("Query text; runtime limit is {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes.")
-            },
-            "layers": layers_schema(),
-            "labels": { "type": "array", "items": { "type": "string" } },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
-        },
-        "required": ["text", "layers"]
-    }))
+fn label_schema() -> serde_json::Value {
+    json!({
+        "type": "string",
+        "minLength": 1,
+        "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+    })
 }
 
-fn schema_memory_merge() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "source": { "type": "string", "minLength": 1 },
-            "target": { "type": "string", "minLength": 1 }
-        },
-        "required": ["source", "target"]
-    }))
-}
-
-#[allow(dead_code)]
-fn schema_memory_traverse() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "from": { "type": "string" },
-            "layers": layers_schema(),
-            "rels": { "type": "array", "items": { "type": "string" } },
-            "depth": { "type": "integer", "minimum": 1, "maximum": 3 },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
-        },
-        "required": ["from", "layers"]
-    }))
-}
-
-#[allow(dead_code)]
-fn schema_memory_stats() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": { "layers": layers_schema() },
-        "required": ["layers"]
-    }))
+fn predicate_list_schema(description: &str) -> serde_json::Value {
+    json!({
+        "type": "array",
+        "description": description,
+        "minItems": 1,
+        "uniqueItems": true,
+        "items": { "type": "string", "minLength": 1 }
+    })
 }
 
 fn entity_input_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "description": "A node reference. Runtime validation requires at least one of iri or name.",
+        "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node"] },
             "iri": { "type": "string", "minLength": 1 },
             "name": { "type": "string", "minLength": 1 },
-            "labels": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$" } }
+            "labels": { "type": "array", "uniqueItems": true, "items": label_schema() }
         },
         "required": ["kind"]
     })
@@ -166,11 +124,12 @@ fn object_input_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "description": "A tagged node or literal. Node values use iri/name/labels; literal values use value and optional datatype.",
+        "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node", "literal"] },
             "iri": { "type": "string", "minLength": 1 },
             "name": { "type": "string", "minLength": 1 },
-            "labels": { "type": "array", "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]*$" } },
+            "labels": { "type": "array", "uniqueItems": true, "items": label_schema() },
             "value": { "type": "string" },
             "datatype": { "type": "string", "minLength": 1, "default": "xsd:string" }
         },
@@ -178,7 +137,7 @@ fn object_input_schema() -> serde_json::Value {
     })
 }
 
-fn schema_memory_assert() -> Arc<rmcp::model::JsonObject> {
+fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
     // Host wrappers drop the whole server if any inputSchema uses anyOf.
     object_schema(serde_json::json!({
         "type": "object",
@@ -188,8 +147,10 @@ fn schema_memory_assert() -> Arc<rmcp::model::JsonObject> {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 20,
+                "description": "Atomic, input-ordered batch. The whole call rolls back if any item is invalid or fails.",
                 "items": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "s": entity_input_schema(),
                         "p": { "type": "string", "minLength": 1 },
@@ -209,104 +170,14 @@ fn schema_memory_assert() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
-#[allow(dead_code)]
-fn schema_memory_replace() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "s": entity_input_schema(),
-            "p": { "type": "string", "minLength": 1 },
-            "old": object_input_schema(),
-            "new": object_input_schema(),
-            "layers": layers_schema(),
-            "spike": {
-                "type": "string",
-                "enum": ["Signal", "Pattern", "Insight", "Knowledge"]
-            },
-            "contradicts": { "type": "boolean" },
-            "reason": { "type": "string" }
-        },
-        "required": ["s", "p", "old", "new", "layers"]
-    }))
-}
-
-#[allow(dead_code)]
-fn schema_memory_retract() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "target": {
-                "type": "object",
-                "description": "A tagged retract scope. fact requires p and o; predicate requires p; subject uses only s.",
-                "properties": {
-                    "kind": {
-                        "type": "string",
-                        "enum": ["fact", "predicate", "subject"]
-                    },
-                    "s": entity_input_schema(),
-                    "p": { "type": "string", "minLength": 1 },
-                    "o": object_input_schema()
-                },
-                "required": ["kind", "s"]
-            },
-            "layers": layers_schema(),
-            "reason": { "type": "string" }
-        },
-        "required": ["target", "layers"]
-    }))
-}
-
-#[allow(dead_code)]
-fn schema_memory_feedback() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "layers": layers_schema(),
-            "target": target_schema(),
-            "mode": { "type": "string", "enum": ["strengthen", "weaken"] }
-        },
-        "required": ["layers", "target", "mode"]
-    }))
-}
-
-#[allow(dead_code)]
-fn schema_memory_layers() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "layers": layers_schema(),
-            "target": target_schema(),
-            "add": { "type": "array", "items": layers_schema()["items"].clone() },
-            "remove": { "type": "array", "items": layers_schema()["items"].clone() }
-        },
-        "required": ["layers", "target"]
-    }))
-}
-
-#[allow(dead_code)]
-fn schema_memory_schema() -> Arc<rmcp::model::JsonObject> {
-    object_schema(serde_json::json!({
-        "type": "object",
-        "properties": {
-            "kind": { "type": "string", "enum": ["class", "property"] },
-            "list": { "type": "boolean" },
-            "name": { "type": "string", "minLength": 1 },
-            "iri": { "type": "string", "minLength": 1 },
-            "subClassOf": { "type": "string", "minLength": 1 },
-            "subPropertyOf": { "type": "string", "minLength": 1 },
-            "domain": { "type": "string", "minLength": 1 },
-            "range": { "type": "string", "minLength": 1 }
-        },
-        "required": ["kind"]
-    }))
-}
-
 fn error_envelope_properties() -> serde_json::Map<String, Value> {
     let Value::Object(map) = json!({
         "ok": { "type": "boolean" },
         "reason": { "type": "string" },
         "message": { "type": "string" },
-        "episode": {}
+        "retryable": { "type": "boolean" },
+        "outcome": { "type": "string", "enum": ["not_applied", "unknown"] },
+        "retryAfterMs": { "type": "integer", "minimum": 1 }
     }) else {
         unreachable!("literal object")
     };
@@ -319,7 +190,9 @@ fn schema_out(mut properties: serde_json::Map<String, Value>) -> Arc<rmcp::model
     }
     object_schema(json!({
         "type": "object",
-        "properties": properties
+        "additionalProperties": false,
+        "properties": properties,
+        "required": ["ok"]
     }))
 }
 
@@ -330,117 +203,172 @@ fn props(value: Value) -> serde_json::Map<String, Value> {
     }
 }
 
-#[allow(dead_code)]
-fn schema_out_memory_get() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "found": { "type": "boolean" },
-        "iri": { "type": "string" },
-        "node": { "type": "object" },
-        "neighbors": { "type": "array" },
-        "hops": { "type": "integer" },
-        "layers": { "type": "array" }
-    })))
+fn node_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "enum": ["node", "literal"] },
+            "iri": { "type": "string" },
+            "name": { "type": ["string", "null"] },
+            "labels": { "type": "array", "items": { "type": "string" } },
+            "value": { "type": "string" },
+            "datatype": { "type": "string" },
+            "scope": scope_schema(),
+            "weight": { "type": "integer" },
+            "stub": { "type": "boolean" },
+            "tool": { "type": "string" },
+            "target": target_schema_with_kinds(&["node"], "Pasteable node handle.")
+        },
+        "required": ["iri"]
+    })
 }
 
-#[allow(dead_code)]
-fn schema_out_memory_search() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "facts": { "type": "array" },
-        "spike": { "type": "array" },
-        "layers": { "type": "array" }
-    })))
+fn relationship_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "enum": ["fact"] },
+            "type": { "type": "string" },
+            "iri": { "type": "string" },
+            "from": { "type": "string" },
+            "to": { "type": "string" },
+            "propertyIri": { "type": "string" },
+            "scope": scope_schema(),
+            "weight": { "type": "integer" },
+            "episodeId": { "type": "string" },
+            "reason": { "type": "string" }
+        },
+        "required": ["iri"]
+    })
 }
 
-#[allow(dead_code)]
-fn schema_out_memory_semantic_search() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "facts": { "type": "array" },
-        "spike": { "type": "array" },
-        "layers": { "type": "array" }
-    })))
+fn conflict_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "relationship": relationship_schema(),
+            "o": node_schema(),
+            "p": { "type": "string" }
+        },
+        "required": ["relationship", "o", "p"]
+    })
 }
 
-fn schema_out_memory_merge() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "node": { "type": "object" }
-    })))
+fn fact_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "target": fact_target_schema(),
+            "s": node_schema(),
+            "p": { "type": "string" },
+            "o": node_schema(),
+            "relationship": relationship_schema(),
+            "scope": scope_schema(),
+            "spike": { "type": ["string", "null"], "enum": ["Signal", "Pattern", "Insight", "Knowledge", null] },
+            "score": { "type": "number" },
+            "effectiveWeight": { "type": "integer" },
+            "weight": { "type": "integer" },
+            "rank": { "type": "integer", "minimum": 1 },
+            "conflicts": { "type": "array", "items": conflict_schema() },
+            "noop": { "type": "boolean" }
+        },
+        "required": ["target", "s", "p", "o"]
+    })
 }
 
-#[allow(dead_code)]
-fn schema_out_memory_traverse() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "from": { "type": "string" },
-        "layers": { "type": "array" },
-        "rels": { "type": "array" },
-        "paths": { "type": "array" },
-        "nodes": { "type": "array" },
-        "edges": { "type": "array" },
-        "depth": { "type": "integer" }
-    })))
+fn nullable_fact_schema() -> Value {
+    let mut schema = fact_schema();
+    schema["type"] = json!(["object", "null"]);
+    schema
 }
 
-#[allow(dead_code)]
-fn schema_out_memory_stats() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "layers": { "type": "array" },
-        "ready": { "type": "boolean" }
-    })))
+fn about_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "node": node_schema(),
+            "about": { "type": "string" },
+            "rank": { "type": "string", "enum": ["Signal", "Pattern", "Insight", "Knowledge"] },
+            "relationship": relationship_schema(),
+            "effectiveWeight": { "type": "integer" }
+        },
+        "required": ["node", "about", "rank", "relationship", "effectiveWeight"]
+    })
 }
 
-fn schema_out_memory_assert() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "noop": { "type": "boolean" },
-        "layers": { "type": "array" },
-        "mergeSuggestions": { "type": "array" },
-        "facts": { "type": "array" }
-    })))
+fn episode_schema() -> Value {
+    json!({
+        "type": ["object", "null"],
+        "properties": {
+            "iri": { "type": "string" },
+            "at": { "type": "string" },
+            "tool": {
+                "type": "string",
+                "enum": [
+                    "memory_judge", "memory_place", "memory_revise", "memory_unify",
+                    "memory_withdraw", "memory_write"
+                ]
+            }
+        },
+        "required": ["iri", "at", "tool"]
+    })
 }
 
-fn schema_out_memory_replace() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "noop": { "type": "boolean" },
-        "layers": { "type": "array" },
-        "mergeSuggestions": { "type": "array" }
-    })))
+fn review_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "unify": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "source": node_schema(),
+                        "target": node_schema(),
+                        "similarity": { "type": "number", "minimum": 0, "maximum": 1 },
+                        "merge": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "properties": {
+                                "source": { "type": "string", "minLength": 1 },
+                                "target": { "type": "string", "minLength": 1 }
+                            },
+                            "required": ["source", "target"]
+                        }
+                    },
+                    "required": ["source", "target", "similarity", "merge"]
+                }
+            },
+            "alternatives": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "target": fact_target_schema(),
+                        "conflicts": { "type": "array", "items": conflict_schema() }
+                    },
+                    "required": ["target", "conflicts"]
+                }
+            }
+        },
+        "required": ["unify", "alternatives"]
+    })
 }
 
-#[allow(dead_code)]
-fn schema_out_memory_retract() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "retracted": { "type": "integer" },
-        "layers": { "type": "array" }
-    })))
-}
-
-#[allow(dead_code)]
-fn schema_out_memory_feedback() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "weight": { "type": "integer" },
-        "target": { "type": "object" }
-    })))
-}
-
-#[allow(dead_code)]
-fn schema_out_memory_layers() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "noop": { "type": "boolean" },
-        "target": { "type": "object" },
-        "before": { "type": "array" },
-        "layers": { "type": "array" }
-    })))
-}
-
-#[allow(dead_code)]
-fn schema_out_memory_schema() -> Arc<rmcp::model::JsonObject> {
-    schema_out(props(json!({
-        "list": { "type": "boolean" },
-        "kind": { "type": "string" },
-        "items": { "type": "array" },
-        "noop": { "type": "boolean" },
-        "node": { "type": "object" },
-        "links": { "type": "array" },
-        "mergeSuggestions": { "type": "array" }
-    })))
+fn summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "requested": { "type": "integer", "minimum": 1, "maximum": 20 },
+            "changed": { "type": "integer", "minimum": 0, "maximum": 20 },
+            "noop": { "type": "integer", "minimum": 0, "maximum": 20 }
+        },
+        "required": ["requested", "changed", "noop"]
+    })
 }
 
 struct TokenBucket {
@@ -462,7 +390,7 @@ impl TokenBucket {
         }
     }
 
-    fn try_acquire(&self) -> bool {
+    fn try_acquire(&self) -> std::result::Result<(), u64> {
         let mut state = self
             .inner
             .lock()
@@ -474,14 +402,18 @@ impl TokenBucket {
         state.last = now;
         if state.tokens >= 1.0 {
             state.tokens -= 1.0;
-            true
+            Ok(())
         } else {
-            false
+            let tokens_per_second = RATE_LIMIT_PER_MINUTE / 60.0;
+            let retry_after_ms = ((1.0 - state.tokens) / tokens_per_second * 1_000.0)
+                .ceil()
+                .max(1.0) as u64;
+            Err(retry_after_ms)
         }
     }
 }
 
-/// Stdio MCP server: seven-tool router, lazy Neo4j service, and invoke limiter.
+/// Stdio MCP server: eight-tool router, lazy Neo4j service, and invoke limiter.
 #[derive(Clone)]
 pub struct Mindreader {
     pub tool_router: ToolRouter<Self>,
@@ -526,7 +458,7 @@ impl Mindreader {
         Ok(())
     }
 
-    /// Sorted names of the seven advertised MCP tools.
+    /// Sorted names of the eight advertised MCP tools.
     pub fn registered_tool_names() -> Vec<String> {
         let router = Self::tool_router();
         let mut names: Vec<String> = router.map.keys().map(|k| k.to_string()).collect();
@@ -539,10 +471,11 @@ impl Mindreader {
         F: FnOnce(MemoryService) -> Fut,
         Fut: std::future::Future<Output = AppResult<Value>>,
     {
-        if !self.limiter.try_acquire() {
-            return Ok(structured_error(
+        if let Err(retry_after_ms) = self.limiter.try_acquire() {
+            return Ok(structured_error_with_retry_after(
                 "rate_limited",
                 "MCP invoke rate limit exceeded (120/min, burst 20)",
+                retry_after_ms,
             ));
         }
         if let Err(error) = self.ensure_connected().await {
@@ -566,11 +499,43 @@ impl Mindreader {
 }
 
 fn structured_error(reason: &str, message: impl std::fmt::Display) -> CallToolResult {
+    let (retryable, outcome) = error_retry_metadata(reason);
     CallToolResult::structured_error(json!({
         "ok": false,
         "reason": reason,
         "message": message.to_string(),
+        "retryable": retryable,
+        "outcome": outcome,
     }))
+}
+
+fn structured_error_with_retry_after(
+    reason: &str,
+    message: impl std::fmt::Display,
+    retry_after_ms: u64,
+) -> CallToolResult {
+    let (retryable, outcome) = error_retry_metadata(reason);
+    CallToolResult::structured_error(json!({
+        "ok": false,
+        "reason": reason,
+        "message": message.to_string(),
+        "retryable": retryable,
+        "outcome": outcome,
+        "retryAfterMs": retry_after_ms,
+    }))
+}
+
+fn error_retry_metadata(reason: &str) -> (bool, &'static str) {
+    match reason {
+        "connect_failed" | "rate_limited" | "concurrent_mutation" => (true, "not_applied"),
+        "invalid_input" | "precondition_failed" | "missing_embedding" | "embedding_http" => {
+            (false, "not_applied")
+        }
+        // A timeout or undifferentiated operation failure can include an
+        // ambiguous commit. Never encourage an automatic retry.
+        "timeout" | "operation" => (false, "unknown"),
+        _ => (false, "unknown"),
+    }
 }
 
 fn map_connect_error(error: Error) -> CallToolResult {
@@ -579,7 +544,11 @@ fn map_connect_error(error: Error) -> CallToolResult {
 
 fn map_tool_result(result: AppResult<Value>) -> CallToolResult {
     match result {
-        Ok(value) => CallToolResult::structured(value),
+        Ok(Value::Object(mut value)) => {
+            value.insert("ok".into(), Value::Bool(true));
+            CallToolResult::structured(Value::Object(value))
+        }
+        Ok(value) => CallToolResult::structured(json!({ "ok": true, "result": value })),
         Err(error) => structured_error(classify_tool_error(&error), error),
     }
 }
@@ -638,22 +607,85 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
         "additionalProperties": false,
         "properties": {
             "scope": scope_schema(),
-            "text": { "type": "string" },
-            "iris": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-            "labels": { "type": "array", "items": { "type": "string" } },
-            "around": { "type": "string", "minLength": 1 },
-            "semantic": { "type": "boolean" },
-            "hops": { "type": "integer", "enum": [0, 1] },
-            "p": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-            "depth": { "type": "integer", "minimum": 1, "maximum": 3 },
-            "limit": { "type": "integer", "minimum": 1, "maximum": 200 }
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Lexical fact query. Use only when text is the selected recall mode."
+            },
+            "iris": {
+                "type": "array",
+                "description": "One to 20 node IRIs. Results preserve input order and report misses.",
+                "minItems": 1,
+                "maxItems": 20,
+                "uniqueItems": true,
+                "items": { "type": "string", "minLength": 1 }
+            },
+            "labels": {
+                "type": "array",
+                "description": "Node labels to catalog or filter. Class and Property select the global schema catalog.",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": label_schema()
+            },
+            "around": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Starting node IRI for bounded graph recall."
+            },
+            "hops": {
+                "type": "integer",
+                "description": "IRI mode only: return the node alone (0) or include current neighboring facts (1).",
+                "enum": [0, 1],
+                "default": 0
+            },
+            "p": predicate_list_schema("Around mode only: predicate names or IRIs to filter before limiting."),
+            "depth": {
+                "type": "integer",
+                "description": "Around mode only: traversal depth.",
+                "minimum": 1,
+                "maximum": 3,
+                "default": 1
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum returned facts across the selected mode.",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20
+            }
         },
         "required": ["scope"]
     }))
 }
 
-fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
-    schema_memory_assert()
+fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
+    object_schema(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "scope": scope_schema(),
+            "text": {
+                "type": "string",
+                "minLength": 1,
+                "description": format!("Conceptual query sent to the configured embedding provider; maximum {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes.")
+            },
+            "labels": {
+                "type": "array",
+                "description": "Optional labels used to filter semantic results.",
+                "minItems": 1,
+                "uniqueItems": true,
+                "items": label_schema()
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum fused semantic results.",
+                "minimum": 1,
+                "maximum": 100,
+                "default": 20
+            }
+        },
+        "required": ["scope", "text"]
+    }))
 }
 
 fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
@@ -662,7 +694,7 @@ fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
         "additionalProperties": false,
         "properties": {
             "scope": scope_schema(),
-            "target": target_schema(),
+            "target": fact_target_schema(),
             "new": object_input_schema(),
             "spike": { "type": "string", "enum": ["Signal", "Pattern", "Insight", "Knowledge"] },
             "contradicts": { "type": "boolean" },
@@ -678,10 +710,10 @@ fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
         "additionalProperties": false,
         "properties": {
             "scope": scope_schema(),
-            "target": target_schema(),
+            "target": fact_target_schema(),
             "subject": entity_input_schema(),
             "p": { "type": "string", "minLength": 1 },
-            "reason": { "type": "string" }
+            "reason": { "type": "string", "description": "Optional audit reason." }
         },
         "required": ["scope"]
     }))
@@ -697,8 +729,10 @@ fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 20,
+                "description": "Atomic, input-ordered ratings. Duplicate targets are invalid; any failure rolls back every rating.",
                 "items": {
                     "type": "object",
+                    "additionalProperties": false,
                     "properties": {
                         "target": target_schema(),
                         "mode": { "type": "string", "enum": ["strengthen", "weaken"] }
@@ -717,66 +751,223 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
         "additionalProperties": false,
         "properties": {
             "scope": scope_schema(),
-            "target": target_schema(),
-            "add": { "type": "array", "items": scope_schema()["items"].clone() },
-            "remove": { "type": "array", "items": scope_schema()["items"].clone() }
+            "edits": {
+                "type": "array",
+                "description": "Atomic, input-ordered membership edits. Duplicate targets, add/remove overlap, and closure violations reject the whole batch.",
+                "minItems": 1,
+                "maxItems": 20,
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "target": target_schema(),
+                        "add": layer_list_schema("Layer memberships to add."),
+                        "remove": layer_list_schema("Layer memberships to remove.")
+                    },
+                    "required": ["target"]
+                }
+            }
         },
-        "required": ["scope", "target"]
+        "required": ["scope", "edits"]
+    }))
+}
+
+fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
+    object_schema(json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "source": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Same-kind node IRI that will be permanently absorbed."
+            },
+            "target": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Same-kind surviving node IRI whose identity and name remain."
+            }
+        },
+        "required": ["source", "target"]
     }))
 }
 
 fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
-        "scope": { "type": "array" },
-        "semantic": { "type": "boolean" },
-        "facts": { "type": "array" },
-        "nodes": { "type": "array" },
-        "paths": { "type": "array" }
+        "mode": { "type": "string", "enum": ["text", "iris", "labels", "catalog", "around"] },
+        "scope": scope_schema(),
+        "facts": { "type": "array", "items": fact_schema() },
+        "nodes": { "type": "array", "items": node_schema() },
+        "paths": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "nodes": { "type": "array", "items": { "type": "string" } },
+                    "edges": { "type": "array", "items": relationship_schema() }
+                },
+                "required": ["nodes", "edges"]
+            }
+        },
+        "about": { "type": "array", "items": about_schema() },
+        "lookups": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "iri": { "type": "string" },
+                    "found": { "type": "boolean" },
+                    "node": node_schema(),
+                    "facts": { "type": "array", "items": fact_schema() }
+                },
+                "required": ["iri", "found"]
+            }
+        },
+        "from": { "type": "string" },
+        "truncated": { "type": "boolean" }
+    })))
+}
+
+fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
+    schema_out(props(json!({
+        "mode": { "type": "string", "enum": ["semantic"] },
+        "scope": scope_schema(),
+        "facts": { "type": "array", "items": fact_schema() },
+        "nodes": { "type": "array", "items": node_schema() },
+        "paths": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "nodes": { "type": "array", "items": { "type": "string" } },
+                    "edges": { "type": "array", "items": relationship_schema() }
+                },
+                "required": ["nodes", "edges"]
+            }
+        },
+        "about": { "type": "array", "items": about_schema() },
+        "lookups": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "iri": { "type": "string" },
+                    "found": { "type": "boolean" },
+                    "node": node_schema(),
+                    "facts": { "type": "array", "items": fact_schema() }
+                },
+                "required": ["iri", "found"]
+            }
+        },
+        "from": { "type": "string" },
+        "truncated": { "type": "boolean" }
     })))
 }
 
 fn schema_out_memory_write() -> Arc<rmcp::model::JsonObject> {
-    schema_out_memory_assert()
+    schema_out(props(json!({
+        "scope": scope_schema(),
+        "noop": { "type": "boolean" },
+        "episode": episode_schema(),
+        "facts": { "type": "array", "items": fact_schema() },
+        "review": review_schema()
+    })))
 }
 
 fn schema_out_memory_revise() -> Arc<rmcp::model::JsonObject> {
-    schema_out_memory_replace()
+    schema_out(props(json!({
+        "scope": scope_schema(),
+        "noop": { "type": "boolean" },
+        "episode": episode_schema(),
+        "target": fact_target_schema(),
+        "previousTarget": fact_target_schema(),
+        "fact": nullable_fact_schema(),
+        "review": review_schema()
+    })))
 }
 
 fn schema_out_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
+        "scope": scope_schema(),
+        "noop": { "type": "boolean" },
+        "episode": episode_schema(),
         "retracted": { "type": "integer" },
-        "scope": { "type": "array" },
-        "targets": { "type": "array" }
+        "withdrawnTargets": { "type": "array", "items": fact_target_schema() },
+        "reason": { "type": ["string", "null"] }
     })))
 }
 
 fn schema_out_memory_judge() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
-        "scope": { "type": "array" },
-        "ratings": { "type": "array" }
+        "scope": scope_schema(),
+        "noop": { "type": "boolean" },
+        "episode": episode_schema(),
+        "summary": summary_schema(),
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "index": { "type": "integer", "minimum": 0, "maximum": 19 },
+                    "target": target_schema(),
+                    "mode": { "type": "string", "enum": ["strengthen", "weaken"] },
+                    "delta": { "type": "integer", "enum": [-1, 1] },
+                    "before": { "type": "integer" },
+                    "after": { "type": "integer" },
+                    "status": { "type": "string", "enum": ["changed", "noop"] }
+                },
+                "required": ["index", "target", "mode", "delta", "before", "after", "status"]
+            }
+        }
     })))
 }
 
 fn schema_out_memory_place() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
-        "target": { "type": "object" },
-        "memberships": { "type": "array" }
+        "scope": scope_schema(),
+        "noop": { "type": "boolean" },
+        "episode": episode_schema(),
+        "summary": summary_schema(),
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "index": { "type": "integer", "minimum": 0, "maximum": 19 },
+                    "target": target_schema(),
+                    "before": scope_schema(),
+                    "memberships": scope_schema(),
+                    "added": scope_schema(),
+                    "removed": scope_schema(),
+                    "status": { "type": "string", "enum": ["changed", "noop"] }
+                },
+                "required": ["index", "target", "before", "memberships", "added", "removed", "status"]
+            }
+        }
     })))
 }
 
 fn schema_out_memory_unify() -> Arc<rmcp::model::JsonObject> {
-    schema_out_memory_merge()
+    schema_out(props(json!({
+        "noop": { "type": "boolean" },
+        "episode": episode_schema(),
+        "node": node_schema()
+    })))
 }
 
 #[tool_router]
 impl Mindreader {
     #[tool(
         name = "memory_recall",
-        description = "Use to recover visible memory. Pass exactly one of text, iris, labels, or around. labels Class or Property lists schema nodes. semantic:true is conceptual recall and sends query text to the embedding provider. hops is 0 or 1 with iris. around+p filters by predicate name, not Neo4j type.",
+        title = "Recall visible memory",
+        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, or around; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris; p and depth apply only to around, with predicates filtered before limiting. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
-        annotations(title = "Recall visible memory", read_only_hint = false, open_world_hint = true)
+        annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn memory_recall(
         &self,
@@ -787,11 +978,28 @@ impl Mindreader {
     }
 
     #[tool(
+        name = "memory_recall_semantic",
+        title = "Recall by meaning",
+        description = "Use for conceptual recall when lexical memory_recall is insufficient. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. The call maintains expiring semantic activations, so it is neither read-only nor idempotent.",
+        input_schema = schema_memory_recall_semantic(),
+        output_schema = schema_out_memory_recall_semantic(),
+        annotations(title = "Recall by meaning", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
+    )]
+    async fn memory_recall_semantic(
+        &self,
+        Parameters(args): Parameters<SemanticSearchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.invoke(|service| async move { service.recall_semantic(args).await })
+            .await
+    }
+
+    #[tool(
         name = "memory_write",
-        description = "Use when adding durable triples after recall. Pass facts[] (1–20) and call-level scope. [] makes facts global. Exact reassertions are no-ops. Review next.unify before memory_unify. Optional per-fact contradicts:true links conflicting current values.",
+        title = "Write facts",
+        description = "Use to add durable triples after recall. facts contains 1–20 input-ordered items under one call-level scope; the batch is atomic and records one Episode only when something changes. Exact reassertions are no-ops. Review review.unify before memory_unify and review.alternatives without assuming another set-valued fact is wrong.",
         input_schema = schema_memory_write(),
         output_schema = schema_out_memory_write(),
-        annotations(title = "Write facts", destructive_hint = false, idempotent_hint = true)
+        annotations(title = "Write facts", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
     async fn memory_write(
         &self,
@@ -803,10 +1011,11 @@ impl Mindreader {
 
     #[tool(
         name = "memory_revise",
-        description = "Use to correct one current fact by pasting its target handle and the new object. scope moves only those memberships; SUPERSEDES is recorded atomically. Do not re-write a correction.",
+        title = "Revise a fact",
+        description = "Use to correct one current fact by pasting its fact-only target and supplying the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement and SUPERSEDES history commit in one transaction and the response returns both current target and previousTarget.",
         input_schema = schema_memory_revise(),
         output_schema = schema_out_memory_revise(),
-        annotations(title = "Revise a fact", destructive_hint = true, idempotent_hint = false)
+        annotations(title = "Revise a fact", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn memory_revise(
         &self,
@@ -818,10 +1027,11 @@ impl Mindreader {
 
     #[tool(
         name = "memory_withdraw",
-        description = "Use to soft-withdraw a fact handle or every current fact for a subject (optional p). Does not delete nodes or history.",
+        title = "Withdraw facts",
+        description = "Use to soft-withdraw either one current fact target or every visible current fact for subject, optionally restricted by p. Exactly one of target or subject is required. The operation sets validity history, never hard-deletes nodes or facts, and records one Episode only when something changes.",
         input_schema = schema_memory_withdraw(),
         output_schema = schema_out_memory_withdraw(),
-        annotations(title = "Withdraw facts", destructive_hint = true, idempotent_hint = false)
+        annotations(title = "Withdraw facts", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn memory_withdraw(
         &self,
@@ -833,10 +1043,11 @@ impl Mindreader {
 
     #[tool(
         name = "memory_judge",
-        description = "Use after a recalled node or fact helped or hurt. Pass ratings[] of strengthen or weaken. Retrieval never changes weight automatically.",
+        title = "Judge retrieved targets",
+        description = "Use after recalled nodes or facts helped or hurt. ratings contains 1–20 unique targets; strengthen or weaken changes each shared weight by exactly +1 or -1. The input-ordered batch is atomic, records one Episode, and rolls back fully on any failure. Recall itself never changes weight.",
         input_schema = schema_memory_judge(),
         output_schema = schema_out_memory_judge(),
-        annotations(title = "Judge retrieved targets", destructive_hint = true, idempotent_hint = false)
+        annotations(title = "Judge retrieved targets", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn memory_judge(
         &self,
@@ -848,10 +1059,11 @@ impl Mindreader {
 
     #[tool(
         name = "memory_place",
-        description = "Use to change which layers a node or fact belongs to. scope is visibility, not the edit. Put memberships in add and remove.",
+        title = "Place layer memberships",
+        description = "Use to atomically change layer memberships for 1–20 unique node or fact targets. scope controls visibility; each edits item supplies add and/or remove. The whole input-ordered batch is validated against its combined final endpoint-closure state, records one Episode if changed, and rolls back fully on failure.",
         input_schema = schema_memory_place(),
         output_schema = schema_out_memory_place(),
-        annotations(title = "Place layer memberships", destructive_hint = true, idempotent_hint = false)
+        annotations(title = "Place layer memberships", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn memory_place(
         &self,
@@ -863,10 +1075,11 @@ impl Mindreader {
 
     #[tool(
         name = "memory_unify",
-        description = "Use after reviewing next.unify when two same-kind nodes are truly identical. Permanently merge source into target. The target IRI and name survive. Reverse the pair when the other IRI should survive.",
-        input_schema = schema_memory_merge(),
+        title = "Permanently unify nodes",
+        description = "Use only after reviewing review.unify and confirming two same-kind nodes are identical. This database-wide operation permanently absorbs source into target; target IRI and name survive. Reverse the pair when the other identity should survive. It has no scope because all memberships and history must be reconciled.",
+        input_schema = schema_memory_unify(),
         output_schema = schema_out_memory_unify(),
-        annotations(title = "Permanently unify nodes", destructive_hint = true)
+        annotations(title = "Permanently unify nodes", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
     async fn memory_unify(
         &self,
@@ -887,7 +1100,7 @@ impl ServerHandler for Mindreader {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "scope is an OR-union ([] is global-only). Recall before write. Catalog Classes/Properties with labels Class or Property. semantic:true sends query text to the embed provider. Write facts[] (1-20). Paste target into revise, withdraw, judge, or place. Review unify {source,target}. Never send Cypher or write CONTRADICTS/SUPERSEDES.",
+                "scope is an OR-union ([] is global-only). Recall before write; use memory_recall_semantic only for conceptual retrieval because it calls the embedding provider and updates activations. Write facts[] (1-20). Paste returned targets into revise, withdraw, judge, or place edits[]. Review review.unify before unifying. Never send Cypher or assert CONTRADICTS/SUPERSEDES.",
             )
     }
 
@@ -905,6 +1118,7 @@ impl ServerHandler for Mindreader {
 mod tests {
     use super::{
         classify_tool_error, map_connect_error, map_tool_result, structured_error, Mindreader,
+        TokenBucket,
     };
     use crate::config::Config;
     use crate::domain::DomainError;
@@ -956,12 +1170,13 @@ mod tests {
     }
 
     #[test]
-    fn registers_seven_tools() {
+    fn registers_eight_tools() {
         let names = Mindreader::registered_tool_names();
         let expected = [
             "memory_judge",
             "memory_place",
             "memory_recall",
+            "memory_recall_semantic",
             "memory_revise",
             "memory_unify",
             "memory_withdraw",
@@ -972,7 +1187,7 @@ mod tests {
         for name in expected {
             assert!(router.has_route(name), "missing route {name}");
         }
-        assert_eq!(router.map.len(), 7);
+        assert_eq!(router.map.len(), 8);
     }
 
     #[test]
@@ -1039,7 +1254,17 @@ mod tests {
         assert_eq!(revise_schema["properties"]["new"]["type"], "object");
         assert_eq!(
             revise_schema["properties"]["target"]["properties"]["kind"]["enum"],
-            serde_json::json!(["node", "fact"])
+            serde_json::json!(["fact"])
+        );
+
+        let withdraw_schema = tools
+            .iter()
+            .find(|tool| tool.name == "memory_withdraw")
+            .unwrap()
+            .schema_as_json_value();
+        assert_eq!(
+            withdraw_schema["properties"]["target"]["properties"]["kind"]["enum"],
+            serde_json::json!(["fact"])
         );
 
         let judge_schema = tools
@@ -1050,6 +1275,22 @@ mod tests {
         assert_eq!(
             judge_schema["properties"]["ratings"]["items"]["properties"]["mode"]["enum"],
             serde_json::json!(["strengthen", "weaken"])
+        );
+        assert_eq!(judge_schema["properties"]["ratings"]["maxItems"], 20);
+
+        let place_schema = tools
+            .iter()
+            .find(|tool| tool.name == "memory_place")
+            .unwrap()
+            .schema_as_json_value();
+        assert!(place_schema["properties"].get("target").is_none());
+        assert!(place_schema["properties"].get("add").is_none());
+        assert!(place_schema["properties"].get("remove").is_none());
+        assert_eq!(place_schema["properties"]["edits"]["minItems"], 1);
+        assert_eq!(place_schema["properties"]["edits"]["maxItems"], 20);
+        assert_eq!(
+            place_schema["required"],
+            serde_json::json!(["scope", "edits"])
         );
     }
 
@@ -1131,6 +1372,11 @@ mod tests {
     #[test]
     fn tool_annotations_are_present() {
         for tool in Mindreader::tool_router().list_all() {
+            assert!(
+                tool.title.as_ref().is_some_and(|title| !title.is_empty()),
+                "{} missing top-level title",
+                tool.name
+            );
             let annotations = tool
                 .annotations
                 .as_ref()
@@ -1145,19 +1391,40 @@ mod tests {
             );
             match tool.name.as_ref() {
                 "memory_recall" => {
-                    assert_ne!(annotations.read_only_hint, Some(true));
+                    assert_eq!(annotations.read_only_hint, Some(true));
+                    assert_eq!(annotations.destructive_hint, Some(false));
+                    assert_eq!(annotations.idempotent_hint, Some(true));
+                    assert_eq!(annotations.open_world_hint, Some(false));
+                }
+                "memory_recall_semantic" => {
+                    assert_eq!(annotations.read_only_hint, Some(false));
+                    assert_eq!(annotations.destructive_hint, Some(false));
+                    assert_eq!(annotations.idempotent_hint, Some(false));
                     assert_eq!(annotations.open_world_hint, Some(true));
                 }
                 "memory_write" => {
+                    assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(false));
                     assert_eq!(annotations.idempotent_hint, Some(true));
+                    assert_eq!(annotations.open_world_hint, Some(false));
                 }
-                "memory_revise" | "memory_withdraw" | "memory_place" | "memory_judge" => {
+                "memory_place" => {
+                    assert_eq!(annotations.read_only_hint, Some(false));
+                    assert_eq!(annotations.destructive_hint, Some(true));
+                    assert_eq!(annotations.idempotent_hint, Some(true));
+                    assert_eq!(annotations.open_world_hint, Some(false));
+                }
+                "memory_revise" | "memory_withdraw" | "memory_judge" => {
+                    assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(true));
                     assert_eq!(annotations.idempotent_hint, Some(false));
+                    assert_eq!(annotations.open_world_hint, Some(false));
                 }
                 "memory_unify" => {
+                    assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(true));
+                    assert_eq!(annotations.idempotent_hint, Some(false));
+                    assert_eq!(annotations.open_world_hint, Some(false));
                 }
                 other => panic!("unexpected tool {other}"),
             }
@@ -1179,6 +1446,13 @@ mod tests {
                 "tool {} outputSchema.type",
                 tool.name
             );
+            assert!(
+                schema["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|value| value == "ok")),
+                "tool {} output must require ok",
+                tool.name
+            );
         }
     }
 
@@ -1195,9 +1469,59 @@ mod tests {
             serde_json::json!([0, 1])
         );
         assert_eq!(recall["properties"]["limit"]["minimum"], 1);
-        assert_eq!(recall["properties"]["limit"]["maximum"], 200);
+        assert_eq!(recall["properties"]["limit"]["maximum"], 100);
+        assert_eq!(recall["properties"]["limit"]["default"], 20);
+        assert_eq!(recall["properties"]["iris"]["minItems"], 1);
+        assert_eq!(recall["properties"]["iris"]["maxItems"], 20);
         assert_eq!(recall["properties"]["depth"]["minimum"], 1);
         assert_eq!(recall["properties"]["depth"]["maximum"], 3);
+        assert!(recall["properties"].get("semantic").is_none());
+
+        let semantic = tools
+            .iter()
+            .find(|tool| tool.name == "memory_recall_semantic")
+            .unwrap()
+            .schema_as_json_value();
+        assert_eq!(semantic["required"], serde_json::json!(["scope", "text"]));
+        assert_eq!(semantic["properties"]["limit"]["maximum"], 100);
+        assert_eq!(semantic["properties"]["limit"]["default"], 20);
+        assert!(semantic["properties"].get("iris").is_none());
+        assert!(semantic["properties"].get("around").is_none());
+    }
+
+    #[test]
+    fn output_schemas_use_only_v04_field_names() {
+        for tool in Mindreader::tool_router().list_all() {
+            let output = tool.output_schema.as_ref().expect("output schema");
+            let properties = output
+                .get("properties")
+                .and_then(Value::as_object)
+                .expect("output properties");
+            for legacy in ["layers", "mergeSuggestions", "next", "targets", "ratings"] {
+                assert!(
+                    !properties.contains_key(legacy),
+                    "{} advertises legacy output field {legacy}",
+                    tool.name
+                );
+            }
+        }
+        let tools: Vec<_> = Mindreader::tool_router().list_all();
+        let revise = tools
+            .iter()
+            .find(|tool| tool.name == "memory_revise")
+            .unwrap()
+            .output_schema
+            .as_ref()
+            .unwrap();
+        assert!(revise["properties"].get("previousTarget").is_some());
+        let withdraw = tools
+            .iter()
+            .find(|tool| tool.name == "memory_withdraw")
+            .unwrap()
+            .output_schema
+            .as_ref()
+            .unwrap();
+        assert!(withdraw["properties"].get("withdrawnTargets").is_some());
     }
 
     #[test]
@@ -1206,7 +1530,8 @@ mod tests {
         let instructions = info.instructions.expect("instructions");
         assert!(instructions.len() <= 512, "instructions exceed 512 chars");
         assert!(instructions.contains("OR-union") || instructions.contains("OR union"));
-        assert!(instructions.contains("Recall"));
+        assert!(instructions.contains("Recall") || instructions.contains("recall"));
+        assert!(instructions.contains("memory_recall_semantic"));
         assert!(instructions.contains("facts[]"));
         assert!(instructions.contains("target"));
         assert!(instructions.contains("CONTRADICTS"));
@@ -1225,6 +1550,16 @@ mod tests {
 
     #[test]
     fn map_tool_result_returns_structured_error() {
+        let success = map_tool_result(Ok(serde_json::json!({ "scope": [] })));
+        assert_eq!(success.is_error, Some(false));
+        assert_eq!(
+            success
+                .structured_content
+                .as_ref()
+                .and_then(|value| value.get("ok")),
+            Some(&Value::Bool(true))
+        );
+
         let invalid = map_tool_result(Err(DomainError::InvalidInput("bad layers".into()).into()));
         assert_eq!(reason_of(invalid), "invalid_input");
 
@@ -1253,5 +1588,26 @@ mod tests {
         );
         let limiter = structured_error("rate_limited", "MCP invoke rate limit exceeded");
         assert_eq!(reason_of(limiter), "rate_limited");
+
+        let timeout = structured_error("timeout", "late");
+        let body = timeout.structured_content.expect("structured timeout");
+        assert_eq!(body["retryable"], false);
+        assert_eq!(body["outcome"], "unknown");
+        let retryable = structured_error("connect_failed", "offline");
+        let body = retryable
+            .structured_content
+            .expect("structured connect error");
+        assert_eq!(body["retryable"], true);
+        assert_eq!(body["outcome"], "not_applied");
+    }
+
+    #[test]
+    fn token_bucket_reports_a_bounded_retry_delay() {
+        let limiter = TokenBucket::new();
+        for _ in 0..20 {
+            assert_eq!(limiter.try_acquire(), Ok(()));
+        }
+        let retry_after_ms = limiter.try_acquire().expect_err("burst is exhausted");
+        assert!((1..=500).contains(&retry_after_ms));
     }
 }

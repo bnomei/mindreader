@@ -1,6 +1,6 @@
 {
   "name": "mindreader",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Deterministic, privacy-first Neo4j memory MCP server",
   "transport": {
     "type": "stdio",
@@ -14,6 +14,7 @@
   ],
   "tools": [
     "memory_recall",
+    "memory_recall_semantic",
     "memory_write",
     "memory_revise",
     "memory_withdraw",
