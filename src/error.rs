@@ -1,12 +1,20 @@
 //! Typed error boundary shared by the application, adapters, and binaries.
+//!
+//! Failures preserve a source chain for diagnostics while exposing stable
+//! variants for configuration, domain validation, Neo4j, embeddings, and
+//! concurrent mutation. Transient Neo4j errors are classified for bounded
+//! retries; MCP maps domain errors to invalid params and everything else to
+//! internal errors.
 
 use crate::domain::DomainError;
 use neo4rs::{Error as Neo4jError, Neo4jErrorKind};
 use std::error::Error as StdError;
 use thiserror::Error;
 
+/// Crate-wide result alias using [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Application error with preserved sources and retry-relevant variants.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
@@ -63,6 +71,7 @@ impl Error {
         }
     }
 
+    /// Walk the source chain for Neo4j transient kinds eligible for retry.
     pub fn is_transient_neo4j(&self) -> bool {
         let mut current: Option<&(dyn StdError + 'static)> = Some(self);
         while let Some(error) = current {

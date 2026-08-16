@@ -1,3 +1,10 @@
+//! Remote embedding providers and vector normalization for semantic search.
+//!
+//! Builds OpenAI or xAI HTTP clients from selected config, retries transient
+//! failures with bounded timeouts, and normalizes vectors to unit length so
+//! cosine similarity matches Neo4j vector queries. API keys stay in request
+//! headers and are never logged.
+
 use crate::config::{EmbeddingProviderKind, SelectedEmbedding};
 use crate::{
     embedding_error,
@@ -38,6 +45,7 @@ impl Default for RetryPolicy {
     }
 }
 
+/// Async embedding backend used by semantic search and smoke fixtures.
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, text: &str) -> Result<Vec<f64>>;
@@ -46,6 +54,7 @@ pub trait EmbeddingProvider: Send + Sync {
     fn dimensions(&self) -> usize;
 }
 
+/// Construct the HTTP embedding provider for the selected OpenAI or xAI config.
 pub fn build_provider(config: &SelectedEmbedding) -> Result<Box<dyn EmbeddingProvider>> {
     let (provider, endpoint) = match config.provider {
         EmbeddingProviderKind::OpenAi => ("openai", "https://api.openai.com/v1/embeddings"),
@@ -334,6 +343,7 @@ async fn read_limited(
     Ok((body, false))
 }
 
+/// Validate dimension and finiteness, then L2-normalize for cosine similarity.
 pub fn normalize_vector(
     mut vector: Vec<f64>,
     dimensions: usize,

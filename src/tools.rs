@@ -1,3 +1,11 @@
+//! Mutation arguments and graph behavior for the non-search memory tools.
+//!
+//! Implements get, traverse, stats, assert, replace, retract, feedback, layers,
+//! and schema: set-valued assertions, soft retraction, explicit SUPERSEDES
+//! corrections, shared signed weights, membership audits with endpoint closure,
+//! and global schema-as-data. CONTRADICTS and SUPERSEDES are system-owned.
+//! State-changing mutations create one Episode when they change graph state.
+
 use crate::domain::{
     DomainError, EntityInput, EntityRef, ObjectInput, ObjectValue, PredicateRef, RetractScope,
     SpikeRank,
@@ -193,6 +201,7 @@ fn relationship_iri() -> String {
     format!("mindreader:relationship/{}", Uuid::new_v4())
 }
 
+/// Arguments for IRI lookup with optional one-hop neighbor expansion.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct GetArgs {
     pub iri: String,
@@ -201,11 +210,13 @@ pub struct GetArgs {
     pub hops: Option<u32>,
 }
 
+/// Arguments for model readiness and layer-scoped graph counters.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct StatsArgs {
     pub layers: Vec<String>,
 }
 
+/// Arguments for bounded typed-edge walks from a visible start IRI.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct TraverseArgs {
     pub from: String,
@@ -218,6 +229,7 @@ pub struct TraverseArgs {
     pub limit: Option<u32>,
 }
 
+/// Arguments for set-valued triple assertion (membership merge, optional Spike/CONTRADICTS).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct AssertArgs {
     pub s: EntityInput,
@@ -230,6 +242,7 @@ pub struct AssertArgs {
     pub contradicts: bool,
 }
 
+/// Arguments for explicit fact correction with atomic SUPERSEDES history.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ReplaceArgs {
     pub s: EntityInput,
@@ -245,6 +258,7 @@ pub struct ReplaceArgs {
     pub reason: Option<String>,
 }
 
+/// Tagged retract target: fact, predicate-wide, or subject-wide soft withdrawal.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RetractTargetArgs {
     pub kind: String,
@@ -255,6 +269,7 @@ pub struct RetractTargetArgs {
     pub o: Option<ObjectInput>,
 }
 
+/// Arguments for soft retraction of selected fact memberships.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct RetractArgs {
     pub target: RetractTargetArgs,
@@ -263,12 +278,14 @@ pub struct RetractArgs {
     pub reason: Option<String>,
 }
 
+/// Stable node or relationship target for feedback and membership audits.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct TargetArgs {
     pub kind: String,
     pub iri: String,
 }
 
+/// Arguments for explicit +1/−1 weight feedback on a visible current target.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FeedbackArgs {
     pub layers: Vec<String>,
@@ -276,6 +293,7 @@ pub struct FeedbackArgs {
     pub mode: String,
 }
 
+/// Arguments for auditable add/remove of layer memberships on a target.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct LayersArgs {
     pub layers: Vec<String>,
@@ -286,6 +304,7 @@ pub struct LayersArgs {
     pub remove: Vec<String>,
 }
 
+/// Arguments for global schema-as-data class or property declaration.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SchemaArgs {
     pub kind: String,
@@ -524,6 +543,7 @@ async fn refreshed_node_json_txn(txn: &mut Txn, iri: &str) -> Result<Value> {
     Ok(node_json(&row.get::<Node>("n")?))
 }
 
+/// Return a visible node by IRI, optionally with current visible one-hop neighbors.
 pub async fn memory_get(graph: &Graph, args: GetArgs) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let hops = if args.hops == Some(1) { 1 } else { 0 };
@@ -936,6 +956,7 @@ pub(crate) async fn legacy_memory_search(graph: &Graph, args: SearchArgs) -> Res
     }))
 }
 
+/// Return model readiness and counters for entities and facts in the layer union.
 pub async fn memory_stats(graph: &Graph, args: StatsArgs) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let row = fetch_one(
@@ -1064,6 +1085,7 @@ pub async fn memory_stats(graph: &Graph, args: StatsArgs) -> Result<Value> {
     }))
 }
 
+/// Walk typed edges from a visible start IRI (depth capped at 3) under layer closure.
 pub async fn memory_traverse(graph: &Graph, args: TraverseArgs) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let depth = args.depth.unwrap_or(1).clamp(1, 3);
@@ -1244,6 +1266,7 @@ async fn ensure_contradictions_txn(
     Ok(changed)
 }
 
+/// Assert one exact set-valued triple, merging memberships on reassert; no-ops record no Episode.
 pub async fn memory_assert(graph: &Graph, args: AssertArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_assert_once(graph, args.clone()).await {
@@ -1517,6 +1540,7 @@ async fn change_fact_memberships_batch_txn(
     Ok(())
 }
 
+/// Correct one exact fact in the listed memberships and record SUPERSEDES in the same transaction.
 pub async fn memory_replace(graph: &Graph, args: ReplaceArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_replace_once(graph, args.clone()).await {
@@ -1722,6 +1746,7 @@ async fn memory_replace_once(graph: &Graph, args: ReplaceArgs) -> Result<Value> 
     }))
 }
 
+/// Soft-retract selected fact memberships by setting `validTo` (no hard deletes).
 pub async fn memory_retract(graph: &Graph, args: RetractArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_retract_once(graph, args.clone()).await {
@@ -1883,6 +1908,7 @@ fn validate_target(target: &TargetArgs) -> Result<()> {
     Ok(())
 }
 
+/// Apply explicit strengthen (+1) or weaken (−1) to a visible current node or relationship weight.
 pub async fn memory_feedback(graph: &Graph, args: FeedbackArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_feedback_once(graph, args.clone()).await {
@@ -2033,6 +2059,7 @@ fn membership_allows(record: &[String], required: &[String]) -> bool {
     record.is_empty() || required.iter().all(|layer| record.contains(layer))
 }
 
+/// Add or remove layer memberships on a target while preserving relationship endpoint closure.
 pub async fn memory_layers(graph: &Graph, args: LayersArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_layers_once(graph, args.clone()).await {
@@ -2265,6 +2292,7 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
     }))
 }
 
+/// Write global RDFS class or property schema-as-data (no `layers` input).
 pub async fn memory_schema(graph: &Graph, args: SchemaArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_schema_once(graph, args.clone()).await {
@@ -2540,6 +2568,7 @@ fn node_json_from_merged(node: &MergedNode) -> Value {
     node.json.clone()
 }
 
+/// Count current ASSERTS edges for subject/predicate under a layer filter (tests and diagnostics).
 pub async fn count_current_asserts(
     graph: &Graph,
     s: &str,
@@ -2578,6 +2607,7 @@ pub async fn count_current_asserts(
         .unwrap_or_default())
 }
 
+/// Count ASSERTS including retracted history for subject/predicate under a layer filter.
 pub async fn count_historical_asserts(graph: &Graph, s: &str, p: &str, layer: &str) -> Result<i64> {
     let row = fetch_one(
         graph,
@@ -2596,6 +2626,7 @@ pub async fn count_historical_asserts(graph: &Graph, s: &str, p: &str, layer: &s
     Ok(row.and_then(|row| row.get::<i64>("n").ok()).unwrap_or(0))
 }
 
+/// Count current CONTRADICTS edges between two entity IRIs.
 pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> Result<i64> {
     let row = fetch_one(
         graph,
@@ -2610,6 +2641,7 @@ pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> R
     Ok(row.and_then(|row| row.get::<i64>("n").ok()).unwrap_or(0))
 }
 
+/// Map application errors to MCP: domain → invalid params, others → internal error.
 pub fn map_tool_error(err: Error) -> rmcp::model::ErrorData {
     use rmcp::model::ErrorData as McpError;
     if let Error::Domain(domain) = &err {

@@ -1,3 +1,10 @@
+//! Live Neo4j integration suite for the twelve memory tools and graph contracts.
+//!
+//! Mutates the configured database and leaves fixtures in place; use a
+//! development or disposable instance only. Enabled with the `developer-tools`
+//! feature. Includes a deterministic smoke embedding provider when remote keys
+//! are absent.
+
 use async_trait::async_trait;
 use mindreader::config::{Config, EmbeddingSpace, SemanticConfig};
 use mindreader::domain::{EntityInput, ObjectInput};

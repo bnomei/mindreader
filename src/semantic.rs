@@ -1,3 +1,11 @@
+//! Semantic recall: embed queries, fuse direct hits with remembered activations.
+//!
+//! Combines current `memory_search` results with nearby TTL-bounded activation
+//! bundles via reciprocal rank fusion, then returns current visible facts under
+//! the same layer and label filters. Activations expire and can converge when
+//! similar queries share overlapping result sets. Requires a configured
+//! embedding provider; without keys the tool fails with configuration guidance.
+
 use crate::config::{Config, SemanticConfig};
 use crate::domain::DomainError;
 use crate::embeddings::{build_provider, normalize_vector, EmbeddingProvider};
@@ -16,8 +24,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Maximum UTF-8 byte length accepted for semantic query text.
 pub const MAX_SEMANTIC_TEXT_BYTES: usize = 32 * 1024;
 
+/// Arguments for embedding-backed semantic search under a layer union.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SemanticSearchArgs {
     pub text: String,
@@ -28,6 +38,7 @@ pub struct SemanticSearchArgs {
     pub limit: Option<u32>,
 }
 
+/// Optional embedding provider plus semantic fusion tunables for a process.
 #[derive(Clone)]
 pub struct SemanticRuntime {
     provider: Arc<dyn EmbeddingProvider>,
@@ -35,6 +46,7 @@ pub struct SemanticRuntime {
 }
 
 impl SemanticRuntime {
+    /// Build a runtime when embedding credentials are present; otherwise `None`.
     pub fn from_config(config: &Config) -> Result<Option<Self>> {
         let Some(selected) = config.embedding.as_ref() else {
             return Ok(None);
@@ -57,6 +69,7 @@ impl SemanticRuntime {
         self.provider.dimensions()
     }
 
+    /// Construct a runtime with an explicit provider (tests and smoke fixtures).
     pub fn new(provider: Arc<dyn EmbeddingProvider>, config: SemanticConfig) -> Self {
         Self { provider, config }
     }
@@ -86,6 +99,7 @@ fn validate_semantic_text(text: &str) -> Result<String> {
     Ok(text.to_string())
 }
 
+/// Embed the query, fuse direct search with neighbor activations, return ranked current facts.
 pub async fn memory_semantic_search(
     graph: &Graph,
     runtime: Option<&SemanticRuntime>,

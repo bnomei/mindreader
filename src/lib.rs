@@ -1,7 +1,12 @@
 //! Mindreader: RDFS schema-as-data agent memory over Neo4j.
 //!
-//! Library functions are the source of truth; the stdio MCP server and the
-//! live smoke binary both call them.
+//! The library is the source of truth for graph semantics. Transport adapters
+//! (stdio MCP), live smoke coverage, and benchmarks call these modules rather
+//! than embedding their own Cypher or layer policy.
+//!
+//! Memory is stored as explicit graph triples with provenance episodes,
+//! request-scoped multi-layer visibility, shared feedback weights, soft
+//! retraction (`validTo`), and intentional same-kind entity merging.
 
 pub mod config;
 pub mod domain;

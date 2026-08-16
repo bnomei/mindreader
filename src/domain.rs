@@ -1,3 +1,10 @@
+//! Validated domain values for layers, entities, literals, spikes, and retraction.
+//!
+//! Types here enforce input contracts before any Neo4j work: layer id shape,
+//! entity/literal object shapes, predicate IRIs, Spike ranks, and retract
+//! scopes. Graph adapters convert these values into Cypher parameters rather
+//! than re-validating strings ad hoc.
+
 use crate::iri::{default_lower_for_kind, is_iri, kind_for_label, mint_iri, slugify};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -5,6 +12,7 @@ use sha2::{Digest, Sha256};
 use std::fmt;
 use thiserror::Error;
 
+/// Caller-facing domain failure: bad input versus violated graph precondition.
 #[derive(Debug, Error)]
 pub enum DomainError {
     #[error("{0}")]
@@ -101,6 +109,7 @@ impl<'de> Deserialize<'de> for LayerId {
     }
 }
 
+/// Canonical property IRI for a fact predicate (accepts local names or full IRIs).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PredicateRef(String);
 
@@ -127,6 +136,7 @@ impl PredicateRef {
     }
 }
 
+/// Wire-shape subject entity for MCP/tool arguments (`kind` must be `"entity"`).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct EntityInput {
     pub kind: String,
@@ -138,6 +148,7 @@ pub struct EntityInput {
     pub labels: Vec<String>,
 }
 
+/// Wire-shape fact object: tagged entity or literal fields on one plain object schema.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ObjectInput {
     pub kind: String,
@@ -153,6 +164,7 @@ pub struct ObjectInput {
     pub datatype: Option<String>,
 }
 
+/// Validated entity reference after kind and IRI/name checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRef {
     pub iri: Option<String>,
@@ -170,6 +182,7 @@ impl EntityRef {
         validate_entity_parts(input.iri, input.name, input.labels)
     }
 
+    /// Prefer an explicit IRI; otherwise mint from name, labels, and kind defaults.
     pub fn resolved_iri(&self, fallback_kind: &str) -> String {
         if let Some(iri) = &self.iri {
             return iri.clone();
@@ -187,6 +200,7 @@ impl EntityRef {
     }
 }
 
+/// Validated fact object: entity reference or typed literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectValue {
     Entity(EntityRef),
@@ -231,6 +245,7 @@ impl ObjectValue {
         }
     }
 
+    /// Entity IRI via [`EntityRef::resolved_iri`], or a deterministic literal IRI.
     pub fn resolved_iri(&self) -> String {
         match self {
             Self::Entity(entity) => entity.resolved_iri("element"),
@@ -277,6 +292,7 @@ fn validate_entity_parts(
     Ok(EntityRef { iri, name, labels })
 }
 
+/// Deterministic `mindreader:literal/…` IRI from datatype and value content.
 pub fn literal_iri(value: &str, datatype: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(format!("{datatype}:{value}").as_bytes());
@@ -291,6 +307,7 @@ pub fn literal_iri(value: &str, datatype: &str) -> String {
     format!("mindreader:literal/{slug}-{hex}")
 }
 
+/// Epistemic Spike label used in retrieval ranking (Knowledge highest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpikeRank {
     Signal,
@@ -324,6 +341,7 @@ impl SpikeRank {
     }
 }
 
+/// How wide a soft retraction is: one triple, all facts for a predicate, or a whole subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetractScope {
     Fact,

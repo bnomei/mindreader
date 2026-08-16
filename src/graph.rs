@@ -1,3 +1,11 @@
+//! Neo4j connection, bootstrap, query helpers, and persistence primitives.
+//!
+//! Owns driver setup, model-version markers, full-text indexes, safe label and
+//! relationship allowlisting, node/relationship JSON serialization, in-txn
+//! MERGE helpers, fact locks, and Episode provenance. Bootstrap is idempotent
+//! for the current model marker; incompatible or unversioned non-empty
+//! databases fail with reset guidance rather than migrating data.
+
 use crate::config::{Config, EmbeddingSpace};
 use crate::domain::literal_iri;
 use crate::iri::{
@@ -15,6 +23,7 @@ use std::collections::HashMap;
 use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
+/// Fixed relationship types known to the schema (including system-owned edges).
 pub const FIXED_RELS: &[&str] = &[
     "INSTANCE_OF",
     "SUBCLASS_OF",
@@ -30,6 +39,7 @@ pub const FIXED_RELS: &[&str] = &[
     "SUPERSEDES",
 ];
 
+/// Structural relationship types that map property IRIs to first-class edge types.
 pub const STRUCTURAL: &[&str] = &[
     "INSTANCE_OF",
     "SUBCLASS_OF",
@@ -44,8 +54,10 @@ pub const STRUCTURAL: &[&str] = &[
     "SUPERSEDES",
 ];
 
+/// Spike labels ordered for ranking elsewhere (not priority order here).
 pub const SPIKE: &[&str] = &["Signal", "Pattern", "Insight", "Knowledge"];
 
+/// Relationship types included in the wakeup full-text fact index.
 pub const WAKEUP_RELS: &[&str] = &[
     "ASSERTS",
     "ABOUT",
@@ -61,9 +73,13 @@ pub const WAKEUP_RELS: &[&str] = &[
 
 const LABEL_OK: &str = "label";
 
+/// Property key on the singleton model marker node.
 pub const MODEL_MARKER_KEY: &str = "model";
+/// Current graph model version; incompatible databases must be recreated.
 pub const MODEL_VERSION: i64 = 5;
+/// Vector index name for expiring semantic activations.
 pub const SEMANTIC_INDEX: &str = "semantic_activation_embeddings";
+/// Keyword full-text index used for advisory merge candidate names.
 pub const MERGE_CANDIDATE_INDEX: &str = "merge_candidate_names";
 const EMBEDDING_MARKER_KEY: &str = "embedding";
 
@@ -75,6 +91,7 @@ const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] = &[
 ];
 const WAKEUP_NODE_PROPERTIES: &[&str] = &["name", "iri", "searchText", "value"];
 
+/// Connect to Neo4j with password from config, retrying alternate URI forms.
 pub async fn connect(cfg: &Config) -> Result<Graph> {
     let password = cfg.neo4j_password()?;
     let stripped = cfg
@@ -126,6 +143,7 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
     }
 }
 
+/// Ensure model marker, constraints, indexes, and seed schema for an empty or current database.
 pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Result<()> {
     ensure_model_marker(graph).await?;
     verify_required_apoc(graph).await?;
@@ -595,6 +613,7 @@ fn same_string_members(actual: &[String], expected: &[&str]) -> bool {
             .all(|expected| actual.iter().any(|actual| actual == expected))
 }
 
+/// Allowlist a Neo4j node label safe to interpolate into Cypher.
 pub fn safe_label(label: &str) -> Result<String> {
     let Some(first) = label.chars().next() else {
         return Err(graph_error!("invalid label: {label}"));
@@ -607,6 +626,7 @@ pub fn safe_label(label: &str) -> Result<String> {
     Ok(label.to_string())
 }
 
+/// Allowlist and normalize a relationship type safe to interpolate into Cypher.
 pub fn safe_rel(rel: &str) -> Result<String> {
     let up = rel.to_ascii_uppercase();
     let Some(first) = up.chars().next() else {
@@ -622,6 +642,7 @@ pub fn safe_rel(rel: &str) -> Result<String> {
     Ok(up)
 }
 
+/// Map a property name/IRI to a structural relationship type when applicable.
 pub fn structural_rel_for(property: &str) -> Option<String> {
     let iri = property_iri(property);
     let name = name_from_iri(&iri);
@@ -638,15 +659,18 @@ pub fn structural_rel_for(property: &str) -> Option<String> {
     None
 }
 
+/// Whether a label is one of the Spike ranks (Signal through Knowledge).
 pub fn is_spike(label: &str) -> bool {
     SPIKE.contains(&label)
 }
 
+/// Run a graph-level query and return its first row.
 pub async fn fetch_one(graph: &Graph, q: neo4rs::Query) -> Result<Option<Row>> {
     let mut stream = graph.execute(q).await?;
     Ok(stream.next().await?)
 }
 
+/// Run a graph-level query and collect every row.
 pub async fn fetch_all(graph: &Graph, q: neo4rs::Query) -> Result<Vec<Row>> {
     let mut stream = graph.execute(q).await?;
     let mut rows = Vec::new();
@@ -699,6 +723,7 @@ fn unbounded_relation_weight(rel: &UnboundedRelation) -> i64 {
         .unwrap_or_else(|| rel.get::<i64>("weight").unwrap_or(0))
 }
 
+/// Serialize a Neo4j entity node for tool responses (signed weight via weightText).
 pub fn node_json(node: &Node) -> Value {
     let labels: Vec<String> = node
         .labels()
@@ -730,6 +755,7 @@ pub fn node_json(node: &Node) -> Value {
     obj
 }
 
+/// Serialize a relationship with endpoint IRIs for tool responses.
 pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     let mut obj = json!({
         "type": rel.typ(),
@@ -780,6 +806,7 @@ fn node_iri(node: &Node) -> String {
     node.get::<String>("iri").unwrap_or_default()
 }
 
+/// Expand a Neo4j path into node JSON, edge JSON, and ordered node IRIs.
 pub fn path_to_json(path: &Path) -> (Vec<Value>, Vec<Value>, Vec<String>) {
     let nodes = path.nodes();
     let rels = path.rels();
@@ -820,6 +847,7 @@ pub fn path_to_json(path: &Path) -> (Vec<Value>, Vec<Value>, Vec<String>) {
     (node_jsons, edges, iris)
 }
 
+/// Result of merging an entity or literal inside a transaction.
 #[derive(Debug, Clone)]
 pub struct MergedNode {
     pub iri: String,
@@ -829,6 +857,7 @@ pub struct MergedNode {
     pub json: Value,
 }
 
+/// Input for resolving or creating an entity node (IRI and/or name plus labels).
 #[derive(Debug, Clone, Default)]
 pub struct NodeSpec {
     pub iri: Option<String>,
@@ -844,6 +873,7 @@ struct FactLockSpec {
     layer: String,
 }
 
+/// Infer mint kind from IRI path, labels, or a caller-supplied fallback.
 pub fn infer_kind(spec: &NodeSpec, fallback: &str) -> String {
     if let Some(iri) = &spec.iri {
         if let Some(k) = kind_from_iri(iri) {
@@ -1101,6 +1131,7 @@ pub async fn acquire_fact_locks_in_txn(
     Ok(())
 }
 
+/// Provenance episode created for a state-changing mutation (none for no-ops).
 #[derive(Debug, Clone)]
 pub struct Episode {
     pub iri: String,
@@ -1137,6 +1168,7 @@ fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
     })
 }
 
+/// Create one Episode node in the caller's transaction and return its identity.
 pub async fn create_episode_in_txn(
     txn: &mut Txn,
     tool: &str,
@@ -1151,6 +1183,7 @@ pub async fn create_episode_in_txn(
     episode_from_row(&row, tool)
 }
 
+/// Load an entity by IRI without layer filtering.
 pub async fn get_node(graph: &Graph, iri: &str) -> Result<Option<Node>> {
     let row = fetch_one(
         graph,
@@ -1163,6 +1196,7 @@ pub async fn get_node(graph: &Graph, iri: &str) -> Result<Option<Node>> {
     })
 }
 
+/// Build relationship `factText` for full-text indexing from subject, property, and object.
 pub fn fact_text(s_name: &str, s_iri: &str, prop_iri: &str, o: &MergedNode) -> String {
     let s_part = if !s_name.is_empty() { s_name } else { s_iri };
     let p_part = name_from_iri(prop_iri);
@@ -1182,6 +1216,7 @@ pub fn fact_text(s_name: &str, s_iri: &str, prop_iri: &str, o: &MergedNode) -> S
     format!("{s_part} {p_part} {o_part}")
 }
 
+/// Compact endpoint JSON for facts: entities expose name/labels; literals expose value/datatype.
 pub fn endpoint_json(node: &Node) -> Value {
     let labels: Vec<String> = node
         .labels()
@@ -1216,6 +1251,7 @@ pub fn endpoint_json(node: &Node) -> Value {
     })
 }
 
+/// Highest Spike label present on a label set, or `None` if unranked.
 pub fn spike_label(labels: &[String]) -> Option<String> {
     for rank in ["Knowledge", "Insight", "Pattern", "Signal"] {
         if labels.iter().any(|l| l == rank) {
@@ -1225,6 +1261,7 @@ pub fn spike_label(labels: &[String]) -> Option<String> {
     None
 }
 
+/// Numeric Spike priority for ranking (Knowledge = 4 … unranked = 0).
 pub fn spike_rank(label: Option<&str>) -> i32 {
     match label {
         Some("Knowledge") => 4,

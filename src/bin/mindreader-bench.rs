@@ -1,3 +1,9 @@
+//! Release-mode graph performance and ranking regression benchmark.
+//!
+//! Seeds a large entity set, warms indexes, then samples search and merge-
+//! suggestion latency. Enabled with the `developer-tools` feature; mutates the
+//! configured database like the smoke suite.
+
 use mindreader::config::Config;
 use mindreader::error::{Context, Result};
 use mindreader::graph::{self, acquire_fact_locks_in_txn, fetch_one};

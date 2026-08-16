@@ -1,3 +1,10 @@
+//! Process entry for the stdio MCP server.
+//!
+//! Stdout is protocol-only: logs and diagnostics go to stderr. MCP initialize
+//! and `tools/list` must not wait on Neo4j; the database connects lazily in the
+//! background after serve starts. Explicit `--help` and `--version` may print
+//! their requested output to stdout and exit.
+
 use mindreader::error::{Context, Result};
 use mindreader::operation_error;
 use mindreader::Mindreader;

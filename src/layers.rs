@@ -1,3 +1,10 @@
+//! Layer validation and visibility-union policy.
+//!
+//! Every scoped tool supplies a `layers` array. Empty means global-only for
+//! request filters; named layers form an OR union. Records with empty
+//! memberships are global and visible in every request scope. Visible
+//! relationships also require visible endpoints (enforced in graph queries).
+
 use crate::domain::{DomainError, LayerId};
 
 /// Validate request layer strings, remove duplicates, and sort the result.

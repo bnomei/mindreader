@@ -1,3 +1,10 @@
+//! Permanent same-kind entity merge and advisory duplicate suggestions.
+//!
+//! `memory_merge` moves memberships, history, and edges from a source IRI onto
+//! a surviving target of the same canonical kind across all layers. Bootstrap
+//! seed Class/Property IRIs cannot be merge sources. Assert and related tools
+//! may call [`merge_suggestions_in_txn`] for review-only fuzzy name matches.
+
 use crate::domain::DomainError;
 use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, fetch_all_txn, fetch_one_txn, node_json,
@@ -65,12 +72,14 @@ fn lucene_fuzzy_term(name: &str) -> String {
     query
 }
 
+/// Source and target entity IRIs for a permanent same-kind merge.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MergeArgs {
     pub source: String,
     pub target: String,
 }
 
+/// Merge `source` into `target`, retrying transient Neo4j and concurrent-mutation failures.
 pub async fn memory_merge(graph: &Graph, args: MergeArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_merge_once(graph, &args).await {
@@ -607,6 +616,7 @@ async fn consolidate_current_duplicates(
     Ok(())
 }
 
+/// Advisory fuzzy name matches for newly created IRIs; never auto-merges.
 pub async fn merge_suggestions_in_txn(
     txn: &mut Txn,
     created_iris: &[String],

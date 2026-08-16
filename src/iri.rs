@@ -1,3 +1,11 @@
+//! Deterministic IRI minting and kind/label mapping for graph nodes.
+//!
+//! Entity and property IRIs use the `mindreader:{kind}/{slug}` shape unless a
+//! full IRI is already supplied. Kind and Neo4j label tables stay aligned so
+//! MERGE and schema tools can round-trip Class, Property, Element, Spike, and
+//! Episode nodes.
+
+/// True when `value` looks like a scheme-qualified IRI (`scheme:rest`).
 pub fn is_iri(value: &str) -> bool {
     let bytes = value.as_bytes();
     if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
@@ -14,6 +22,7 @@ pub fn is_iri(value: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '.' || c == '-')
 }
 
+/// Normalize a display name into a path-safe slug, optionally lowercased.
 pub fn slugify(name: &str, lower: bool) -> String {
     let mut s = name.trim().to_string();
     if let Some(rest) = s.strip_prefix("mindreader:") {
@@ -43,6 +52,7 @@ pub fn slugify(name: &str, lower: bool) -> String {
     }
 }
 
+/// Mint `mindreader:{kind}/{slug}` or pass through an already-qualified IRI.
 pub fn mint_iri(kind: &str, name_or_slug: &str, lower: bool) -> String {
     if is_iri(name_or_slug) {
         return name_or_slug.to_string();
@@ -50,12 +60,14 @@ pub fn mint_iri(kind: &str, name_or_slug: &str, lower: bool) -> String {
     format!("mindreader:{kind}/{}", slugify(name_or_slug, lower))
 }
 
+/// Extract the kind segment from a `mindreader:` IRI, if present.
 pub fn kind_from_iri(iri: &str) -> Option<String> {
     let rest = iri.strip_prefix("mindreader:")?;
     let (kind, _) = rest.split_once('/')?;
     Some(kind.to_string())
 }
 
+/// Local name after the last `/`, or the post-scheme remainder as a fallback.
 pub fn name_from_iri(iri: &str) -> String {
     if let Some(slash) = iri.rfind('/') {
         if slash + 1 < iri.len() {
@@ -68,6 +80,7 @@ pub fn name_from_iri(iri: &str) -> String {
     iri.to_string()
 }
 
+/// Resolve a property local name or IRI to a property IRI.
 pub fn property_iri(p: &str) -> String {
     if is_iri(p) {
         p.to_string()
@@ -76,6 +89,7 @@ pub fn property_iri(p: &str) -> String {
     }
 }
 
+/// Resolve a class local name or IRI to a class IRI.
 pub fn class_iri(name_or_iri: &str) -> String {
     if is_iri(name_or_iri) {
         name_or_iri.to_string()
@@ -84,6 +98,7 @@ pub fn class_iri(name_or_iri: &str) -> String {
     }
 }
 
+/// Whether minting for this kind lowercases the slug by default.
 pub fn default_lower_for_kind(kind: &str) -> bool {
     matches!(
         kind,
@@ -91,6 +106,7 @@ pub fn default_lower_for_kind(kind: &str) -> bool {
     )
 }
 
+/// Map a lowercase kind string to its Neo4j entity label, if known.
 pub fn label_for_kind(kind: &str) -> Option<&'static str> {
     Some(match kind.to_ascii_lowercase().as_str() {
         "class" => "Class",
@@ -106,6 +122,7 @@ pub fn label_for_kind(kind: &str) -> Option<&'static str> {
     })
 }
 
+/// Inverse of [`label_for_kind`]: Neo4j label to lowercase kind string.
 pub fn kind_for_label(label: &str) -> Option<&'static str> {
     Some(match label {
         "Class" => "class",

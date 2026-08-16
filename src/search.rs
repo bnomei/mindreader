@@ -1,3 +1,11 @@
+//! Database-side retrieval ranking and bounded fact assembly for `memory_search`.
+//!
+//! Full-text wakeup indexes and optional label filters produce candidates;
+//! ranking is Spike category first (Knowledge > Insight > Pattern > Signal),
+//! then shared subject+relationship+object weight within that category, then
+//! text score. Layer filters require visible endpoints and current
+//! relationships (`validTo` null). Retrieval never mutates weights.
+
 use crate::error::Result;
 use crate::graph::{endpoint_json, fetch_all, node_json, rel_json, spike_label, spike_rank};
 use crate::layers::validate_layer_ids;
@@ -7,6 +15,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashSet;
 
+/// Arguments for full-text / label-scoped fact retrieval under a layer union.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchArgs {
     pub layers: Vec<String>,
@@ -276,6 +285,7 @@ fn relation_weight(relation: &Relation) -> i64 {
         .unwrap_or_else(|| relation.get::<i64>("weight").unwrap_or(0))
 }
 
+/// Rank current visible facts for a text and/or label query under the request layer union.
 pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
     let layers = normalize_layers(args.layers)?;
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as i64;

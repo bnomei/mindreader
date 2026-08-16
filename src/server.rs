@@ -1,3 +1,10 @@
+//! MCP stdio adapter: tool registration, host-compatible schemas, lazy Neo4j.
+//!
+//! Advertises all twelve memory tools with plain tagged object input schemas
+//! (no `anyOf`/`oneOf`, which break some hosts). Initialize and `tools/list`
+//! do not require Neo4j; the first tool call (or explicit connect) bootstraps
+//! the graph and [`MemoryService`].
+
 use crate::config::Config;
 use crate::error::{Error, Result as AppResult};
 use crate::graph;
@@ -257,6 +264,7 @@ fn schema_memory_schema() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// MCP server handle: tool router, lazy `MemoryService`, and loaded config.
 #[derive(Clone)]
 pub struct Mindreader {
     pub tool_router: ToolRouter<Self>,
@@ -286,6 +294,7 @@ impl Mindreader {
         Ok(this)
     }
 
+    /// Connect, bootstrap the model, and initialize [`MemoryService`] once.
     pub async fn ensure_connected(&self) -> AppResult<()> {
         self.service
             .get_or_try_init(|| async {
@@ -305,6 +314,7 @@ impl Mindreader {
             .ok_or_else(|| McpError::internal_error("neo4j not connected", None))
     }
 
+    /// Sorted list of registered MCP tool names (for startup logs and tests).
     pub fn registered_tool_names() -> Vec<String> {
         let router = Self::tool_router();
         let mut names: Vec<String> = router.map.keys().map(|k| k.to_string()).collect();

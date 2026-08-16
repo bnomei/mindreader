@@ -1,3 +1,10 @@
+//! Native configuration and colocated secret loading.
+//!
+//! Non-secret settings live in `config.toml` under the OS config directory.
+//! Secrets (`NEO4J_PASSWORD`, embedding API keys) load from a colocated `.env`
+//! or the process environment; process values win when non-empty. Passwords
+//! are never logged and remain required for Neo4j connections.
+
 use crate::{
     config_error,
     error::{Context, Result},
@@ -12,6 +19,7 @@ use std::{collections::HashMap, env};
 const CONFIG_FILE: &str = "config.toml";
 const SECRETS_FILE: &str = ".env";
 
+/// Bolt connection endpoints and auth user for Neo4j (password is secret-only).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Neo4jConfig {
@@ -28,6 +36,7 @@ impl Default for Neo4jConfig {
     }
 }
 
+/// Per-provider embedding model id and output dimensionality.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
@@ -44,6 +53,7 @@ impl Default for ProviderConfig {
     }
 }
 
+/// Embedding provider sections in `config.toml` (keys stay in secrets).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingsConfig {
@@ -63,6 +73,7 @@ impl Default for EmbeddingsConfig {
     }
 }
 
+/// Tunables for semantic activation TTL, neighbor recall, and RRF fusion.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SemanticConfig {
@@ -146,6 +157,7 @@ struct FileConfig {
     semantic: SemanticConfig,
 }
 
+/// Which remote embedding API is selected at runtime.
 #[derive(Clone, PartialEq, Eq)]
 pub enum EmbeddingProviderKind {
     OpenAi,
@@ -161,6 +173,7 @@ impl EmbeddingProviderKind {
     }
 }
 
+/// Fully resolved embedding credentials and model settings ready for HTTP use.
 #[derive(Clone)]
 pub struct SelectedEmbedding {
     pub provider: EmbeddingProviderKind,
@@ -179,6 +192,7 @@ impl SelectedEmbedding {
     }
 }
 
+/// Provider/model/dimension triple stored on the Neo4j semantic index marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingSpace {
     pub provider: String,
@@ -186,6 +200,7 @@ pub struct EmbeddingSpace {
     pub dimensions: usize,
 }
 
+/// Runtime configuration assembled from `config.toml`, secrets, and the process environment.
 #[derive(Clone)]
 pub struct Config {
     pub uri: String,
@@ -196,6 +211,7 @@ pub struct Config {
     pub config_dir: PathBuf,
 }
 
+/// Resolve the platform config directory (`…/mindreader`), creating nothing yet.
 pub fn config_dir() -> Result<PathBuf> {
     let base =
         BaseDirs::new().ok_or_else(|| config_error!("cannot resolve the OS config directory"))?;
@@ -254,14 +270,15 @@ fn resolve_secret(name: &str, file: &HashMap<String, String>) -> Option<String> 
 }
 
 impl Config {
+    /// Load configuration from the default OS config directory, initializing files if missing.
     pub fn from_env() -> Result<Self> {
         Self::from_dir(config_dir()?)
     }
 
     /// Load a complete native configuration from an explicit directory.
     ///
-    /// This is intended for diagnostics and isolated integration tests that
-    /// must not reuse the operator's normal configuration directory.
+    /// Intended for diagnostics and isolated integration tests that must not
+    /// reuse the operator's normal configuration directory.
     pub fn from_directory(config_dir: impl Into<PathBuf>) -> Result<Self> {
         Self::from_dir(config_dir.into())
     }
@@ -309,10 +326,12 @@ impl Config {
         })
     }
 
+    /// Path to the colocated `.env` secrets file under this config directory.
     pub fn secrets_path(&self) -> PathBuf {
         self.config_dir.join(SECRETS_FILE)
     }
 
+    /// Require `NEO4J_PASSWORD` from secrets or the process environment.
     pub fn neo4j_password(&self) -> Result<&str> {
         self.password.as_deref().ok_or_else(|| {
             config_error!(

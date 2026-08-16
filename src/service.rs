@@ -1,7 +1,9 @@
 //! Typed application boundary for memory operations.
 //!
 //! Transport adapters depend on this service instead of coordinating graph
-//! transactions or project-layer policy themselves.
+//! transactions or layer policy themselves. Methods delegate to `tools`,
+//! `search`, `semantic`, and `merge` with a shared Neo4j handle and optional
+//! semantic runtime.
 
 use crate::config::Config;
 use crate::error::Result;
@@ -16,6 +18,7 @@ use neo4rs::Graph;
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Shared graph handle plus optional embedding runtime for all twelve memory tools.
 #[derive(Clone)]
 pub struct MemoryService {
     graph: Graph,
@@ -24,6 +27,7 @@ pub struct MemoryService {
 }
 
 impl MemoryService {
+    /// Build a service from an already-connected graph and loaded config.
     pub fn new(graph: Graph, config: &Config) -> Result<Self> {
         Ok(Self {
             graph,
@@ -32,6 +36,7 @@ impl MemoryService {
         })
     }
 
+    /// Borrow the underlying Neo4j graph (smoke tests and diagnostics).
     pub fn graph(&self) -> &Graph {
         &self.graph
     }
