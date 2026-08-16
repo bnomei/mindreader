@@ -27,22 +27,23 @@ MCP server: `user-mindreader`. Always call `user-mindreader:<tool>`.
 
 1. Choose `@layers`, the request's `layers` array. Use one or more named memberships for this work; use `[]` only for global memory.
 2. Use `user-mindreader:memory_search` for an exact name or relation. Use `user-mindreader:memory_semantic_search` for a concept when sending the query text to the configured OpenAI or xAI embedding API is acceptable. Multiple layers are an OR union. If the fact is already current, stop.
-3. One triple per `user-mindreader:memory_assert`. Use tagged entity/literal objects for `s` and `o`; `p` is a relation; always pass `layers`.
-4. Layer IDs use lowercase kebab-case colon namespaces, for example `project:graph-memory` or `analysis:hypothesis`. Colons are naming, not hierarchy.
-5. `spike=Knowledge` only if you would bet on it. Otherwise `Signal` (raw) or `Insight` (interpreted). Do not auto-promote.
-6. Add another valid value with `memory_assert`. Correct selected memberships of one exact old value with `memory_replace`; use `memory_retract` only to withdraw.
-7. If another visible membership has a different current `(s,p)`, set `contradicts=true`.
-8. Inspect `mergeSuggestions` returned by `memory_assert`, `memory_replace`, and `memory_schema`. A suggestion is only a fuzzy same-kind name match, not proof of identity. If—and only if—the entities are truly identical, pass its `merge` payload to `memory_merge`; reverse `source` and `target` when the other IRI/name should survive.
-9. Search again for `s` or the topic. If the new fact is missing, fix the assert.
-10. After using a retrieved node or relationship, call `memory_feedback`: `strengthen` if it helped, `weaken` if it did not. Retrieval never updates weight itself.
+3. If search does not show the Class or Property, call `user-mindreader:memory_schema` with `list=true` before writing schema.
+4. One `user-mindreader:memory_assert` call with `facts[]` (1–20 triples) and call-level `layers`. Use tagged entity/literal objects for each fact's `s` and `o`; `p` is a relation.
+5. Layer IDs use lowercase kebab-case colon namespaces, for example `project:graph-memory` or `analysis:hypothesis`. Colons are naming, not hierarchy.
+6. `spike=Knowledge` only if you would bet on it. Otherwise `Signal` (raw) or `Insight` (interpreted). Do not auto-promote.
+7. Add another valid value with `memory_assert`. Correct selected memberships of one exact old value with `memory_replace`; use `memory_retract` only to withdraw.
+8. If another visible membership has a different current `(s,p)`, set that fact's `contradicts=true`.
+9. Inspect `mergeSuggestions` and per-fact `propertyStub` on the `memory_assert` result. A suggestion is only a fuzzy same-kind name match, not proof of identity. If—and only if—the entities are truly identical, pass its `merge` payload to `memory_merge`; reverse `source` and `target` when the other IRI/name should survive.
+10. Search again for `s` or the topic. If the new fact is missing, fix the assert.
+11. After using a retrieved node or relationship, call `memory_feedback`: `strengthen` if it helped, `weaken` if it did not. Retrieval never updates weight itself.
 
 ## Examples
 
 Good:
 
 ```
-s={kind:entity,name:Alice}  p=worksOn  o={kind:entity,name:mindreader}  layers=[project:graph-memory]  spike=Knowledge
-s={kind:entity,name:Bob}    p=INSTANCE_OF  o={kind:entity,iri:mindreader:class/Agent}  layers=[]
+memory_assert facts=[{s:{kind:entity,name:Alice}, p=worksOn, o:{kind:entity,name:mindreader}, spike=Knowledge}] layers=[project:graph-memory]
+memory_assert facts=[{s:{kind:entity,name:Bob}, p=INSTANCE_OF, o:{kind:entity,iri:mindreader:class/Agent}}] layers=[]
 ```
 
 Bad:
@@ -62,7 +63,7 @@ s=Bob    p=notes  o="I am working on the MCP today"  # task status, not durable
 | Walk typed edges | `user-mindreader:memory_traverse` |
 | Retrieved target helped or hurt | `user-mindreader:memory_feedback` |
 | Audit or correct memberships | `user-mindreader:memory_layers` |
-| New Class or Property after search misses | `user-mindreader:memory_schema` |
+| New Class or Property after search and `list=true` miss | `user-mindreader:memory_schema` |
 | Confirmed duplicate entities | `user-mindreader:memory_merge` |
 
 Every read filters nodes, relationships, and relationship endpoints through the same `@layers` scope. Empty stored memberships are global. One exact relationship identity is shared across memberships, so asserting it again merges memberships. Feedback is explicit `+1`/`-1`, shared across memberships, has no decay, and ranks results only within the same Spike category. Search's top-level `spike` context covers endpoints in the returned facts after the fact limit and is capped to that same requested limit.

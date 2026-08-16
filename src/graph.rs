@@ -734,6 +734,7 @@ pub fn node_json(node: &Node) -> Value {
     let iri = node.get::<String>("iri").unwrap_or_default();
     let name = node.get::<String>("name").ok();
     let mut obj = json!({
+        "kind": "node",
         "iri": iri,
         "name": name,
         "labels": labels,
@@ -768,6 +769,7 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("iri") {
         obj["iri"] = json!(v);
     }
+    obj["kind"] = json!("relationship");
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
     }
@@ -791,6 +793,7 @@ fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("iri") {
         obj["iri"] = json!(v);
     }
+    obj["kind"] = json!("relationship");
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
     }
@@ -866,7 +869,7 @@ pub struct NodeSpec {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FactLockSpec {
+pub(crate) struct FactLockSpec {
     key: String,
     subject_iri: String,
     predicate_iri: String,
@@ -1057,7 +1060,7 @@ fn lock_key(subject_iri: &str, predicate_iri: &str, layer: &str) -> String {
         .collect()
 }
 
-fn fact_lock_specs(facts: &[(String, String, String)]) -> Vec<FactLockSpec> {
+pub(crate) fn fact_lock_specs(facts: &[(String, String, String)]) -> Vec<FactLockSpec> {
     let mut locks = Vec::with_capacity(facts.len() * 2);
     for (subject_iri, predicate_iri, layer) in facts {
         for predicate_iri in ["*", predicate_iri.as_str()] {
@@ -1235,6 +1238,7 @@ pub fn endpoint_json(node: &Node) -> Value {
             .get::<String>("datatype")
             .unwrap_or_else(|_| "xsd:string".into());
         return json!({
+            "kind": "node",
             "iri": iri,
             "value": value,
             "datatype": datatype,
@@ -1243,6 +1247,7 @@ pub fn endpoint_json(node: &Node) -> Value {
         });
     }
     json!({
+        "kind": "node",
         "iri": iri,
         "name": node.get::<String>("name").ok(),
         "labels": labels,

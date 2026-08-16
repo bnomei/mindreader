@@ -195,7 +195,7 @@ Pin the package version in MCP configuration so the client always starts the sam
   "mcpServers": {
     "mindreader": {
       "command": "npx",
-      "args": ["-y", "@bnomei/mindreader@0.1.0"],
+      "args": ["-y", "@bnomei/mindreader@0.2.0"],
       "env": {
         "NEO4J_PASSWORD": "<NEO4J_PASSWORD>",
         "XAI_API_KEY": "<OPTIONAL_XAI_API_KEY>"
@@ -238,10 +238,10 @@ Start each session by recovering relevant context, then write only durable facts
 1. Choose the request's `layers` visibility union, then call `memory_search` for exact names or `memory_semantic_search` for conceptual recall when you do not have an IRI.
 2. Call `memory_get` for a returned IRI when you need the exact node or its immediate neighbors.
 3. Call `memory_traverse` when you need typed paths beyond one hop.
-4. Call `memory_schema` only when the required Class or Property does not exist.
-5. Call `memory_assert` once per durable, future-relevant triple.
+4. Call `memory_schema` with `list=true` if the required Class or Property is missing from search, then write schema only when the catalog confirms it is absent.
+5. Call `memory_assert` once with `facts[]` for one or more durable, future-relevant triples (1–20).
 6. Review any `mergeSuggestions`. They are fuzzy, advisory candidates rather than proof that two nodes are identical. Call `memory_merge` only after deciding the identities truly match.
-7. Search again to verify an important write.
+7. Search again to verify an important write. Correct with `memory_replace`; do not reassert.
 8. After using a retrieved node or relationship, call `memory_feedback` with `strengthen` if it helped or `weaken` if it did not.
 
 Do not store task chatter, acknowledgements, markdown dumps, or transient status as memory. The repository includes a reusable decision guide at [`skills/writing-to-mindreader/SKILL.md`](skills/writing-to-mindreader/SKILL.md).
@@ -250,18 +250,22 @@ Do not store task chatter, acknowledgements, markdown dumps, or transient status
 
 ### Assert one durable fact
 
-Call `memory_assert` with one triple and an explicit visibility scope:
+Call `memory_assert` with `facts[]` and an explicit visibility scope:
 
 ```json
 {
-  "s": { "kind": "entity", "name": "Alice" },
-  "p": "worksOn",
-  "o": { "kind": "entity", "name": "mindreader" },
+  "facts": [
+    {
+      "s": { "kind": "entity", "name": "Alice" },
+      "p": "worksOn",
+      "o": { "kind": "entity", "name": "mindreader" }
+    }
+  ],
   "layers": ["project:graph-memory"]
 }
 ```
 
-The response includes subject, object, and stable relationship IRIs.
+The response includes one Episode when any fact changed, plus per-item subject, object, and stable relationship IRIs.
 
 ### Search by text
 
@@ -307,7 +311,7 @@ To audit its memberships independently of the fact value, use `memory_layers` wi
 
 ## MCP tool reference
 
-All tools return structured JSON. Every scoped tool requires a `layers` array; the global `memory_schema` and permanent `memory_merge` operations do not. In the table, `@layers` is short for that request field. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them.
+All tools return structured JSON. Recoverable failures return an MCP `isError` result with `{ok:false,reason,message}` rather than JSON-RPC `-32602`. Every scoped tool requires a `layers` array; the global `memory_schema` and permanent `memory_merge` operations do not. In the table, `@layers` is short for that request field. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers only apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
@@ -316,12 +320,12 @@ All tools return structured JSON. Every scoped tool requires a `layers` array; t
 | `memory_get` | `iri`, `layers` | `hops` (`0`; only `1` includes neighbors) | Fetch a visible node and, optionally, its current visible one-hop relationships. |
 | `memory_traverse` | `from`, `layers` | `rels` (all fixed relationships), `depth` (`1`, clamped to `1..3`), `limit` (`50`, clamped to `1..200`) | Walk current visible typed relationships in either direction. |
 | `memory_stats` | `layers` | None | Report graph-model readiness, visible node/edge counts, database-wide episode count, and per-membership active edge totals. |
-| `memory_assert` | tagged `s`, `p`, tagged `o`, `layers` | `spike`, `contradicts` (`false`) | Add one set-valued triple or merge memberships into its existing relationship identity. |
+| `memory_assert` | `facts[]` (1–20 triples), `layers` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships into each existing relationship identity. One Episode if any fact changed. |
 | `memory_replace` | tagged `s`, `p`, tagged `old`, tagged `new`, `layers` | `spike`, `contradicts` (`false`), `reason` | Move the selected memberships from one exact value to its correction atomically. |
 | `memory_retract` | tagged `target`, `layers` | `reason` | Remove selected memberships and soft-close a fact when its last membership is removed. |
 | `memory_feedback` | `layers`, tagged `target`, `mode` | None | Apply exactly `+1` (`strengthen`) or `-1` (`weaken`) to a visible node or current relationship's shared weight. |
 | `memory_layers` | `layers`, tagged `target` | `add`, `remove` (at least one entry across them) | Audit and atomically edit one node or current relationship's memberships. |
-| `memory_schema` | `kind`, plus `name` or `iri` | Class: `subClassOf`; Property: `subPropertyOf`, `domain`, `range` | Declare a Class or Property and its valid structural links as global records. |
+| `memory_schema` | `kind` | `list` (`false`); write: `name` or `iri`, Class `subClassOf`, Property `subPropertyOf`/`domain`/`range` | `list=true` catalogs existing Class or Property records (no Episode). Without `list`, declare a Class or Property and its valid structural links as global records. |
 | `memory_merge` | same-kind `source`, `target` IRIs | None | Permanently merge two user-visible non-literal entities across every membership and historical relationship; the target IRI and name survive. Property merges also rewrite facts to the surviving predicate and consolidate exact duplicates. |
 
 `memory_assert`, `memory_replace`, and `memory_schema` return `mergeSuggestions` when they create a user-visible entity with a fuzzy same-kind name match. Each suggestion includes the two names, its similarity, and a directly callable `merge: {source, target}` payload. The shorter name is recommended as the target; ties keep the pre-existing candidate. This direction is only a recommendation: inspect identity carefully and reverse or ignore it when appropriate. Names such as `007` and `007s` can be similar while still naming different entities.

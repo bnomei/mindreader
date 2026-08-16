@@ -13,6 +13,7 @@ use crate::graph::{endpoint_json, fetch_all, fetch_one, rel_json, spike_label, S
 use crate::layers::validate_layer_ids;
 use crate::search::{memory_search, SearchArgs};
 use crate::{
+    embedding_error,
     error::{Context, Result},
     operation_error,
 };
@@ -107,7 +108,7 @@ pub async fn memory_semantic_search(
     args: SemanticSearchArgs,
 ) -> Result<Value> {
     let runtime = runtime.ok_or_else(|| {
-        operation_error!(
+        embedding_error!(
             "semantic search requires OPENAI_API_KEY or XAI_API_KEY in {} or the process environment",
             secrets_path.display()
         )

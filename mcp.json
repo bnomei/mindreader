@@ -1,6 +1,6 @@
 {
   "name": "mindreader",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Deterministic, privacy-first Neo4j memory MCP server",
   "transport": {
     "type": "stdio",

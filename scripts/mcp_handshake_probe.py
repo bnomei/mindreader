@@ -143,11 +143,15 @@ def main() -> int:
             print("--- stderr ---")
             print(stderr)
             names = []
+            listed = []
             if tools and isinstance(tools.get("result"), dict):
-                names = [t.get("name") for t in tools["result"].get("tools") or []]
+                listed = tools["result"].get("tools") or []
+                names = [t.get("name") for t in listed]
             print("--- tool names ---")
             print(names)
-            if init is None or len(names) != 12:
+            negotiated = (init or {}).get("result", {}).get("protocolVersion")
+            print(f"negotiated={negotiated}")
+            if init is None or negotiated != proto or not handshake_contract_ok(init, listed):
                 succeeded = False
 
         print("=" * 72)
@@ -165,9 +169,58 @@ def main() -> int:
             names = [t.get("name") for t in tools["result"].get("tools") or []]
         print("--- tool names ---")
         print(names)
-        if init is None or negotiated == UNKNOWN_PROTOCOL or len(names) != 12:
+        if init is None or negotiated == UNKNOWN_PROTOCOL or not handshake_contract_ok(
+            init, [t for t in ((tools or {}).get("result") or {}).get("tools") or []]
+        ):
             succeeded = False
         return 0 if succeeded else 1
+
+
+UNION_KEYS = {"anyOf", "oneOf", "allOf"}
+EXPECTED_TOOLS = {
+    "memory_assert",
+    "memory_feedback",
+    "memory_get",
+    "memory_layers",
+    "memory_merge",
+    "memory_replace",
+    "memory_retract",
+    "memory_schema",
+    "memory_search",
+    "memory_semantic_search",
+    "memory_stats",
+    "memory_traverse",
+}
+
+
+def contains_union(value) -> bool:
+    if isinstance(value, dict):
+        if UNION_KEYS.intersection(value):
+            return True
+        return any(contains_union(child) for child in value.values())
+    if isinstance(value, list):
+        return any(contains_union(child) for child in value)
+    return False
+
+
+def handshake_contract_ok(init: dict, listed: list) -> bool:
+    caps = ((init or {}).get("result") or {}).get("capabilities") or {}
+    tools_cap = caps.get("tools")
+    if not isinstance(tools_cap, dict):
+        return False
+    if tools_cap.get("listChanged") not in (None, False):
+        return False
+    names = [tool.get("name") for tool in listed]
+    if set(names) != EXPECTED_TOOLS or len(names) != 12:
+        return False
+    for tool in listed:
+        if not isinstance(tool.get("annotations"), dict):
+            return False
+        if contains_union(tool.get("inputSchema")) or contains_union(tool.get("outputSchema")):
+            return False
+        if not isinstance(tool.get("outputSchema"), dict):
+            return False
+    return True
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ use mindreader::operation_error;
 use mindreader::search::SearchArgs;
 use mindreader::semantic::{memory_semantic_search, SemanticRuntime, SemanticSearchArgs};
 use mindreader::tools::{
-    self, AssertArgs, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs,
+    self, AssertArgs, AssertFact, FeedbackArgs, GetArgs, LayersArgs, ReplaceArgs, RetractArgs,
     RetractTargetArgs, SchemaArgs, StatsArgs, TargetArgs,
 };
 use mindreader::Mindreader;
@@ -122,9 +122,28 @@ fn object_iri(iri: impl Into<String>) -> ObjectInput {
     }
 }
 
+fn assert_args(
+    s: EntityInput,
+    p: impl AsRef<str>,
+    o: ObjectInput,
+    layers: Vec<String>,
+) -> AssertArgs {
+    AssertArgs {
+        facts: vec![AssertFact {
+            s,
+            p: p.as_ref().to_string(),
+            o,
+            spike: None,
+            contradicts: false,
+        }],
+        layers,
+    }
+}
+
 fn relationship_iri(value: &Value) -> Result<String> {
     value
-        .pointer("/relationship/iri")
+        .pointer("/facts/0/relationship/iri")
+        .or_else(|| value.pointer("/relationship/iri"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| operation_error!("response has no relationship IRI: {value}"))
@@ -132,7 +151,7 @@ fn relationship_iri(value: &Value) -> Result<String> {
 
 fn subject_iri(value: &Value) -> Result<String> {
     value
-        .pointer("/s/iri")
+        .pointer("/facts/0/s/iri")
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| operation_error!("response has no subject IRI: {value}"))
@@ -140,7 +159,7 @@ fn subject_iri(value: &Value) -> Result<String> {
 
 fn object_result_iri(value: &Value) -> Result<String> {
     value
-        .pointer("/o/iri")
+        .pointer("/facts/0/o/iri")
         .or_else(|| value.pointer("/new/iri"))
         .and_then(Value::as_str)
         .map(str::to_string)
@@ -424,11 +443,9 @@ async fn run() -> Result<u32> {
         SchemaArgs {
             kind: "property".into(),
             name: Some(property.clone()),
-            iri: None,
-            sub_class_of: None,
-            sub_property_of: None,
             domain: Some("Element".into()),
             range: Some("Element".into()),
+            ..SchemaArgs::default()
         },
     )
     .await?;
@@ -448,38 +465,32 @@ async fn run() -> Result<u32> {
     let visibility_token = format!("visibility-{tag}");
     let global = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("{visibility_token}-global-subject")),
-            p: property.clone(),
-            o: object(format!("{visibility_token}-global-object")),
-            layers: Vec::new(),
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("{visibility_token}-global-subject")),
+            property.clone(),
+            object(format!("{visibility_token}-global-object")),
+            Vec::new(),
+        ),
     )
     .await?;
     let in_a = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("{visibility_token}-a-subject")),
-            p: property.clone(),
-            o: object(format!("{visibility_token}-a-object")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("{visibility_token}-a-subject")),
+            property.clone(),
+            object(format!("{visibility_token}-a-object")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let in_b = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("{visibility_token}-b-subject")),
-            p: property.clone(),
-            o: object(format!("{visibility_token}-b-object")),
-            layers: vec![layer_b.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("{visibility_token}-b-subject")),
+            property.clone(),
+            object(format!("{visibility_token}-b-object")),
+            vec![layer_b.clone()],
+        ),
     )
     .await?;
     let global_rel = relationship_iri(&global)?;
@@ -513,29 +524,113 @@ async fn run() -> Result<u32> {
         format!("global={only_global:?} A={seen_a:?} B={seen_b:?} AB={seen_ab:?}"),
     );
 
+    let batch_token = format!("batch-{tag}");
+    let batch = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            facts: vec![
+                AssertFact {
+                    s: entity(format!("{batch_token}-one")),
+                    p: property.clone(),
+                    o: object(format!("{batch_token}-a")),
+                    spike: None,
+                    contradicts: false,
+                },
+                AssertFact {
+                    s: entity(format!("{batch_token}-two")),
+                    p: property.clone(),
+                    o: object(format!("{batch_token}-b")),
+                    spike: None,
+                    contradicts: false,
+                },
+                AssertFact {
+                    s: entity(format!("{batch_token}-three")),
+                    p: property.clone(),
+                    o: object(format!("{batch_token}-c")),
+                    spike: None,
+                    contradicts: false,
+                },
+            ],
+            layers: vec![layer_a.clone()],
+        },
+    )
+    .await?;
+    let batch_episode = batch.pointer("/episode/iri").and_then(Value::as_str);
+    report.check(
+        "one memory_assert facts[] call records one Episode for three triples",
+        batch.get("noop").and_then(Value::as_bool) == Some(false)
+            && batch
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| facts.len() == 3)
+            && batch_episode.is_some(),
+        &batch,
+    );
+    let batch_iris = (0..3)
+        .map(|index| {
+            let subject = batch
+                .pointer(&format!("/facts/{index}/s/iri"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| operation_error!("batch fact {index} missing subject"))?;
+            let object = batch
+                .pointer(&format!("/facts/{index}/o/iri"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| operation_error!("batch fact {index} missing object"))?;
+            Ok::<_, mindreader::error::Error>((subject.to_string(), object.to_string()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let batch_noop = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            facts: batch_iris
+                .into_iter()
+                .map(|(subject, object)| AssertFact {
+                    s: entity_iri(subject),
+                    p: property.clone(),
+                    o: object_iri(object),
+                    spike: None,
+                    contradicts: false,
+                })
+                .collect(),
+            layers: vec![layer_a.clone()],
+        },
+    )
+    .await?;
+    report.check(
+        "all-noop memory_assert facts[] rolls back without an Episode",
+        batch_noop.get("noop").and_then(Value::as_bool) == Some(true)
+            && batch_noop.get("episode").is_some_and(Value::is_null)
+            && batch_noop
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| {
+                    facts.len() == 3
+                        && facts
+                            .iter()
+                            .all(|fact| fact.get("noop") == Some(&Value::Bool(true)))
+                }),
+        &batch_noop,
+    );
+
     let merge_token = format!("merge-{tag}");
     let merged_a = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("{merge_token}-subject")),
-            p: property.clone(),
-            o: object(format!("{merge_token}-old")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("{merge_token}-subject")),
+            property.clone(),
+            object(format!("{merge_token}-old")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let merged_b = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity_iri(subject_iri(&merged_a)?),
-            p: property.clone(),
-            o: object_iri(object_result_iri(&merged_a)?),
-            layers: vec![layer_b.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity_iri(subject_iri(&merged_a)?),
+            property.clone(),
+            object_iri(object_result_iri(&merged_a)?),
+            vec![layer_b.clone()],
+        ),
     )
     .await?;
     let merged_rel = relationship_iri(&merged_a)?;
@@ -549,26 +644,22 @@ async fn run() -> Result<u32> {
 
     let global_wins_1 = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("global-wins-{tag}-subject")),
-            p: property.clone(),
-            o: object(format!("global-wins-{tag}-object")),
-            layers: Vec::new(),
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("global-wins-{tag}-subject")),
+            property.clone(),
+            object(format!("global-wins-{tag}-object")),
+            Vec::new(),
+        ),
     )
     .await?;
     let global_wins_2 = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity_iri(subject_iri(&global_wins_1)?),
-            p: property.clone(),
-            o: object_iri(object_result_iri(&global_wins_1)?),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity_iri(subject_iri(&global_wins_1)?),
+            property.clone(),
+            object_iri(object_result_iri(&global_wins_1)?),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let global_wins_rel = relationship_iri(&global_wins_1)?;
@@ -582,27 +673,23 @@ async fn run() -> Result<u32> {
 
     let contradiction_old_left = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("contradiction-left-{tag}")),
-            p: format!("contradictionLeft{tag}"),
-            o: object(format!("contradiction-old-{tag}")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("contradiction-left-{tag}")),
+            format!("contradictionLeft{tag}"),
+            object(format!("contradiction-old-{tag}")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let contradiction_old_iri = object_result_iri(&contradiction_old_left)?;
     let contradiction_old_right = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("contradiction-right-{tag}")),
-            p: format!("contradictionRight{tag}"),
-            o: object_iri(contradiction_old_iri.clone()),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("contradiction-right-{tag}")),
+            format!("contradictionRight{tag}"),
+            object_iri(contradiction_old_iri.clone()),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let contradiction_new_name = format!("contradiction-new-{tag}");
@@ -610,23 +697,27 @@ async fn run() -> Result<u32> {
         tools::memory_assert(
             &graph,
             AssertArgs {
-                s: entity_iri(subject_iri(&contradiction_old_left)?),
-                p: format!("contradictionLeft{tag}"),
-                o: object(contradiction_new_name.clone()),
+                facts: vec![AssertFact {
+                    s: entity_iri(subject_iri(&contradiction_old_left)?),
+                    p: format!("contradictionLeft{tag}"),
+                    o: object(contradiction_new_name.clone()),
+                    spike: None,
+                    contradicts: true,
+                }],
                 layers: vec![layer_a.clone()],
-                spike: None,
-                contradicts: true,
             },
         ),
         tools::memory_assert(
             &graph,
             AssertArgs {
-                s: entity_iri(subject_iri(&contradiction_old_right)?),
-                p: format!("contradictionRight{tag}"),
-                o: object(contradiction_new_name),
+                facts: vec![AssertFact {
+                    s: entity_iri(subject_iri(&contradiction_old_right)?),
+                    p: format!("contradictionRight{tag}"),
+                    o: object(contradiction_new_name),
+                    spike: None,
+                    contradicts: true,
+                }],
                 layers: vec![layer_a.clone()],
-                spike: None,
-                contradicts: true,
             },
         ),
     )?;
@@ -706,50 +797,42 @@ async fn run() -> Result<u32> {
     let broad_subject_name = format!("broad-retract-{tag}");
     let broad_a = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(broad_subject_name.clone()),
-            p: property.clone(),
-            o: object(format!("broad-a-{tag}")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(broad_subject_name.clone()),
+            property.clone(),
+            object(format!("broad-a-{tag}")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let broad_ab = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(broad_subject_name.clone()),
-            p: property.clone(),
-            o: object(format!("broad-ab-{tag}")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(broad_subject_name.clone()),
+            property.clone(),
+            object(format!("broad-ab-{tag}")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(broad_subject_name.clone()),
-            p: property.clone(),
-            o: object_iri(object_result_iri(&broad_ab)?),
-            layers: vec![layer_b.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(broad_subject_name.clone()),
+            property.clone(),
+            object_iri(object_result_iri(&broad_ab)?),
+            vec![layer_b.clone()],
+        ),
     )
     .await?;
     let broad_b = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(broad_subject_name),
-            p: property.clone(),
-            o: object(format!("broad-b-{tag}")),
-            layers: vec![layer_b.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(broad_subject_name),
+            property.clone(),
+            object(format!("broad-b-{tag}")),
+            vec![layer_b.clone()],
+        ),
     )
     .await?;
     let broad_a_rel = relationship_iri(&broad_a)?;
@@ -789,26 +872,22 @@ async fn run() -> Result<u32> {
     let rank_token = format!("rank-{tag}");
     let low = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("{rank_token}-low-subject")),
-            p: property.clone(),
-            o: object(format!("{rank_token}-low-object")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("{rank_token}-low-subject")),
+            property.clone(),
+            object(format!("{rank_token}-low-object")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let high = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("{rank_token}-high-subject")),
-            p: property.clone(),
-            o: object(format!("{rank_token}-high-object")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("{rank_token}-high-subject")),
+            property.clone(),
+            object(format!("{rank_token}-high-object")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let low_rel = relationship_iri(&low)?;
@@ -901,14 +980,12 @@ async fn run() -> Result<u32> {
     let closure_token = format!("closure-{tag}");
     let closure = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("{closure_token}-subject")),
-            p: property,
-            o: object(format!("{closure_token}-object")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("{closure_token}-subject")),
+            property,
+            object(format!("{closure_token}-object")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let closure_rel = relationship_iri(&closure)?;
@@ -1015,26 +1092,22 @@ async fn run() -> Result<u32> {
 
     let merge_short = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("merge-{tag}")),
-            p: "mindreader:property/merge-smoke".into(),
-            o: object(format!("merge-object-{tag}")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("merge-{tag}")),
+            "mindreader:property/merge-smoke",
+            object(format!("merge-object-{tag}")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let merge_long = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("merge-{tag}s")),
-            p: "mindreader:property/merge-smoke".into(),
-            o: object(format!("merge-object-{tag}")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("merge-{tag}s")),
+            "mindreader:property/merge-smoke",
+            object(format!("merge-object-{tag}")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     let short_iri = subject_iri(&merge_short)?;
@@ -1085,7 +1158,7 @@ async fn run() -> Result<u32> {
     report.check(
         "merge suggestions prefer the shorter name and memory_merge keeps only the target",
         suggested
-            && survivor.get("iri").and_then(Value::as_str) == Some(short_iri.as_str())
+            && survivor.pointer("/node/iri").and_then(Value::as_str) == Some(short_iri.as_str())
             && removed.get("found").and_then(Value::as_bool) == Some(false)
             && relation_state(&graph, &merge_survivor_relationship)
                 .await?
@@ -1100,14 +1173,12 @@ async fn run() -> Result<u32> {
     let same_txn_long_name = format!("007s-{tag}");
     let same_txn_merge = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(same_txn_long_name.clone()),
-            p: "mindreader:property/same-transaction-merge-smoke".into(),
-            o: object(same_txn_short_name.clone()),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(same_txn_long_name.clone()),
+            "mindreader:property/same-transaction-merge-smoke",
+            object(same_txn_short_name.clone()),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     report.check(
@@ -1133,11 +1204,7 @@ async fn run() -> Result<u32> {
         SchemaArgs {
             kind: "property".into(),
             name: Some(target_property_name.clone()),
-            iri: None,
-            sub_class_of: None,
-            sub_property_of: None,
-            domain: None,
-            range: None,
+            ..SchemaArgs::default()
         },
     )
     .await?;
@@ -1146,11 +1213,7 @@ async fn run() -> Result<u32> {
         SchemaArgs {
             kind: "property".into(),
             name: Some(source_property_name.clone()),
-            iri: None,
-            sub_class_of: None,
-            sub_property_of: None,
-            domain: None,
-            range: None,
+            ..SchemaArgs::default()
         },
     )
     .await?;
@@ -1166,26 +1229,22 @@ async fn run() -> Result<u32> {
         .to_string();
     let property_fact = tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity(format!("property-merge-subject-{tag}")),
-            p: target_property_iri.clone(),
-            o: object(format!("property-merge-object-{tag}")),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity(format!("property-merge-subject-{tag}")),
+            target_property_iri.clone(),
+            object(format!("property-merge-object-{tag}")),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     tools::memory_assert(
         &graph,
-        AssertArgs {
-            s: entity_iri(subject_iri(&property_fact)?),
-            p: source_property_iri.clone(),
-            o: object_iri(object_result_iri(&property_fact)?),
-            layers: vec![layer_a.clone()],
-            spike: None,
-            contradicts: false,
-        },
+        assert_args(
+            entity_iri(subject_iri(&property_fact)?),
+            source_property_iri.clone(),
+            object_iri(object_result_iri(&property_fact)?),
+            vec![layer_a.clone()],
+        ),
     )
     .await?;
     memory_merge(

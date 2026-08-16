@@ -38,16 +38,18 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - Parameterize user-provided Cypher values. Validate any identifier that must be interpolated, such as labels or relationship types.
 - Every scoped tool requires a validated `layers` array. `[]` means global-only; named layers form an OR union, and visible relationships require visible endpoints. Layer IDs use lowercase kebab-case colon namespaces.
 - Empty record memberships mean global. An exact relationship has one identity across memberships; assertions merge memberships rather than duplicate the relationship.
-- `memory_schema` writes global schema-as-data. It and database-wide `memory_merge` are the only tools without a `layers` input.
+- `memory_schema` writes global schema-as-data or lists the Class/Property catalog with `list=true`. It and database-wide `memory_merge` are the only tools without a `layers` input.
 - `memory_feedback` changes a visible node or current relationship's shared signed weight by exactly `+1` or `-1`. Retrieval never changes weight automatically, weights do not decay, and search uses weight only within the same Spike category.
 - `memory_layers` records state-changing membership audits and must preserve relationship endpoint closure.
 - Retraction is soft: set `validTo`; do not hard-delete nodes or history.
-- Ordinary assertions are set-valued. Reasserting the exact `(subject, property, object)` merges memberships or is a no-op; asserting another object preserves every current value.
+- Ordinary assertions are set-valued `facts[]` (1–20 triples, call-level `layers`). Reasserting the exact `(subject, property, object)` merges memberships or is a no-op; asserting another object preserves every current value. One Episode is recorded if any fact changed; all-noop rolls back with `episode: null`.
 - Corrections are explicit: `memory_replace` moves only the requested memberships off the selected old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in the same transaction.
 - `CONTRADICTS` and `SUPERSEDES` are system-owned. Client commands must not assert, replace, or retract them directly.
 - Keep `CONTRADICTS` multi-valued and idempotent per exact pair.
 - Every state-changing mutation records exactly one `Episode` and associates provenance with the changed records. No-op mutations record none.
-- Preserve the MCP host compatibility rule in `src/server.rs`: advertised input schemas remain plain tagged object schemas and contain no `anyOf` or `oneOf`.
+- Preserve the MCP host compatibility rule in `src/server.rs`: advertised input and output schemas remain plain tagged object schemas and contain no `anyOf`, `oneOf`, or `allOf`.
+- Recoverable tool failures return MCP `isError` structured results (`{ok:false,reason,message}`). Domain validation is not JSON-RPC `-32602`. Protocol errors stay for unknown-tool, unusable-server, and serde of required fields.
+- The 120/min burst-20 token bucket and 45s invoke timeout apply only to MCP `#[tool]` handlers via `Mindreader::invoke`. Never wrap `tools::*` or smoke in the limiter/timeout.
 - Keep the registered tool list synchronized across `src/server.rs`, its tests, `mcp.json`, and the README.
 
 ## Working conventions

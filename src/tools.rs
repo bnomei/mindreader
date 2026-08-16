@@ -13,8 +13,9 @@ use crate::domain::{
 use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, endpoint_json, ensure_property_in_txn,
     fact_text, fetch_all, fetch_all_txn, fetch_one, fetch_one_txn, merge_literal_in_txn,
-    merge_node_in_txn, node_json, path_to_json, rel_json, safe_rel, structural_rel_for, Episode,
-    MergedNode, NodeSpec, FIXED_RELS, MERGE_CANDIDATE_INDEX, MODEL_MARKER_KEY, MODEL_VERSION,
+    merge_node_in_txn, node_json, path_to_json, rel_json, safe_label, safe_rel, structural_rel_for,
+    Episode, MergedNode, NodeSpec, FIXED_RELS, MERGE_CANDIDATE_INDEX, MODEL_MARKER_KEY,
+    MODEL_VERSION,
 };
 #[cfg(test)]
 use crate::graph::{spike_label, spike_rank};
@@ -49,6 +50,7 @@ const FACT_LOCK_SCOPE: &str = "@fact";
 const LAYERS_PROPERTY: &str = "mindreader:property/layers";
 const PREDICATE_USAGE_PROPERTY: &str = "mindreader:property/predicate-usage";
 const CONTRADICTS_PROPERTY: &str = "mindreader:property/CONTRADICTS";
+const MAX_ASSERT_FACTS: usize = 20;
 
 fn assert_fact_lock_requests(
     subject_iri: &str,
@@ -147,6 +149,72 @@ fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
         .collect())
 }
 
+fn validate_assert_args(args: &AssertArgs) -> Result<()> {
+    if args.facts.is_empty() || args.facts.len() > MAX_ASSERT_FACTS {
+        return Err(DomainError::InvalidInput(format!(
+            "memory_assert facts must contain between 1 and {MAX_ASSERT_FACTS} items"
+        ))
+        .into());
+    }
+    Ok(())
+}
+
+fn schema_write_fields_present(args: &SchemaArgs) -> bool {
+    args.name.is_some()
+        || args.iri.is_some()
+        || args.sub_class_of.is_some()
+        || args.sub_property_of.is_some()
+        || args.domain.is_some()
+        || args.range.is_some()
+}
+
+fn validate_schema_list_args(args: &SchemaArgs) -> Result<()> {
+    if args.list && schema_write_fields_present(args) {
+        return Err(DomainError::InvalidInput(
+            "memory_schema list=true cannot be combined with write fields".into(),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn prepare_assert_fact(fact: AssertFact) -> Result<PreparedAssertFact> {
+    let predicate = PredicateRef::parse(&fact.p)?;
+    reject_system_owned_predicate(predicate.iri())?;
+    let spike = SpikeRank::parse(fact.spike)?.map(|rank| rank.as_str().to_string());
+    let mut subject_spec = node_spec(EntityRef::from_input(fact.s)?);
+    if let Some(spike) = &spike {
+        if !subject_spec.labels.contains(spike) {
+            subject_spec.labels.push(spike.clone());
+        }
+    }
+    let subject_kind = spike
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_else(|| "element".into());
+    let subject_iri = EntityRef {
+        iri: subject_spec.iri.clone(),
+        name: subject_spec.name.clone(),
+        labels: subject_spec.labels.clone(),
+    }
+    .resolved_iri(&subject_kind);
+    let object_value = ObjectValue::from_input(fact.o)?;
+    let object_iri = object_value.resolved_iri();
+    let prop_iri = predicate.iri().to_string();
+    let structural = structural_rel_for(&prop_iri);
+    Ok(PreparedAssertFact {
+        subject_spec,
+        subject_kind,
+        subject_iri,
+        object_value,
+        object_iri,
+        prop_iri,
+        structural,
+        spike,
+        contradicts: fact.contradicts,
+    })
+}
+
 fn merge_memberships(current: &[String], incoming: &[String]) -> Vec<String> {
     if current.is_empty() || incoming.is_empty() {
         return Vec::new();
@@ -229,17 +297,37 @@ pub struct TraverseArgs {
     pub limit: Option<u32>,
 }
 
-/// Arguments for set-valued triple assertion (membership merge, optional Spike/CONTRADICTS).
+/// One set-valued triple inside a `memory_assert` call (`facts[]`).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct AssertArgs {
+#[serde(deny_unknown_fields)]
+pub struct AssertFact {
     pub s: EntityInput,
     pub p: String,
     pub o: ObjectInput,
-    pub layers: Vec<String>,
     #[serde(default)]
     pub spike: Option<String>,
     #[serde(default)]
     pub contradicts: bool,
+}
+
+/// Arguments for batched set-valued assertion (membership merge, optional Spike/CONTRADICTS).
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AssertArgs {
+    pub facts: Vec<AssertFact>,
+    pub layers: Vec<String>,
+}
+
+struct PreparedAssertFact {
+    subject_spec: NodeSpec,
+    subject_kind: String,
+    subject_iri: String,
+    object_value: ObjectValue,
+    object_iri: String,
+    prop_iri: String,
+    structural: Option<String>,
+    spike: Option<String>,
+    contradicts: bool,
 }
 
 /// Arguments for explicit fact correction with atomic SUPERSEDES history.
@@ -304,8 +392,8 @@ pub struct LayersArgs {
     pub remove: Vec<String>,
 }
 
-/// Arguments for global schema-as-data class or property declaration.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+/// Arguments for global schema-as-data class or property declaration, or catalog listing.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct SchemaArgs {
     pub kind: String,
     #[serde(default)]
@@ -320,6 +408,8 @@ pub struct SchemaArgs {
     pub domain: Option<String>,
     #[serde(default)]
     pub range: Option<String>,
+    #[serde(default)]
+    pub list: bool,
 }
 
 fn node_spec(entity: EntityRef) -> NodeSpec {
@@ -1266,7 +1356,7 @@ async fn ensure_contradictions_txn(
     Ok(changed)
 }
 
-/// Assert one exact set-valued triple, merging memberships on reassert; no-ops record no Episode.
+/// Assert one or more exact set-valued triples; one Episode if any fact changed.
 pub async fn memory_assert(graph: &Graph, args: AssertArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_assert_once(graph, args.clone()).await {
@@ -1280,141 +1370,46 @@ pub async fn memory_assert(graph: &Graph, args: AssertArgs) -> Result<Value> {
 }
 
 async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
+    validate_assert_args(&args)?;
     let layers = normalize_layers(args.layers)?;
-    let predicate = PredicateRef::parse(&args.p)?;
-    reject_system_owned_predicate(predicate.iri())?;
-    let spike = SpikeRank::parse(args.spike)?.map(|rank| rank.as_str().to_string());
-    let mut subject_spec = node_spec(EntityRef::from_input(args.s)?);
-    if let Some(spike) = &spike {
-        if !subject_spec.labels.contains(spike) {
-            subject_spec.labels.push(spike.clone());
-        }
+    let prepared = args
+        .facts
+        .into_iter()
+        .map(prepare_assert_fact)
+        .collect::<Result<Vec<_>>>()?;
+    let mut locks = Vec::new();
+    for fact in &prepared {
+        locks.extend(assert_fact_lock_requests(
+            &fact.subject_iri,
+            &fact.prop_iri,
+            &fact.object_iri,
+            fact.contradicts,
+        ));
     }
-    let subject_kind = spike
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| "element".into());
-    let subject_iri = EntityRef {
-        iri: subject_spec.iri.clone(),
-        name: subject_spec.name.clone(),
-        labels: subject_spec.labels.clone(),
-    }
-    .resolved_iri(&subject_kind);
-    let object_value = ObjectValue::from_input(args.o)?;
-    let object_iri = object_value.resolved_iri();
-    let prop_iri = predicate.iri().to_string();
-    let structural = structural_rel_for(&prop_iri);
-    let locks = assert_fact_lock_requests(&subject_iri, &prop_iri, &object_iri, args.contradicts);
     let mut txn = graph.start_txn().await?;
     let write = async {
         acquire_fact_locks_in_txn(&mut txn, &locks).await?;
-        let subject = merge_node_in_txn(
-            &mut txn,
-            &subject_spec,
-            &subject_kind,
-            &spike.clone().into_iter().collect::<Vec<_>>(),
-        )
-        .await?;
-        let (object, object_is_literal) = merge_object_in_txn(&mut txn, object_value).await?;
-        let (_, property_created, property) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
         let episode = create_episode_in_txn(&mut txn, "memory_assert", None).await?;
-        let mut changed = property_created;
-        changed |= apply_node_memberships_txn(&mut txn, &subject, &layers).await?;
-        changed |= apply_node_memberships_txn(&mut txn, &object, &layers).await?;
-        let fact_text_value = fact_text(&subject.name, &subject.iri, &prop_iri, &object);
-        let (relationship_iri, relationship_changed) = ensure_relation_txn(
-            &mut txn,
-            &RelationWrite {
-                rel_type: structural.as_deref().unwrap_or("ASSERTS"),
-                s: &subject.iri,
-                o: &object.iri,
-                prop_iri: &prop_iri,
-                layers: &layers,
-                episode: &episode,
-                reason: None,
-                fact_text: &fact_text_value,
-            },
-        )
-        .await?;
-        changed |= relationship_changed;
-        let need_about = spike.is_some()
-            && !object_is_literal
-            && object.labels.iter().any(|label| label == "Element")
-            && structural.as_deref() != Some("ABOUT");
-        if need_about {
-            let about_text = fact_text(
-                &subject.name,
-                &subject.iri,
-                "mindreader:property/ABOUT",
-                &object,
-            );
-            let (_, about_changed) = ensure_relation_txn(
-                &mut txn,
-                &RelationWrite {
-                    rel_type: "ABOUT",
-                    s: &subject.iri,
-                    o: &object.iri,
-                    prop_iri: "mindreader:property/ABOUT",
-                    layers: &layers,
-                    episode: &episode,
-                    reason: None,
-                    fact_text: &about_text,
-                },
-            )
-            .await?;
-            changed |= about_changed;
-        }
-        let conflicts = find_conflicts_txn(
-            &mut txn,
-            &subject.iri,
-            &prop_iri,
-            structural.as_deref(),
-            &object.iri,
-            &layers,
-        )
-        .await?;
-        if args.contradicts {
-            changed |=
-                ensure_contradictions_txn(&mut txn, &object.iri, &conflicts, &layers, &episode)
-                    .await?;
-        }
-        let subject_json = refreshed_node_json_txn(&mut txn, &subject.iri).await?;
-        let object_json = refreshed_node_json_txn(&mut txn, &object.iri).await?;
+        let mut any_changed = false;
         let mut created_iris = Vec::new();
-        if subject.created {
-            created_iris.push(subject.iri.clone());
+        let mut items = Vec::with_capacity(prepared.len());
+        for fact in prepared {
+            let item = assert_prepared_fact_txn(&mut txn, fact, &layers, &episode).await?;
+            any_changed |= !item.noop;
+            created_iris.extend(item.created_iris);
+            items.push(item.json);
         }
-        if object.created && !object_is_literal {
-            created_iris.push(object.iri.clone());
-        }
-        if property_created {
-            created_iris.push(prop_iri.clone());
-        }
-        let merge_suggestions = merge_suggestions_in_txn(&mut txn, &created_iris, &layers).await?;
-        Ok::<_, Error>((
-            changed,
-            episode,
-            subject_json,
-            object_json,
-            property_created,
-            property,
-            conflicts,
-            relationship_iri,
-            merge_suggestions,
-        ))
+        let merge_suggestions = if any_changed {
+            created_iris.sort();
+            created_iris.dedup();
+            merge_suggestions_in_txn(&mut txn, &created_iris, &layers).await?
+        } else {
+            Vec::new()
+        };
+        Ok::<_, Error>((any_changed, episode, items, merge_suggestions))
     }
     .await;
-    let (
-        changed,
-        episode,
-        subject,
-        object,
-        property_created,
-        property,
-        conflicts,
-        relationship_iri,
-        merge_suggestions,
-    ) = match write {
+    let (changed, episode, items, merge_suggestions) = match write {
         Ok(value) => {
             if value.0 {
                 txn.commit()
@@ -1432,18 +1427,123 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
     };
     Ok(json!({
         "noop": !changed,
-        "s": subject,
-        "p": prop_iri,
-        "o": object,
-        "relationship": { "iri": relationship_iri },
         "layers": layers,
-        "episode": if changed { json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool }) } else { Value::Null },
-        "propertyStub": property_created,
-        "property": property,
-        "spike": spike,
-        "conflicts": conflicts,
+        "episode": if changed {
+            json!({ "iri": episode.iri, "at": episode.at, "tool": episode.tool })
+        } else {
+            Value::Null
+        },
         "mergeSuggestions": merge_suggestions,
+        "facts": items,
     }))
+}
+
+struct PreparedFactResult {
+    noop: bool,
+    json: Value,
+    created_iris: Vec<String>,
+}
+
+async fn assert_prepared_fact_txn(
+    txn: &mut Txn,
+    fact: PreparedAssertFact,
+    layers: &[String],
+    episode: &Episode,
+) -> Result<PreparedFactResult> {
+    let subject = merge_node_in_txn(
+        txn,
+        &fact.subject_spec,
+        &fact.subject_kind,
+        &fact.spike.clone().into_iter().collect::<Vec<_>>(),
+    )
+    .await?;
+    let (object, object_is_literal) = merge_object_in_txn(txn, fact.object_value).await?;
+    let (_, property_created, property) = ensure_property_in_txn(txn, &fact.prop_iri).await?;
+    let mut changed = property_created;
+    changed |= apply_node_memberships_txn(txn, &subject, layers).await?;
+    changed |= apply_node_memberships_txn(txn, &object, layers).await?;
+    let fact_text_value = fact_text(&subject.name, &subject.iri, &fact.prop_iri, &object);
+    let (relationship_iri, relationship_changed) = ensure_relation_txn(
+        txn,
+        &RelationWrite {
+            rel_type: fact.structural.as_deref().unwrap_or("ASSERTS"),
+            s: &subject.iri,
+            o: &object.iri,
+            prop_iri: &fact.prop_iri,
+            layers,
+            episode,
+            reason: None,
+            fact_text: &fact_text_value,
+        },
+    )
+    .await?;
+    changed |= relationship_changed;
+    let need_about = fact.spike.is_some()
+        && !object_is_literal
+        && object.labels.iter().any(|label| label == "Element")
+        && fact.structural.as_deref() != Some("ABOUT");
+    if need_about {
+        let about_text = fact_text(
+            &subject.name,
+            &subject.iri,
+            "mindreader:property/ABOUT",
+            &object,
+        );
+        let (_, about_changed) = ensure_relation_txn(
+            txn,
+            &RelationWrite {
+                rel_type: "ABOUT",
+                s: &subject.iri,
+                o: &object.iri,
+                prop_iri: "mindreader:property/ABOUT",
+                layers,
+                episode,
+                reason: None,
+                fact_text: &about_text,
+            },
+        )
+        .await?;
+        changed |= about_changed;
+    }
+    let conflicts = find_conflicts_txn(
+        txn,
+        &subject.iri,
+        &fact.prop_iri,
+        fact.structural.as_deref(),
+        &object.iri,
+        layers,
+    )
+    .await?;
+    if fact.contradicts {
+        changed |= ensure_contradictions_txn(txn, &object.iri, &conflicts, layers, episode).await?;
+    }
+    let subject_json = refreshed_node_json_txn(txn, &subject.iri).await?;
+    let object_json = refreshed_node_json_txn(txn, &object.iri).await?;
+    let mut created_iris = Vec::new();
+    if subject.created {
+        created_iris.push(subject.iri.clone());
+    }
+    if object.created && !object_is_literal {
+        created_iris.push(object.iri.clone());
+    }
+    if property_created {
+        created_iris.push(fact.prop_iri.clone());
+    }
+    Ok(PreparedFactResult {
+        noop: !changed,
+        json: json!({
+            "noop": !changed,
+            "s": subject_json,
+            "p": fact.prop_iri,
+            "o": object_json,
+            "relationship": { "kind": "relationship", "iri": relationship_iri },
+            "propertyStub": property_created,
+            "property": property,
+            "spike": fact.spike,
+            "conflicts": conflicts,
+        }),
+        created_iris,
+    })
 }
 
 async fn change_fact_memberships_txn(
@@ -2292,8 +2392,11 @@ async fn memory_layers_once(graph: &Graph, args: LayersArgs) -> Result<Value> {
     }))
 }
 
-/// Write global RDFS class or property schema-as-data (no `layers` input).
+/// Write global RDFS class or property schema-as-data, or list the catalog (no `layers` input).
 pub async fn memory_schema(graph: &Graph, args: SchemaArgs) -> Result<Value> {
+    if args.list {
+        return memory_schema_list(graph, args).await;
+    }
     for attempt in 0..3_u64 {
         match memory_schema_once(graph, args.clone()).await {
             Err(error) if attempt < 2 && is_transient_neo4j_error(&error) => {
@@ -2303,6 +2406,40 @@ pub async fn memory_schema(graph: &Graph, args: SchemaArgs) -> Result<Value> {
         }
     }
     unreachable!("bounded retry loop always returns")
+}
+
+async fn memory_schema_list(graph: &Graph, args: SchemaArgs) -> Result<Value> {
+    validate_schema_list_args(&args)?;
+    let kind = args.kind.trim().to_ascii_lowercase();
+    if kind != "class" && kind != "property" {
+        return Err(DomainError::InvalidInput("kind must be class or property".into()).into());
+    }
+    let label = safe_label(if kind == "class" { "Class" } else { "Property" })?;
+    let cypher = format!(
+        "MATCH (n:Entity:{label}) \
+         RETURN n.iri AS iri, n.name AS name, coalesce(n.stub, false) AS stub \
+         ORDER BY n.name, n.iri \
+         LIMIT 100"
+    );
+    let items = fetch_all(graph, query(&cypher))
+        .await?
+        .into_iter()
+        .map(|row| {
+            Ok(json!({
+                "kind": kind,
+                "iri": row.get::<String>("iri")?,
+                "name": row.get::<String>("name").ok(),
+                "stub": row.get::<bool>("stub").unwrap_or(false),
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "list": true,
+        "kind": kind,
+        "items": items,
+        "noop": true,
+        "episode": Value::Null,
+    }))
 }
 
 async fn memory_schema_once(graph: &Graph, args: SchemaArgs) -> Result<Value> {
@@ -2641,29 +2778,19 @@ pub async fn count_current_contradicts(graph: &Graph, from: &str, to: &str) -> R
     Ok(row.and_then(|row| row.get::<i64>("n").ok()).unwrap_or(0))
 }
 
-/// Map application errors to MCP: domain → invalid params, others → internal error.
-pub fn map_tool_error(err: Error) -> rmcp::model::ErrorData {
-    use rmcp::model::ErrorData as McpError;
-    if let Error::Domain(domain) = &err {
-        let reason = match domain {
-            DomainError::InvalidInput(_) => "invalid_input",
-            DomainError::Precondition(_) => "precondition_failed",
-        };
-        return McpError::invalid_params(domain.to_string(), Some(json!({ "reason": reason })));
-    }
-    McpError::internal_error(err.to_string(), None)
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        assert_fact_lock_requests, effective_weight, map_tool_error, merge_memberships,
-        plan_fact_membership_changes, reject_system_owned_predicate, remove_memberships,
-        replace_fact_lock_requests, retract_fact_lock_requests, CurrentFact, FactMembershipChange,
-        CONTRADICTS_PROPERTY, LAYERS_PROPERTY, PREDICATE_USAGE_PROPERTY,
+        assert_fact_lock_requests, effective_weight, merge_memberships,
+        plan_fact_membership_changes, prepare_assert_fact, reject_system_owned_predicate,
+        remove_memberships, replace_fact_lock_requests, retract_fact_lock_requests,
+        schema_write_fields_present, validate_assert_args, validate_schema_list_args, AssertArgs,
+        AssertFact, CurrentFact, FactMembershipChange, SchemaArgs, TargetArgs,
+        CONTRADICTS_PROPERTY, LAYERS_PROPERTY, MAX_ASSERT_FACTS, PREDICATE_USAGE_PROPERTY,
     };
-    use crate::domain::DomainError;
-    use crate::graph::spike_rank;
+    use crate::domain::{DomainError, EntityInput, ObjectInput};
+    use crate::error::Error;
+    use crate::graph::{fact_lock_specs, spike_rank};
 
     #[test]
     fn spike_rank_order() {
@@ -2803,12 +2930,136 @@ mod tests {
     }
 
     #[test]
-    fn domain_errors_are_mcp_invalid_params() {
-        let error = map_tool_error(DomainError::Precondition("missing old fact".into()).into());
-        assert_eq!(error.code.0, -32602);
+    fn assert_facts_reject_empty_and_over_max() {
+        let empty = AssertArgs {
+            facts: Vec::new(),
+            layers: Vec::new(),
+        };
+        let over = AssertArgs {
+            facts: (0..=MAX_ASSERT_FACTS)
+                .map(|index| AssertFact {
+                    s: EntityInput {
+                        kind: "entity".into(),
+                        iri: None,
+                        name: Some(format!("s{index}")),
+                        labels: vec!["Element".into()],
+                    },
+                    p: "worksOn".into(),
+                    o: ObjectInput {
+                        kind: "entity".into(),
+                        iri: None,
+                        name: Some(format!("o{index}")),
+                        labels: vec!["Element".into()],
+                        value: None,
+                        datatype: None,
+                    },
+                    spike: None,
+                    contradicts: false,
+                })
+                .collect(),
+            layers: Vec::new(),
+        };
+        assert!(matches!(
+            validate_assert_args(&empty),
+            Err(Error::Domain(DomainError::InvalidInput(_)))
+        ));
+        assert!(matches!(
+            validate_assert_args(&over),
+            Err(Error::Domain(DomainError::InvalidInput(_)))
+        ));
+        let one = AssertArgs {
+            facts: vec![over.facts[0].clone()],
+            layers: Vec::new(),
+        };
+        assert!(validate_assert_args(&one).is_ok());
+    }
+
+    #[test]
+    fn schema_list_true_rejects_write_fields() {
+        let listed = SchemaArgs {
+            kind: "class".into(),
+            list: true,
+            name: Some("Agent".into()),
+            ..SchemaArgs::default()
+        };
+        assert!(schema_write_fields_present(&listed));
+        assert!(matches!(
+            validate_schema_list_args(&listed),
+            Err(Error::Domain(DomainError::InvalidInput(_)))
+        ));
+        let catalog = SchemaArgs {
+            kind: "class".into(),
+            list: true,
+            ..SchemaArgs::default()
+        };
+        assert!(validate_schema_list_args(&catalog).is_ok());
+    }
+
+    #[test]
+    fn assert_fact_lock_union_bounds_at_max_facts() {
+        let mut locks = Vec::new();
+        for index in 0..MAX_ASSERT_FACTS {
+            let fact = prepare_assert_fact(AssertFact {
+                s: EntityInput {
+                    kind: "entity".into(),
+                    iri: Some(format!("mindreader:element/s{index}")),
+                    name: None,
+                    labels: vec!["Element".into()],
+                },
+                p: format!("prop{index}"),
+                o: ObjectInput {
+                    kind: "entity".into(),
+                    iri: Some(format!("mindreader:element/o{index}")),
+                    name: None,
+                    labels: vec!["Element".into()],
+                    value: None,
+                    datatype: None,
+                },
+                spike: None,
+                contradicts: true,
+            })
+            .expect("unique contradict facts prepare");
+            locks.extend(assert_fact_lock_requests(
+                &fact.subject_iri,
+                &fact.prop_iri,
+                &fact.object_iri,
+                fact.contradicts,
+            ));
+        }
+        assert_eq!(locks.len(), 100);
+        let expanded = fact_lock_specs(&locks);
         assert_eq!(
-            error.data.and_then(|data| data.get("reason").cloned()),
-            Some(serde_json::json!("precondition_failed"))
+            expanded.len(),
+            160,
+            "20 unique contradict facts expand to 160 fact-lock rows, not the unexpanded 100"
         );
+    }
+
+    #[test]
+    fn target_args_deserialize_from_serializers() {
+        let node = serde_json::json!({
+            "kind": "node",
+            "iri": "mindreader:element/alice",
+            "name": "Alice",
+            "labels": ["Element"],
+            "layers": ["project:x"],
+            "weight": 0
+        });
+        let rel = serde_json::json!({
+            "kind": "relationship",
+            "iri": "mindreader:relationship/abc",
+            "type": "ASSERTS",
+            "from": "mindreader:element/alice",
+            "to": "mindreader:element/mindreader",
+            "propertyIri": "mindreader:property/worksOn",
+            "layers": ["project:x"],
+            "weight": 0
+        });
+        let node_target: TargetArgs = serde_json::from_value(node).unwrap();
+        let rel_target: TargetArgs = serde_json::from_value(rel).unwrap();
+        assert_eq!(node_target.kind, "node");
+        assert_eq!(node_target.iri, "mindreader:element/alice");
+        assert_eq!(rel_target.kind, "relationship");
+        assert_eq!(rel_target.iri, "mindreader:relationship/abc");
     }
 }

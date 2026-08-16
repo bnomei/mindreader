@@ -342,7 +342,14 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     )
     .await?;
     consolidate_current_duplicates(txn, target_iri, property_merge, &episode).await?;
-    Ok(node_json(&merged_node))
+    Ok(json!({
+        "node": node_json(&merged_node),
+        "episode": {
+            "iri": episode.iri,
+            "at": episode.at,
+            "tool": episode.tool,
+        },
+    }))
 }
 
 fn canonical_kinds(node: &Node) -> BTreeSet<String> {

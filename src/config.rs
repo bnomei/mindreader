@@ -331,6 +331,18 @@ impl Config {
         self.config_dir.join(SECRETS_FILE)
     }
 
+    #[cfg(test)]
+    pub(crate) fn stub() -> Self {
+        Self {
+            uri: "bolt://127.0.0.1:7687".into(),
+            user: "neo4j".into(),
+            password: Some("test".into()),
+            semantic: SemanticConfig::default(),
+            embedding: None,
+            config_dir: PathBuf::from("/tmp/mindreader-test"),
+        }
+    }
+
     /// Require `NEO4J_PASSWORD` from secrets or the process environment.
     pub fn neo4j_password(&self) -> Result<&str> {
         self.password.as_deref().ok_or_else(|| {

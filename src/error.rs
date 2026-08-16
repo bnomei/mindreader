@@ -3,8 +3,9 @@
 //! Failures preserve a source chain for diagnostics while exposing stable
 //! variants for configuration, domain validation, Neo4j, embeddings, and
 //! concurrent mutation. Transient Neo4j errors are classified for bounded
-//! retries; MCP maps domain errors to invalid params and everything else to
-//! internal errors.
+//! retries. The MCP adapter maps recoverable application failures to
+//! `CallToolResult` structured errors (`isError` with `{ok:false,reason,message}`);
+//! domain validation is not JSON-RPC `-32602`.
 
 use crate::domain::DomainError;
 use neo4rs::{Error as Neo4jError, Neo4jErrorKind};
