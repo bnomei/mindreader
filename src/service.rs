@@ -54,6 +54,7 @@ impl MemoryService {
         validate_recall_args(&args)?;
         let scope = args.scope.clone();
         let detail = crate::payload::Detail::parse(args.detail.as_deref())?;
+        let has_iris = args.iris.is_some();
         let result = if let Some(history) = args
             .history
             .as_deref()
@@ -149,6 +150,10 @@ impl MemoryService {
             )
             .await?
         };
+        let mut result = result;
+        if has_iris && detail == crate::payload::Detail::Concise {
+            crate::payload::omit_iris_top_level_facts(&mut result);
+        }
         Ok(crate::payload::finish_recall(result, &scope, detail))
     }
 

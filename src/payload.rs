@@ -318,6 +318,12 @@ fn apply_detail(result: &mut Value, detail: Detail) {
         }
     }
     result["about"] = json!([]);
+    result["paths"] = json!([]);
+}
+
+/// Drop top-level iris hops=1 `facts[]` for concise recall; keep lookup facts.
+pub fn omit_iris_top_level_facts(result: &mut Value) {
+    result["facts"] = json!([]);
 }
 
 /// Decorate a closed-world or semantic recall result and attach `handles`.
@@ -394,7 +400,8 @@ pub fn unify_review_item(
 #[cfg(test)]
 mod tests {
     use super::{
-        decorate_fact, finish_recall, handles_bag, nodes_from_facts, record_mutable, Detail,
+        decorate_fact, finish_recall, handles_bag, nodes_from_facts, omit_iris_top_level_facts,
+        record_mutable, Detail,
     };
     use serde_json::json;
 
@@ -460,9 +467,21 @@ mod tests {
         );
         assert_eq!(result["detail"], "concise");
         assert!(result["about"].as_array().unwrap().is_empty());
+        assert!(result["paths"].as_array().unwrap().is_empty());
         assert_eq!(result["facts"][0]["mutable"], true);
         assert_eq!(result["facts"][0]["rateable"], true);
         assert!(result["facts"][0].get("score").is_none());
+    }
+
+    #[test]
+    fn omit_iris_top_level_facts_keeps_lookups() {
+        let mut result = json!({
+            "facts": [{"target":{"kind":"fact","iri":"mindreader:relationship/a"}}],
+            "lookups": [{"iri":"mindreader:element/a","facts":[{"target":{"kind":"fact","iri":"mindreader:relationship/a"}}]}]
+        });
+        omit_iris_top_level_facts(&mut result);
+        assert!(result["facts"].as_array().unwrap().is_empty());
+        assert_eq!(result["lookups"][0]["facts"].as_array().unwrap().len(), 1);
     }
 
     #[test]

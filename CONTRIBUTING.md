@@ -3,13 +3,13 @@
 ## Development
 
 1. Copy `.env.example` to `.env` and set `NEO4J_PASSWORD`.
-2. Start Neo4j (`docker compose up -d neo4j`) or use an existing instance.
+2. Start the isolated tools Neo4j (`docker compose --profile tools up -d neo4j-tools`) or use an existing disposable instance. Do not run smoke or bench against a live MCP database on port 7687.
 3. Run:
    - `cargo fmt --all -- --check`
    - `cargo clippy --locked --all-targets --all-features -- -D warnings`
    - `cargo test --locked --all-targets --all-features`
    - `npm test --prefix npm/mindreader`
-   - `cargo run --features developer-tools --bin mindreader-smoke` (when Neo4j is available)
+   - `cargo run --features developer-tools --bin mindreader-smoke -- --config-dir packaging/tools-config` (when the tools Neo4j is available)
 
 ## Graph model versioning
 

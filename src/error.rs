@@ -51,6 +51,8 @@ pub enum Error {
     #[error("{0}")]
     Embedding(String),
     #[error("{0}")]
+    EmbeddingSpace(String),
+    #[error("{0}")]
     Graph(String),
     #[error("{0}")]
     Operation(String),

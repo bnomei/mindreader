@@ -3,10 +3,16 @@
 All notable changes to Mindreader are documented here. The format follows Keep a Changelog, and
 versions follow Semantic Versioning.
 
-## [Unreleased]
+## [0.5.0] - 2026-08-16
 
 ### Changed
 
+- Name-only `spike` writes mint `mindreader:element/<slug>` and keep the spike as an extra label instead of minting `mindreader:knowledge/<slug>`.
+- Set-valued writes keep `review.alternatives` from sibling values and leave `facts[].conflicts` empty unless `contradicts` is true.
+- Advisory unify suggestions require similarity ≥ 0.85 (Properties ≥ 0.92).
+- `memory_recall.iris` applies `limit` per requested IRI. Concise iris recall keeps top-level `facts[]` empty and clears `paths`.
+- MCP burst limit is 40 tokens (still 120/min and 45s). Semantic space mismatch returns `reason: embedding_space`.
+- Smoke and bench use isolated Neo4j on port 7688 (`docker compose --profile tools` and `packaging/tools-config`) so they cannot rewrite a live MCP embedding space.
 - Batched fuzzy merge-candidate lookup into two set-oriented Neo4j queries instead of two Bolt round trips per newly created entity.
 - Fused embedding finiteness validation with squared-norm accumulation while preserving sequential floating-point order.
 - Renamed the bundled `writing-to-mindreader` skill to `using-mindreader` and expanded it from write guidance into the complete recall, mutation, review, verification, feedback, placement, and unification flow.

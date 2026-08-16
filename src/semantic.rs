@@ -7,11 +7,12 @@
 //! `missing_embedding`. Activations expire and may converge, so this operation
 //! is intentionally not read-only.
 
-use crate::config::{Config, SemanticConfig};
+use crate::config::{Config, EmbeddingSpace, SemanticConfig};
 use crate::domain::DomainError;
 use crate::embeddings::{build_provider, normalize_vector, EmbeddingProvider};
 use crate::graph::{
-    endpoint_json, fact_envelope, fetch_all, fetch_one, rel_json, spike_label, SEMANTIC_INDEX,
+    endpoint_json, fact_envelope, fetch_all, fetch_one, rel_json, require_embedding_space,
+    spike_label, SEMANTIC_INDEX,
 };
 use crate::layers::validate_layer_ids;
 use crate::search::{memory_search, SearchArgs};
@@ -332,6 +333,15 @@ async fn query_activations(
     runtime: &SemanticRuntime,
     embedding: &[f64],
 ) -> Result<Vec<Activation>> {
+    require_embedding_space(
+        graph,
+        &EmbeddingSpace {
+            provider: runtime.provider().into(),
+            model: runtime.model().into(),
+            dimensions: runtime.dimensions(),
+        },
+    )
+    .await?;
     let rows = fetch_all(
         graph,
         query(&format!(
@@ -442,6 +452,15 @@ async fn persist_activation(
     neighbors: &[Activation],
     contributing_activation_ids: &[String],
 ) -> Result<()> {
+    require_embedding_space(
+        graph,
+        &EmbeddingSpace {
+            provider: runtime.provider().into(),
+            model: runtime.model().into(),
+            dimensions: runtime.dimensions(),
+        },
+    )
+    .await?;
     let ttl_ms = runtime
         .config
         .ttl_days

@@ -225,10 +225,8 @@ impl EntityRef {
         if let Some(iri) = &self.iri {
             return iri.clone();
         }
-        let kind = self
-            .labels
-            .iter()
-            .find_map(|label| kind_for_label(label))
+        let kind = crate::iri::identity_kind_from_labels(&self.labels)
+            .and_then(kind_for_label)
             .unwrap_or(fallback_kind);
         mint_iri(
             kind,

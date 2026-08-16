@@ -5,7 +5,7 @@
 //! and `memory_unify` as
 //! plain tagged object schemas (no `anyOf`/`oneOf`/`allOf`). Initialize and
 //! `tools/list` do not wait on Neo4j. Recoverable failures are structured
-//! `isError` results. The 120/min burst-20 limiter and 45s timeout apply only
+//! `isError` results. The 120/min burst-40 limiter and 45s timeout apply only
 //! to `#[tool]` handlers through the process-local invoke path.
 
 use crate::config::Config;
@@ -36,7 +36,7 @@ use tokio::time::timeout;
 
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(45);
 const RATE_LIMIT_PER_MINUTE: f64 = 120.0;
-const RATE_LIMIT_BURST: f64 = 20.0;
+const RATE_LIMIT_BURST: f64 = 40.0;
 
 fn object_schema(value: serde_json::Value) -> Arc<rmcp::model::JsonObject> {
     Arc::new(rmcp::model::object(value))
@@ -458,7 +458,7 @@ impl TokenBucket {
         }
     }
 
-    /// Take one token from the process-local 120/min burst-20 bucket.
+    /// Take one token from the process-local 120/min burst-40 bucket.
     fn try_acquire(&self) -> std::result::Result<(), u64> {
         let mut state = self
             .inner
@@ -520,7 +520,12 @@ impl Mindreader {
             .get_or_try_init(|| async {
                 let g = graph::connect(&self.cfg).await?;
                 let embedding_space = self.cfg.embedding.as_ref().map(|value| value.space());
-                graph::bootstrap(&g, embedding_space.as_ref()).await?;
+                graph::bootstrap(
+                    &g,
+                    embedding_space.as_ref(),
+                    crate::graph::SpaceReplace::Allow,
+                )
+                .await?;
                 MemoryService::new(g, &self.cfg)
             })
             .await?;
@@ -544,7 +549,7 @@ impl Mindreader {
         if let Err(retry_after_ms) = self.limiter.try_acquire() {
             return Ok(structured_error_with_retry_after(
                 "rate_limited",
-                "MCP invoke rate limit exceeded (120/min, burst 20)",
+                "MCP invoke rate limit exceeded (120/min, burst 40)",
                 retry_after_ms,
             ));
         }
@@ -599,9 +604,11 @@ fn structured_error_with_retry_after(
 fn error_retry_metadata(reason: &str) -> (bool, &'static str) {
     match reason {
         "connect_failed" | "rate_limited" | "concurrent_mutation" => (true, "not_applied"),
-        "invalid_input" | "precondition_failed" | "missing_embedding" | "embedding_http" => {
-            (false, "not_applied")
-        }
+        "invalid_input"
+        | "precondition_failed"
+        | "missing_embedding"
+        | "embedding_space"
+        | "embedding_http" => (false, "not_applied"),
         // A timeout or undifferentiated operation failure can include an
         // ambiguous commit. Never encourage an automatic retry.
         "timeout" | "operation" => (false, "unknown"),
@@ -632,6 +639,7 @@ fn classify_tool_error(error: &Error) -> &'static str {
         Error::ConcurrentMutation(_) => "concurrent_mutation",
         // Setup and missing-key failures; HTTP status variants map separately.
         Error::Embedding(_) => "missing_embedding",
+        Error::EmbeddingSpace(_) => "embedding_space",
         Error::EmbeddingHttp { status: 429, .. } => "rate_limited",
         Error::EmbeddingHttp { .. } => "embedding_http",
         Error::Neo4j(_)
@@ -707,7 +715,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             },
             "hops": {
                 "type": "integer",
-                "description": "IRI mode only: return the node alone (0) or include current neighboring facts (1).",
+                "description": "IRI mode only. 0 still returns incident fact handles on lookups[i].facts. 1 also fills top-level facts[] when detail is detailed. Concise iris recall keeps facts[] empty.",
                 "enum": [0, 1],
                 "default": 0
             },
@@ -833,7 +841,7 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
             "scope": scope_schema(),
             "edits": {
                 "type": "array",
-                "description": "Atomic, input-ordered membership edits. Duplicate targets, add/remove overlap, and closure violations reject the whole batch.",
+                "description": "Atomic, input-ordered membership edits. Duplicate targets, add/remove overlap, and closure violations reject the whole batch. Include literal fact endpoints in the same batch as {kind:\"node\", iri}.",
                 "minItems": 1,
                 "maxItems": 20,
                 "items": {
@@ -1047,7 +1055,7 @@ impl Mindreader {
     #[tool(
         name = "memory_recall",
         title = "Recall visible memory",
-        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris (0 still returns incident fact handles on lookups); p and depth apply only to around; history walks current and validTo/SUPERSEDES facts for one node or fact IRI. detail is concise or detailed. Class or Property labels read the global catalog.",
+        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris (0 still returns incident fact handles on lookups[i].facts; 1 also fills top-level facts[] when detail is detailed). p and depth apply only to around; history walks current and validTo/SUPERSEDES facts for one node or fact IRI. detail is concise or detailed. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1143,7 +1151,7 @@ impl Mindreader {
     #[tool(
         name = "memory_place",
         title = "Place layer memberships",
-        description = "Use to atomically change layer memberships for 1–20 unique node or fact targets. scope controls visibility; each edits item supplies add and/or remove. The whole input-ordered batch is validated against its combined final endpoint-closure state, records one Episode if changed, and rolls back fully on failure.",
+        description = "Use to atomically change layer memberships for 1–20 unique node or fact targets. scope controls visibility; each edits item supplies add and/or remove. Include literal fact endpoints in the same batch as {kind:\"node\", iri}. The whole input-ordered batch is validated against its combined final endpoint-closure state, records one Episode if changed, and rolls back fully on failure.",
         input_schema = schema_memory_place(),
         output_schema = schema_out_memory_place(),
         annotations(title = "Place layer memberships", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -1654,6 +1662,18 @@ mod tests {
         let embedding = map_tool_result(Err(Error::Embedding("missing key".into())));
         assert_eq!(reason_of(embedding), "missing_embedding");
 
+        let space = map_tool_result(Err(Error::EmbeddingSpace("dim mismatch".into())));
+        let space_body = space
+            .structured_content
+            .expect("structured embedding_space");
+        assert_eq!(space_body["reason"], "embedding_space");
+        assert_eq!(space_body["retryable"], false);
+        assert_eq!(space_body["outcome"], "not_applied");
+
+        let wrapped_space = map_tool_result(Err(Error::EmbeddingSpace("dim mismatch".into())
+            .context("query semantic activation vector index")));
+        assert_eq!(reason_of(wrapped_space), "embedding_space");
+
         let concurrent = map_tool_result(Err(Error::ConcurrentMutation("fact".into())));
         assert_eq!(reason_of(concurrent), "concurrent_mutation");
 
@@ -1692,10 +1712,18 @@ mod tests {
     #[test]
     fn token_bucket_reports_a_bounded_retry_delay() {
         let limiter = TokenBucket::new();
-        for _ in 0..20 {
+        for _ in 0..40 {
             assert_eq!(limiter.try_acquire(), Ok(()));
         }
         let retry_after_ms = limiter.try_acquire().expect_err("burst is exhausted");
         assert!((1..=500).contains(&retry_after_ms));
+    }
+
+    #[test]
+    fn token_bucket_allows_an_eight_call_sequential_burst() {
+        let limiter = TokenBucket::new();
+        for _ in 0..8 {
+            assert_eq!(limiter.try_acquire(), Ok(()));
+        }
     }
 }

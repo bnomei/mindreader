@@ -9,8 +9,8 @@
 use crate::config::{Config, EmbeddingSpace};
 use crate::domain::literal_iri;
 use crate::iri::{
-    default_lower_for_kind, kind_for_label, kind_from_iri, label_for_kind, mint_iri, name_from_iri,
-    property_iri,
+    default_lower_for_kind, identity_kind_from_labels, kind_for_label, kind_from_iri,
+    label_for_kind, mint_iri, name_from_iri, property_iri, split_camel_case,
 };
 use crate::{
     error::{Context, Error, Result},
@@ -83,6 +83,13 @@ pub const SEMANTIC_INDEX: &str = "semantic_activation_embeddings";
 pub const MERGE_CANDIDATE_INDEX: &str = "merge_candidate_names";
 const EMBEDDING_MARKER_KEY: &str = "embedding";
 
+/// Whether bootstrap may replace an incompatible semantic embedding space.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpaceReplace {
+    Allow,
+    Refuse,
+}
+
 const RESET_REQUIRED: &str = "recreate the Neo4j database or volume before starting Mindreader";
 const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] = &[
     ("wakeup_nodes", "NODE"),
@@ -144,7 +151,11 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
 }
 
 /// Ensure model marker, constraints, indexes, and seed schema for an empty or current database.
-pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Result<()> {
+pub async fn bootstrap(
+    graph: &Graph,
+    embedding: Option<&EmbeddingSpace>,
+    space_replace: SpaceReplace,
+) -> Result<()> {
     ensure_model_marker(graph).await?;
     verify_required_apoc(graph).await?;
 
@@ -181,7 +192,7 @@ pub async fn bootstrap(graph: &Graph, embedding: Option<&EmbeddingSpace>) -> Res
         .context("create required merge_candidate_names full-text index")?;
 
     if let Some(embedding) = embedding {
-        ensure_semantic_index(graph, embedding).await?;
+        ensure_semantic_index(graph, embedding, space_replace).await?;
     }
 
     graph
@@ -312,8 +323,98 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+fn read_embedding_marker(row: &Row) -> Option<(String, String, i64)> {
+    Some((
+        row.get::<String>("provider").ok()?,
+        row.get::<String>("model").ok()?,
+        row.get::<i64>("dimensions").ok()?,
+    ))
+}
+
+fn marker_matches_space(
+    provider: &str,
+    model: &str,
+    dimensions: i64,
+    embedding: &EmbeddingSpace,
+) -> bool {
+    provider == embedding.provider
+        && model == embedding.model
+        && dimensions == embedding.dimensions as i64
+}
+
+/// Whether bootstrap should drop and recreate the activation index for `incoming`.
+pub(crate) fn should_replace_embedding_space(
+    policy: SpaceReplace,
+    current: Option<(&str, &str, i64)>,
+    incoming: &EmbeddingSpace,
+) -> Result<bool> {
+    let Some((provider, model, dimensions)) = current else {
+        return Ok(true);
+    };
+    if marker_matches_space(provider, model, dimensions, incoming) {
+        return Ok(false);
+    }
+    match policy {
+        SpaceReplace::Allow => Ok(true),
+        SpaceReplace::Refuse => Err(Error::EmbeddingSpace(format!(
+            "database embedding space {provider}/{model}/{dimensions} is incompatible with {}/{}/{}; refuse to replace it",
+            incoming.provider, incoming.model, incoming.dimensions
+        ))),
+    }
+}
+
+/// Fail closed when the stored embedding space cannot serve this process.
+pub async fn require_embedding_space(graph: &Graph, embedding: &EmbeddingSpace) -> Result<()> {
+    let marker = fetch_one(
+        graph,
+        query(
+            "MATCH (m:MindreaderMeta {key: $key}) \
+             RETURN m.provider AS provider, m.model AS model, m.dimensions AS dimensions",
+        )
+        .param("key", EMBEDDING_MARKER_KEY),
+    )
+    .await
+    .context("read embedding-space marker")?;
+    let Some((provider, model, dimensions)) = marker.as_ref().and_then(read_embedding_marker)
+    else {
+        return Err(Error::EmbeddingSpace(
+            "semantic activation embedding marker is missing".into(),
+        ));
+    };
+    if !marker_matches_space(&provider, &model, dimensions, embedding) {
+        return Err(Error::EmbeddingSpace(format!(
+            "database embedding space {provider}/{model}/{dimensions} does not match {}/{}/{}",
+            embedding.provider, embedding.model, embedding.dimensions
+        )));
+    }
+    let index = fetch_one(
+        graph,
+        query(
+            "SHOW VECTOR INDEXES YIELD name, state \
+             WHERE name = $name RETURN state",
+        )
+        .param("name", SEMANTIC_INDEX),
+    )
+    .await
+    .context("inspect semantic activation vector index")?;
+    let online = index
+        .as_ref()
+        .and_then(|row| row.get::<String>("state").ok())
+        .is_some_and(|state| state == "ONLINE");
+    if !online {
+        return Err(Error::EmbeddingSpace(format!(
+            "required vector index {SEMANTIC_INDEX} is missing or not online"
+        )));
+    }
+    Ok(())
+}
+
 /// Create or replace the activation vector index; a space change deletes old activations.
-async fn ensure_semantic_index(graph: &Graph, embedding: &EmbeddingSpace) -> Result<()> {
+async fn ensure_semantic_index(
+    graph: &Graph,
+    embedding: &EmbeddingSpace,
+    space_replace: SpaceReplace,
+) -> Result<()> {
     if !(1..=4096).contains(&embedding.dimensions) {
         return Err(graph_error!(
             "embedding dimensions must be between 1 and 4096"
@@ -329,12 +430,15 @@ async fn ensure_semantic_index(graph: &Graph, embedding: &EmbeddingSpace) -> Res
     )
     .await
     .context("read embedding-space marker")?;
-    let matches = marker.as_ref().is_some_and(|row| {
-        row.get::<String>("provider").ok().as_deref() == Some(embedding.provider.as_str())
-            && row.get::<String>("model").ok().as_deref() == Some(embedding.model.as_str())
-            && row.get::<i64>("dimensions").ok() == Some(embedding.dimensions as i64)
-    });
-    if !matches {
+    let current = marker.as_ref().and_then(read_embedding_marker);
+    let replace = should_replace_embedding_space(
+        space_replace,
+        current
+            .as_ref()
+            .map(|(provider, model, dimensions)| (provider.as_str(), model.as_str(), *dimensions)),
+        embedding,
+    )?;
+    if replace {
         graph
             .run(query(&format!("DROP INDEX {SEMANTIC_INDEX} IF EXISTS")))
             .await
@@ -375,9 +479,10 @@ async fn verify_semantic_index(graph: &Graph) -> Result<()> {
     let row = fetch_one(
         graph,
         query(
-            "SHOW VECTOR INDEXES YIELD name, state, entityType, labelsOrTypes, properties \
+            "SHOW VECTOR INDEXES YIELD name, state, entityType, labelsOrTypes, properties, options \
              WHERE name = $name \
-             RETURN state, entityType, labelsOrTypes, properties",
+             RETURN state, entityType, labelsOrTypes, properties, \
+                    toInteger(options.indexConfig.`vector.dimensions`) AS dimensions",
         )
         .param("name", SEMANTIC_INDEX),
     )
@@ -885,16 +990,16 @@ pub(crate) struct FactLockSpec {
     layer: String,
 }
 
-/// Infer mint kind from IRI path, labels, or a caller-supplied fallback.
+/// Infer mint kind from IRI path, identity labels, or a caller-supplied fallback.
 pub fn infer_kind(spec: &NodeSpec, fallback: &str) -> String {
     if let Some(iri) = &spec.iri {
         if let Some(k) = kind_from_iri(iri) {
             return k;
         }
     }
-    for l in &spec.labels {
-        if let Some(k) = kind_for_label(l) {
-            return k.to_string();
+    if let Some(label) = identity_kind_from_labels(&spec.labels) {
+        if let Some(kind) = kind_for_label(label) {
+            return kind.to_string();
         }
     }
     fallback.to_string()
@@ -1214,6 +1319,7 @@ pub async fn get_node(graph: &Graph, iri: &str) -> Result<Option<Node>> {
 pub fn fact_text(s_name: &str, s_iri: &str, prop_iri: &str, o: &MergedNode) -> String {
     let s_part = if !s_name.is_empty() { s_name } else { s_iri };
     let p_part = name_from_iri(prop_iri);
+    let p_split = split_camel_case(&p_part);
     let o_part = o
         .json
         .get("value")
@@ -1227,7 +1333,11 @@ pub fn fact_text(s_name: &str, s_iri: &str, prop_iri: &str, o: &MergedNode) -> S
             }
         })
         .unwrap_or(o.iri.as_str());
-    format!("{s_part} {p_part} {o_part}")
+    if p_split == p_part {
+        format!("{s_part} {p_part} {o_part}")
+    } else {
+        format!("{s_part} {p_part} {o_part} {p_split}")
+    }
 }
 
 /// Compact endpoint JSON for facts: entities expose name/labels; literals expose value/datatype.
@@ -1322,8 +1432,38 @@ pub fn spike_rank(label: Option<&str>) -> i32 {
 mod tests {
     use super::{
         fact_lock_params, fact_lock_specs, lock_key, safe_label, safe_rel, same_string_members,
-        spike_rank, validate_model_version, MODEL_VERSION,
+        should_replace_embedding_space, spike_rank, validate_model_version, SpaceReplace,
+        MODEL_VERSION,
     };
+    use crate::config::EmbeddingSpace;
+
+    #[test]
+    fn should_replace_embedding_space_refuses_mismatch() {
+        let incoming = EmbeddingSpace {
+            provider: "smoke".into(),
+            model: "deterministic".into(),
+            dimensions: 3,
+        };
+        assert!(should_replace_embedding_space(SpaceReplace::Allow, None, &incoming).unwrap());
+        assert!(!should_replace_embedding_space(
+            SpaceReplace::Refuse,
+            Some(("smoke", "deterministic", 3)),
+            &incoming
+        )
+        .unwrap());
+        assert!(should_replace_embedding_space(
+            SpaceReplace::Refuse,
+            Some(("openai", "text-embedding-3-small", 1536)),
+            &incoming
+        )
+        .is_err());
+        assert!(should_replace_embedding_space(
+            SpaceReplace::Allow,
+            Some(("openai", "text-embedding-3-small", 1536)),
+            &incoming
+        )
+        .unwrap());
+    }
 
     #[test]
     fn model_v5_requires_recreating_older_databases() {

@@ -354,7 +354,7 @@ async fn run() -> Result<Value> {
         None => Config::from_env()?,
     };
     let graph = graph::connect(&config).await?;
-    graph::bootstrap(&graph, None).await?;
+    graph::bootstrap(&graph, None, mindreader::graph::SpaceReplace::Refuse).await?;
     let pristine = fetch_one(
         &graph,
         query(

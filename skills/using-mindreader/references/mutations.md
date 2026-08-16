@@ -30,7 +30,7 @@ Subjects and entity objects are `{"kind":"node","iri":"..."}` or `{"kind":"node"
 }
 ```
 
-SPIKE progresses `Signal -> Pattern -> Insight -> Knowledge`: use Signal for raw evidence, Pattern for recurrence, Insight for interpretation, and Knowledge only for a fact worth relying on. Retrieval priority is the reverse. Do not auto-promote. Reuse established Property/Class vocabulary; make one bounded catalog recall only when vocabulary is uncertain.
+SPIKE progresses `Signal -> Pattern -> Insight -> Knowledge`: use Signal for raw evidence, Pattern for recurrence, Insight for interpretation, and Knowledge only for a fact worth relying on. Retrieval priority is the reverse. Do not auto-promote. Name-only subjects stay `mindreader:element/<slug>`; `spike` is an extra label and ranking, not a new IRI kind. Reuse established Property/Class vocabulary; make one bounded catalog recall only when vocabulary is uncertain.
 
 ## Revise or withdraw facts
 
@@ -53,7 +53,7 @@ Use an exact fact target supplied by the caller, retained from an earlier result
 
 Use `mindreader:memory_place` only when membership itself should change. `scope` controls target visibility; each of 1–20 unique edits supplies `add` and/or `remove`.
 
-Final fact memberships must be visible through both endpoints: a global endpoint permits any fact membership; otherwise each endpoint must contain every membership of the fact. Batch related node and fact edits so Mindreader validates their combined final state atomically.
+Final fact memberships must be visible through both endpoints: a global endpoint permits any fact membership; otherwise each endpoint must contain every membership of the fact. Include literal objects in the same batch as `{kind:"node", iri}`. Batch related node and fact edits so Mindreader validates their combined final state atomically.
 
 Removing a target's final named membership stores an empty membership list and makes it global. To move a target between named layers without exposing it globally, add the destination and remove the source in the same edit.
 

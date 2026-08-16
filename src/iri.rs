@@ -122,6 +122,56 @@ pub fn label_for_kind(kind: &str) -> Option<&'static str> {
     })
 }
 
+/// Identity kind from Neo4j labels: Class, Property, or Element wins; otherwise
+/// exactly one Spike label. Used for IRI minting and same-kind unify.
+pub fn identity_kind_from_labels<I, S>(labels: I) -> Option<&'static str>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let labels: Vec<String> = labels
+        .into_iter()
+        .map(|label| label.as_ref().to_string())
+        .collect();
+    if labels.iter().any(|label| label == "Class") {
+        return Some("Class");
+    }
+    if labels.iter().any(|label| label == "Property") {
+        return Some("Property");
+    }
+    if labels.iter().any(|label| label == "Element") {
+        return Some("Element");
+    }
+    let spikes: Vec<&'static str> = labels
+        .iter()
+        .filter_map(|label| match label.as_str() {
+            "Signal" => Some("Signal"),
+            "Pattern" => Some("Pattern"),
+            "Insight" => Some("Insight"),
+            "Knowledge" => Some("Knowledge"),
+            _ => None,
+        })
+        .collect();
+    if spikes.len() == 1 {
+        Some(spikes[0])
+    } else {
+        None
+    }
+}
+
+/// Insert spaces before internal ASCII capitals (`graphModel` → `graph Model`).
+pub fn split_camel_case(text: &str) -> String {
+    let mut out = String::new();
+    let chars: Vec<char> = text.chars().collect();
+    for (index, ch) in chars.iter().enumerate() {
+        if index > 0 && ch.is_ascii_uppercase() && chars[index - 1].is_ascii_lowercase() {
+            out.push(' ');
+        }
+        out.push(*ch);
+    }
+    out
+}
+
 /// Inverse of [`label_for_kind`]: Neo4j label to lowercase kind string.
 pub fn kind_for_label(label: &str) -> Option<&'static str> {
     Some(match label {
@@ -136,4 +186,29 @@ pub fn kind_for_label(label: &str) -> Option<&'static str> {
         "Episode" => "episode",
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{identity_kind_from_labels, split_camel_case};
+
+    #[test]
+    fn identity_kind_from_labels_prefers_element_over_spike() {
+        assert_eq!(
+            identity_kind_from_labels(["Knowledge", "Element"]),
+            Some("Element")
+        );
+        assert_eq!(identity_kind_from_labels(["Class"]), Some("Class"));
+        assert_eq!(identity_kind_from_labels(["Property"]), Some("Property"));
+        assert_eq!(identity_kind_from_labels(["Knowledge"]), Some("Knowledge"));
+        assert_eq!(identity_kind_from_labels(["Insight", "Pattern"]), None);
+        assert_eq!(identity_kind_from_labels(["Literal"]), None);
+    }
+
+    #[test]
+    fn split_camel_case_inserts_spaces() {
+        assert_eq!(split_camel_case("graphModel"), "graph Model");
+        assert_eq!(split_camel_case("rateLimit"), "rate Limit");
+        assert_eq!(split_camel_case("Mindreader"), "Mindreader");
+    }
 }

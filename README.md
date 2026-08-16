@@ -145,10 +145,11 @@ Mindreader does not migrate older graph models. Recreate a disposable local volu
 ### 3. Verify the memory behavior
 
 ```bash
-NEO4J_PASSWORD='<same-password-as-repository-.env>' cargo run --features developer-tools --bin mindreader-smoke
+docker compose --profile tools up -d neo4j-tools
+NEO4J_PASSWORD='<same-password-as-repository-.env>' cargo run --features developer-tools --bin mindreader-smoke -- --config-dir packaging/tools-config
 ```
 
-The smoke process reads secrets from the native Mindreader `.env`, or from its process environment as shown above.
+The smoke process reads secrets from `packaging/tools-config` (Bolt 7688) so it cannot rewrite a live MCP embedding space on 7687. Process `NEO4J_PASSWORD` still wins over the colocated `.env`.
 
 The smoke test creates test graph data and exercises schema creation, dynamic multi-layer visibility, membership merging, scoped replacement and retraction, signed feedback ranking, concurrent feedback, membership auditing, endpoint closure, and stable relationship retrieval. A successful run ends with:
 
@@ -201,7 +202,7 @@ Pin the package version in MCP configuration so the client always starts the sam
   "mcpServers": {
     "mindreader": {
       "command": "npx",
-      "args": ["-y", "@bnomei/mindreader@0.4.0"],
+      "args": ["-y", "@bnomei/mindreader@0.5.0"],
       "env": {
         "NEO4J_PASSWORD": "<NEO4J_PASSWORD>",
         "XAI_API_KEY": "<OPTIONAL_XAI_API_KEY>"
@@ -380,7 +381,7 @@ Both `memory_judge` and `memory_place` accept 1–20 input items, reject duplica
 
 All successful results include `ok:true`. Successful mutations include `noop` and `episode`, and scoped mutations echo `scope`; batch mutations include `summary:{requested,changed,noop}` plus input-ordered `items` with stable indexes, targets, statuses, and operation-specific fields. An all-noop mutation has `noop:true` and `episode:null`.
 
-Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable,outcome}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. `outcome:"not_applied"` confirms no mutation committed. `outcome:"unknown"` means the caller must not assume retrying a non-idempotent mutation is safe. Every scoped tool requires a `scope` array; permanent `memory_unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected.
+Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable,outcome}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. `outcome:"not_applied"` confirms no mutation committed. `outcome:"unknown"` means the caller must not assume retrying a non-idempotent mutation is safe. Every scoped tool requires a `scope` array; permanent `memory_unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers apply a 120/min burst-40 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
@@ -395,7 +396,7 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 
 Successful results include a `handles` bag. Fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. `memory_write` and `memory_revise` return neutral review queues. `review.unify` items use `{kind:"node", iri, name}` on `source` and `target` — the same dialect as `memory_unify`. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
 
-`memory_recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate filtering and deterministic ordering happen before the result limit; the limit is a global fact budget, not a per-path allowance.
+`memory_recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate filtering and deterministic ordering happen before the result limit. `iris` applies `limit` per requested IRI; `around` still uses one fact budget for the walk.
 
 MCP annotations explicitly describe host-facing risk. Ordinary recall is read-only and closed-world. Semantic recall is additive, non-idempotent, and open-world because it contacts the configured provider and maintains activations. Write is additive and idempotent; place is destructive but idempotent; judge is destructive and non-idempotent. Revise, withdraw, and unify use conservative destructive, non-idempotent, closed-world hints. These hints help a host present consent UI, but Mindreader still validates every call.
 
@@ -435,7 +436,7 @@ An exact correction pastes the selected current fact handle and supplies the rep
 
 Withdrawal accepts either one pasteable fact `target`, or a `subject` node IRI with an optional predicate `p`. Subject and predicate slices are intentionally broad. Subject-wide withdrawal still protects structural and system-owned relationships and does not withdraw relationships whose endpoints are Classes or Properties.
 
-`spike` is a commitment level along `Signal → Pattern → Insight → Knowledge`: raw evidence, a recurring observation, an interpretation, then a fact worth relying on. Do not auto-promote. When a spike subject points to an `Element`, Mindreader also maintains an `ABOUT` relationship. Search ranks the reverse (`Knowledge > Insight > Pattern > Signal`), then uses the sum of subject, relationship, and object weights within the same Spike category, then text relevance.
+`spike` is a commitment level along `Signal → Pattern → Insight → Knowledge`: raw evidence, a recurring observation, an interpretation, then a fact worth relying on. Do not auto-promote. Name-only writes mint `mindreader:element/<slug>` and keep the spike as an extra label. When a Spike-kind subject points to an `Element`, Mindreader also maintains an `ABOUT` relationship. Search ranks the reverse (`Knowledge > Insight > Pattern > Signal`), then uses the sum of subject, relationship, and object weights within the same Spike category, then text relevance.
 
 ### Fixed relationship types
 
@@ -528,7 +529,7 @@ Mindreader accepts explicit IRIs or deterministically derives the following IRIs
 | Property | `mindreader:property/<slug>` | Preserved |
 | Element | `mindreader:element/<slug>` | Lowercase |
 | Literal | `mindreader:literal/<slug>-<hash>` | Lowercase |
-| Signal, Pattern, Insight, Knowledge | `mindreader:<kind>/<slug>` | Lowercase |
+| Signal, Pattern, Insight, Knowledge | existing `mindreader:<kind>/<slug>` IRIs | Lowercase |
 
 Slug normalization keeps ASCII letters, numbers, `.`, `_`, and `-`; replaces other runs with `-`; trims surrounding dashes; and falls back to `unnamed`. Literal identity includes its datatype and value.
 
@@ -645,15 +646,16 @@ cargo test --all-targets --all-features
 Run the live integration smoke test when Neo4j is available:
 
 ```bash
-cargo run --features developer-tools --bin mindreader-smoke
+docker compose --profile tools up -d neo4j-tools
+cargo run --features developer-tools --bin mindreader-smoke -- --config-dir packaging/tools-config
 ```
 
-Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and `.env` instead of the operator's normal configuration directory. The smoke test writes persistent fixtures to the configured Neo4j database and does not clean them up. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for graph model versioning and release expectations.
+Pass `--config-dir PATH` after `--` to use an isolated native `config.toml` and `.env` instead of the operator's normal configuration directory. The smoke test writes persistent fixtures to the configured Neo4j database and does not clean them up. Do not run smoke or bench against a live MCP database on port 7687. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for graph model versioning and release expectations.
 
 Run the release-mode graph benchmark against a disposable database before changing search, logical locks, or merge-candidate generation:
 
 ```bash
-cargo run --release --features developer-tools --bin mindreader-bench -- --config-dir PATH --entities 10000 --samples 30
+cargo run --release --features developer-tools --bin mindreader-bench -- --config-dir packaging/tools-config --entities 10000 --samples 30
 ```
 
 The benchmark refuses any database that is not pristine after model-v5 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions at 1/4/20 newly created entities. Never point it at production or a database whose contents must be preserved.

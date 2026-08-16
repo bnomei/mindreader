@@ -184,16 +184,8 @@ fn prepare_assert_fact(fact: AssertFact) -> Result<PreparedAssertFact> {
     let predicate = PredicateRef::parse(&fact.p)?;
     reject_system_owned_predicate(predicate.iri())?;
     let spike = SpikeRank::parse(fact.spike)?.map(|rank| rank.as_str().to_string());
-    let mut subject_spec = node_spec(EntityRef::from_input(fact.s)?);
-    if let Some(spike) = &spike {
-        if !subject_spec.labels.contains(spike) {
-            subject_spec.labels.push(spike.clone());
-        }
-    }
-    let subject_kind = spike
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| "element".into());
+    let subject_spec = node_spec(EntityRef::from_input(fact.s)?);
+    let subject_kind = "element".to_string();
     let subject_iri = EntityRef {
         iri: subject_spec.iri.clone(),
         name: subject_spec.name.clone(),
@@ -1213,7 +1205,8 @@ pub async fn memory_stats(graph: &Graph, args: StatsArgs) -> Result<Value> {
         graph,
         query(
             "SHOW INDEXES YIELD name, state WHERE name IN \
-             ['wakeup_nodes', 'wakeup_facts', 'merge_candidate_names'] RETURN name, state",
+             ['wakeup_nodes', 'wakeup_facts', 'merge_candidate_names', \
+              'semantic_activation_embeddings'] RETURN name, state",
         ),
     )
     .await?;
@@ -1225,6 +1218,25 @@ pub async fn memory_stats(graph: &Graph, args: StatsArgs) -> Result<Value> {
                     && row.get::<String>("state").ok().as_deref() == Some("ONLINE")
             })
         });
+    let semantic_index_online = index_rows.iter().any(|row| {
+        row.get::<String>("name").ok().as_deref() == Some(crate::graph::SEMANTIC_INDEX)
+            && row.get::<String>("state").ok().as_deref() == Some("ONLINE")
+    });
+    let embedding = fetch_one(
+        graph,
+        query(
+            "MATCH (m:MindreaderMeta {key: 'embedding'}) \
+             RETURN m.provider AS provider, m.model AS model, m.dimensions AS dimensions",
+        ),
+    )
+    .await?
+    .and_then(|row| {
+        Some(json!({
+            "provider": row.get::<String>("provider").ok()?,
+            "model": row.get::<String>("model").ok()?,
+            "dimensions": row.get::<i64>("dimensions").ok()?,
+        }))
+    });
     let constraint_rows = fetch_all(
         graph,
         query(
@@ -1247,6 +1259,8 @@ pub async fn memory_stats(graph: &Graph, args: StatsArgs) -> Result<Value> {
             "version": marker_version,
             "requiredVersion": MODEL_VERSION,
             "indexesOnline": indexes_online,
+            "semanticIndexOnline": semantic_index_online,
+            "embedding": embedding,
             "constraintsPresent": constraints_present,
             "ready": marker_version == Some(MODEL_VERSION) && indexes_online && constraints_present,
         },
@@ -1480,10 +1494,17 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         let mut any_changed = false;
         let mut created_iris = Vec::new();
         let mut items = Vec::with_capacity(prepared.len());
+        let mut alternatives = Vec::new();
         for fact in prepared {
             let item = assert_prepared_fact_txn(&mut txn, fact, &layers, &episode).await?;
             any_changed |= !item.noop;
             created_iris.extend(item.created_iris);
+            if !item.siblings.is_empty() {
+                alternatives.push(json!({
+                    "target": item.json.get("target").cloned().unwrap_or(Value::Null),
+                    "conflicts": item.siblings,
+                }));
+            }
             items.push(item.json);
         }
         let merge_suggestions = if any_changed {
@@ -1493,10 +1514,10 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
         } else {
             Vec::new()
         };
-        Ok::<_, Error>((any_changed, episode, items, merge_suggestions))
+        Ok::<_, Error>((any_changed, episode, items, merge_suggestions, alternatives))
     }
     .await;
-    let (changed, episode, items, merge_suggestions) = match write {
+    let (changed, episode, items, merge_suggestions, alternatives) = match write {
         Ok(value) => {
             if value.0 {
                 txn.commit()
@@ -1525,7 +1546,7 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
             } else {
                 Value::Null
             },
-            "review": review_payloads(&merge_suggestions, &items),
+            "review": review_payloads(&merge_suggestions, &alternatives),
             "facts": items.clone(),
         }),
         &items,
@@ -1535,28 +1556,32 @@ async fn memory_assert_once(graph: &Graph, args: AssertArgs) -> Result<Value> {
     ))
 }
 
-fn review_payloads(merge_suggestions: &[Value], facts: &[Value]) -> Value {
-    let alternatives = facts
-        .iter()
-        .filter(|fact| {
-            fact.get("conflicts")
-                .and_then(Value::as_array)
-                .is_some_and(|conflicts| !conflicts.is_empty())
-        })
-        .map(|fact| {
-            json!({
-                "target": fact.get("target").cloned().unwrap_or(Value::Null),
-                "conflicts": fact.get("conflicts").cloned().unwrap_or_else(|| json!([])),
-            })
-        })
-        .collect::<Vec<_>>();
+fn review_payloads(merge_suggestions: &[Value], alternatives: &[Value]) -> Value {
     json!({ "unify": merge_suggestions, "alternatives": alternatives })
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::review_payloads;
+    use serde_json::json;
+
+    #[test]
+    fn review_payloads_keeps_siblings_when_conflicts_are_empty() {
+        let alternatives = vec![json!({
+            "target": {"kind":"fact","iri":"mindreader:relationship/a"},
+            "conflicts": [{"p":"observed"}]
+        })];
+        let review = review_payloads(&[], &alternatives);
+        assert_eq!(review["alternatives"].as_array().unwrap().len(), 1);
+        assert!(review["unify"].as_array().unwrap().is_empty());
+    }
 }
 
 struct PreparedFactResult {
     noop: bool,
     json: Value,
     created_iris: Vec<String>,
+    siblings: Vec<Value>,
 }
 
 async fn assert_prepared_fact_txn(
@@ -1666,10 +1691,15 @@ async fn assert_prepared_fact_txn(
             item["noop"] = json!(!changed);
             item["propertyStub"] = json!(property_created);
             item["property"] = property;
-            item["conflicts"] = json!(conflicts);
+            item["conflicts"] = if fact.contradicts {
+                json!(conflicts)
+            } else {
+                json!([])
+            };
             item
         },
         created_iris,
+        siblings: conflicts,
     })
 }
 
@@ -1797,16 +1827,8 @@ async fn memory_replace_once(
     let predicate = PredicateRef::parse(&args.p)?;
     reject_system_owned_predicate(predicate.iri())?;
     let spike = SpikeRank::parse(args.spike)?.map(|rank| rank.as_str().to_string());
-    let mut subject_spec = node_spec(EntityRef::from_input(args.s)?);
-    if let Some(spike) = &spike {
-        if !subject_spec.labels.contains(spike) {
-            subject_spec.labels.push(spike.clone());
-        }
-    }
-    let subject_kind = spike
-        .as_deref()
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_else(|| "element".into());
+    let subject_spec = node_spec(EntityRef::from_input(args.s)?);
+    let subject_kind = "element".to_string();
     let subject_iri = EntityRef {
         iri: subject_spec.iri.clone(),
         name: subject_spec.name.clone(),
@@ -1950,6 +1972,7 @@ async fn memory_replace_once(
             property_created,
             property,
             conflicts,
+            args.contradicts,
             merge_suggestions,
         ))
     }
@@ -1961,7 +1984,8 @@ async fn memory_replace_once(
         relationship_iri,
         property_created,
         property,
-        conflicts,
+        siblings,
+        contradicts,
         merge_suggestions,
     ) = match result {
         Ok(value) => {
@@ -1990,7 +2014,12 @@ async fn memory_replace_once(
         "propertyStub": property_created,
         "property": property,
         "spike": spike,
-        "conflicts": conflicts,
+        "siblings": siblings.clone(),
+        "conflicts": if contradicts {
+            Value::Array(siblings)
+        } else {
+            json!([])
+        },
         "mergeSuggestions": merge_suggestions,
     }))
 }
@@ -3018,20 +3047,26 @@ ORDER BY inputIndex ASC
 
 const RECALL_IRI_FACTS_QUERY: &str = r#"
 UNWIND range(0, size($iris) - 1) AS inputIndex
-MATCH (root:Entity {iri: $iris[inputIndex]})-[r]-(other:Entity)
-WHERE (size(coalesce(root.layers, [])) = 0
-       OR any(layer IN coalesce(root.layers, []) WHERE layer IN $layers))
-  AND r.validTo IS NULL
-  AND (size(coalesce(r.layers, [])) = 0
-       OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
-  AND (size(coalesce(other.layers, [])) = 0
-       OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
-WITH r, min(inputIndex) AS inputIndex
-WITH inputIndex, r, startNode(r) AS s, endNode(r) AS o,
-     coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
-ORDER BY inputIndex ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
-LIMIT $limit
+WITH inputIndex, $iris[inputIndex] AS iri
+MATCH (root:Entity {iri: iri})
+WHERE size(coalesce(root.layers, [])) = 0
+   OR any(layer IN coalesce(root.layers, []) WHERE layer IN $layers)
+CALL {
+  WITH root
+  MATCH (root)-[r]-(other:Entity)
+  WHERE r.validTo IS NULL
+    AND (size(coalesce(r.layers, [])) = 0
+         OR any(layer IN coalesce(r.layers, []) WHERE layer IN $layers))
+    AND (size(coalesce(other.layers, [])) = 0
+         OR any(layer IN coalesce(other.layers, []) WHERE layer IN $layers))
+  WITH r, startNode(r) AS s, endNode(r) AS o,
+       coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
+  ORDER BY s.iri ASC, property ASC, o.iri ASC, r.iri ASC
+  LIMIT $limit
+  RETURN s, r, o, property
+}
 RETURN inputIndex, s, r, o, property
+ORDER BY inputIndex ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
 "#;
 
 /// `memory_recall` `iris` path: ordered lookups plus a globally bounded fact set.
@@ -3096,8 +3131,15 @@ pub async fn memory_recall_iris(
             .param("limit", i64::from(fact_limit.saturating_add(1))),
     )
     .await?;
-    let truncated = rows.len() > fact_limit as usize;
-    for row in rows.into_iter().take(fact_limit as usize) {
+    let mut counts: HashMap<i64, usize> = HashMap::new();
+    for row in &rows {
+        if let Ok(index) = row.get::<i64>("inputIndex") {
+            *counts.entry(index).or_default() += 1;
+        }
+    }
+    let truncated = counts.values().any(|count| *count > fact_limit as usize);
+    let mut kept: HashMap<i64, usize> = HashMap::new();
+    for row in rows {
         let (Ok(index), Ok(subject), Ok(relationship), Ok(object), Ok(property)) = (
             row.get::<i64>("inputIndex"),
             row.get::<Node>("s"),
@@ -3107,6 +3149,11 @@ pub async fn memory_recall_iris(
         ) else {
             continue;
         };
+        let taken = kept.entry(index).or_default();
+        if *taken >= fact_limit as usize {
+            continue;
+        }
+        *taken += 1;
         let subject_iri = subject.get::<String>("iri").unwrap_or_default();
         let object_iri = object.get::<String>("iri").unwrap_or_default();
         let relationship = rel_json(&relationship, &subject_iri, &object_iri);
@@ -3641,6 +3688,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
         .unwrap_or(&args.target.iri)
         .to_string();
     let current_target = json!({ "kind": "fact", "iri": current_iri });
+    let siblings = result.get("siblings").cloned().unwrap_or_else(|| json!([]));
     let conflicts = result
         .get("conflicts")
         .cloned()
@@ -3680,8 +3728,8 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
             "fact": fact,
             "review": {
                 "unify": merge_suggestions,
-                "alternatives": if conflicts.as_array().is_some_and(|values| !values.is_empty()) {
-                    json!([{ "target": current_target.clone(), "conflicts": conflicts }])
+                "alternatives": if siblings.as_array().is_some_and(|values| !values.is_empty()) {
+                    json!([{ "target": current_target.clone(), "conflicts": siblings }])
                 } else {
                     json!([])
                 },
@@ -4199,6 +4247,14 @@ fn planned_memberships(before: &[String], edit: &NormalizedPlaceEdit) -> Planned
     }
 }
 
+fn hidden_endpoint_kind(iri: &str, labels: &[String]) -> &'static str {
+    if labels.iter().any(|label| label == "Literal") || iri.starts_with("mindreader:literal/") {
+        "literal"
+    } else {
+        "node"
+    }
+}
+
 /// Reject a batch whose final memberships would expose a fact while an endpoint is hidden.
 async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit]) -> Result<()> {
     let node_iris = planned
@@ -4222,9 +4278,9 @@ async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit])
             MATCH (s:Entity)-[r]->(o:Entity)
             WHERE r.validTo IS NULL
               AND (s.iri IN $nodeIris OR o.iri IN $nodeIris OR r.iri IN $factIris)
-            RETURN s.iri AS sIri, coalesce(s.layers, []) AS sLayers,
+            RETURN s.iri AS sIri, coalesce(s.layers, []) AS sLayers, labels(s) AS sLabels,
                    r.iri AS rIri, coalesce(r.layers, []) AS rLayers,
-                   o.iri AS oIri, coalesce(o.layers, []) AS oLayers
+                   o.iri AS oIri, coalesce(o.layers, []) AS oLayers, labels(o) AS oLabels
             "#,
         )
         .param("nodeIris", node_iris)
@@ -4247,9 +4303,19 @@ async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit])
             .get(&o_iri)
             .cloned()
             .unwrap_or(row.get::<Vec<String>>("oLayers").unwrap_or_default());
-        if !membership_allows(&s_layers, &r_layers) || !membership_allows(&o_layers, &r_layers) {
+        if !membership_allows(&s_layers, &r_layers) {
+            let s_labels = row.get::<Vec<String>>("sLabels").unwrap_or_default();
             return Err(DomainError::Precondition(format!(
-                "memory_place final state would expose fact {r_iri} while an endpoint is hidden"
+                "memory_place final state would expose fact {r_iri} while endpoint {s_iri} ({}) is hidden",
+                hidden_endpoint_kind(&s_iri, &s_labels)
+            ))
+            .into());
+        }
+        if !membership_allows(&o_layers, &r_layers) {
+            let o_labels = row.get::<Vec<String>>("oLabels").unwrap_or_default();
+            return Err(DomainError::Precondition(format!(
+                "memory_place final state would expose fact {r_iri} while endpoint {o_iri} ({}) is hidden",
+                hidden_endpoint_kind(&o_iri, &o_labels)
             ))
             .into());
         }
@@ -4501,7 +4567,8 @@ mod tests {
     fn recall_queries_are_set_oriented_bounded_and_deterministic() {
         assert!(RECALL_IRI_NODES_QUERY.contains("UNWIND range(0, size($iris) - 1)"));
         assert!(RECALL_IRI_NODES_QUERY.contains("ORDER BY inputIndex ASC"));
-        assert!(RECALL_IRI_FACTS_QUERY.contains("WITH r, min(inputIndex) AS inputIndex"));
+        assert!(RECALL_IRI_FACTS_QUERY.contains("CALL {"));
+        assert!(!RECALL_IRI_FACTS_QUERY.contains("collect("));
         assert!(RECALL_IRI_FACTS_QUERY.contains("ORDER BY inputIndex ASC"));
         assert!(RECALL_IRI_FACTS_QUERY.contains("LIMIT $limit"));
 

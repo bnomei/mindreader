@@ -11,7 +11,8 @@ use mindreader::domain::{EntityInput, ObjectInput};
 use mindreader::embeddings::{normalize_vector, EmbeddingProvider};
 use mindreader::error::{Context, Result};
 use mindreader::graph::{
-    self, acquire_fact_locks_in_txn, fetch_one, merge_node_in_txn, MergedNode, NodeSpec,
+    self, acquire_fact_locks_in_txn, fetch_one, merge_node_in_txn, require_embedding_space,
+    MergedNode, NodeSpec,
 };
 use mindreader::merge::{memory_merge, MergeArgs};
 use mindreader::operation_error;
@@ -362,7 +363,12 @@ async fn run() -> Result<u32> {
         model: "deterministic".into(),
         dimensions: 3,
     };
-    graph::bootstrap(&graph, Some(&embedding_space)).await?;
+    graph::bootstrap(
+        &graph,
+        Some(&embedding_space),
+        mindreader::graph::SpaceReplace::Refuse,
+    )
+    .await?;
     let stats = tools::memory_stats(&graph, StatsArgs { layers: Vec::new() }).await?;
     report.check(
         "bootstrap is ready in global-only scope",
@@ -1467,9 +1473,18 @@ async fn run() -> Result<u32> {
                 .and_then(Value::as_bool)
                 == Some(false)
             && recalled
-                .get("facts")
+                .get("lookups")
                 .and_then(Value::as_array)
-                .is_some_and(|facts| facts.len() <= 1)
+                .is_some_and(|lookups| {
+                    lookups.iter().filter(|lookup| {
+                        lookup.get("found").and_then(Value::as_bool) == Some(true)
+                    }).all(|lookup| {
+                        lookup
+                            .get("facts")
+                            .and_then(Value::as_array)
+                            .is_some_and(|facts| facts.len() <= 1)
+                    })
+                })
             && filtered_around
                 .get("facts")
                 .and_then(Value::as_array)
@@ -1583,6 +1598,189 @@ async fn run() -> Result<u32> {
                     })
                 }),
         format!("hops0={hops0} history={history}"),
+    );
+
+    report.check(
+        "query-time embedding space rejects a mismatched process space",
+        require_embedding_space(&graph, &embedding_space)
+            .await
+            .is_ok()
+            && require_embedding_space(
+                &graph,
+                &EmbeddingSpace {
+                    provider: "openai".into(),
+                    model: "text-embedding-3-small".into(),
+                    dimensions: 1536,
+                },
+            )
+            .await
+            .is_err(),
+        "smoke space accepted; openai/1536 rejected",
+    );
+
+    let spike_name = format!("spike-id-{tag}");
+    let spiked = tools::memory_assert(
+        &graph,
+        AssertArgs {
+            facts: vec![AssertFact {
+                s: entity(spike_name.clone()),
+                p: property.clone(),
+                o: object(format!("spike-obj-{tag}")),
+                spike: Some("Knowledge".into()),
+                contradicts: false,
+            }],
+            scope: vec![layer_a.clone()],
+        },
+    )
+    .await?;
+    let spiked_iri = spiked
+        .pointer("/facts/0/s/iri")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    report.check(
+        "name-only Knowledge spike mints an Element IRI and keeps the extra label",
+        spiked_iri == format!("mindreader:element/spike-id-{tag}")
+            && spiked
+                .pointer("/facts/0/s/labels")
+                .and_then(Value::as_array)
+                .is_some_and(|labels| labels.iter().any(|label| label == "Knowledge")),
+        format!("iri={spiked_iri} spiked={spiked}"),
+    );
+
+    let fanout_subject = format!("fanout-{tag}");
+    let mut fanout_facts = Vec::new();
+    for index in 0..20 {
+        fanout_facts.push(AssertFact {
+            s: entity(fanout_subject.clone()),
+            p: property.clone(),
+            o: object(format!("fanout-{tag}-{index}")),
+            spike: None,
+            contradicts: false,
+        });
+    }
+    tools::memory_assert(
+        &graph,
+        AssertArgs {
+            facts: fanout_facts,
+            scope: vec![layer_a.clone()],
+        },
+    )
+    .await?;
+    let mut extra_fanout = Vec::new();
+    for index in 20..25 {
+        extra_fanout.push(AssertFact {
+            s: entity(fanout_subject.clone()),
+            p: property.clone(),
+            o: object(format!("fanout-{tag}-{index}")),
+            spike: None,
+            contradicts: false,
+        });
+    }
+    tools::memory_assert(
+        &graph,
+        AssertArgs {
+            facts: extra_fanout,
+            scope: vec![layer_a.clone()],
+        },
+    )
+    .await?;
+    let fanout_iri = format!("mindreader:element/{fanout_subject}");
+    let hops0_budget = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: Some(vec![fanout_iri.clone()]),
+            labels: None,
+            around: None,
+            hops: Some(0),
+            p: None,
+            depth: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let hops1_budget = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: Some(vec![fanout_iri]),
+            labels: None,
+            around: None,
+            hops: Some(1),
+            p: None,
+            depth: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let lookup_iris = |value: &Value| -> Vec<String> {
+        value
+            .pointer("/lookups/0/facts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|fact| {
+                fact.pointer("/target/iri")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    };
+    let hops0_iris = lookup_iris(&hops0_budget);
+    let hops1_iris = lookup_iris(&hops1_budget);
+    report.check(
+        "iris hops 0 and 1 share a per-root fact budget and truncate at 20",
+        hops0_iris == hops1_iris
+            && hops0_iris.len() == 20
+            && hops0_budget.get("truncated").and_then(Value::as_bool) == Some(true)
+            && hops1_budget.get("truncated").and_then(Value::as_bool) == Some(true),
+        format!("hops0={hops0_budget} hops1={hops1_budget}"),
+    );
+
+    let camel_subject = format!("camel-{tag}");
+    tools::memory_assert(
+        &graph,
+        assert_args(
+            entity(camel_subject.clone()),
+            "graphModel",
+            object(format!("camel-object-{tag}")),
+            vec![layer_a.clone()],
+        ),
+    )
+    .await?;
+    let camel_recall = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: Some("graphModel".into()),
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            history: None,
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    report.check(
+        "text recall finds a camelCase predicate via the Property catalog",
+        camel_recall
+            .get("facts")
+            .and_then(Value::as_array)
+            .is_some_and(|facts| {
+                facts.iter().any(|fact| {
+                    fact.get("p").and_then(Value::as_str) == Some("graphModel")
+                        || fact
+                            .get("p")
+                            .and_then(Value::as_str)
+                            .is_some_and(|value| value.ends_with("graphModel"))
+                })
+            }),
+        &camel_recall,
     );
 
     let merge_short = tools::memory_assert(

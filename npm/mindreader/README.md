@@ -4,7 +4,7 @@ The npm launcher for [Mindreader](https://github.com/bnomei/mindreader), a deter
 privacy-first Neo4j memory MCP server.
 
 ```bash
-npx -y @bnomei/mindreader@0.4.0 --version
+npx -y @bnomei/mindreader@0.5.0 --version
 ```
 
 The launcher downloads the matching checksummed GitHub Release binary on first use and then

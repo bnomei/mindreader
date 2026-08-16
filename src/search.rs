@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::graph::{
     endpoint_json, fact_envelope, fetch_all, node_json, rel_json, spike_label, spike_rank,
 };
-use crate::iri::is_iri;
+use crate::iri::{is_iri, property_iri, split_camel_case};
 use crate::layers::validate_layer_ids;
 use neo4rs::{query, Graph, Node, Relation};
 use schemars::JsonSchema;
@@ -235,6 +235,16 @@ fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
 }
 
 /// Quote a Lucene phrase and escape operators so user text cannot change query shape.
+fn lucene_query(text: &str) -> String {
+    let escaped = lucene_escape(text);
+    let split = split_camel_case(text);
+    if split != text {
+        format!("({escaped} OR {})", lucene_escape(&split))
+    } else {
+        escaped
+    }
+}
+
 fn lucene_escape(text: &str) -> String {
     let mut out = String::from("\"");
     for ch in text.chars() {
@@ -268,6 +278,14 @@ CALL {
   YIELD relationship, score
   RETURN startNode(relationship) AS s, relationship AS r,
          endNode(relationship) AS o, score AS indexScore
+  UNION ALL
+  MATCH (p:Entity:Property)
+  WHERE toLower(coalesce(p.name, '')) = toLower($predicateName)
+     OR p.iri = $predicateIri
+     OR p.iri ENDS WITH ('/' + $predicateName)
+  MATCH (s:Entity)-[r:ASSERTS]->(o:Entity)
+  WHERE r.validTo IS NULL AND r.propertyIri = p.iri
+  RETURN s, r, o, 1.0 AS indexScore
 }
 WITH s, r, o, max(indexScore) AS indexScore
 "#;
@@ -519,7 +537,10 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
         .param("minWeight", i64::MIN)
         .param("maxWeight", i64::MAX);
     if text_mode {
-        ranked = ranked.param("q", lucene_escape(&trimmed));
+        ranked = ranked
+            .param("q", lucene_query(&trimmed))
+            .param("predicateName", trimmed.clone())
+            .param("predicateIri", property_iri(&trimmed));
     }
 
     let mut facts = Vec::new();
@@ -605,11 +626,19 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{lucene_escape, ranked_query, spike_from_rank, validate_recall_args, RecallArgs};
+    use super::{
+        lucene_escape, lucene_query, ranked_query, spike_from_rank, validate_recall_args,
+        RecallArgs,
+    };
 
     #[test]
     fn search_helpers_preserve_contract_values() {
         assert_eq!(lucene_escape("C++"), "\"C\\+\\+\"");
+        assert_eq!(
+            lucene_query("graphModel"),
+            "(\"graphModel\" OR \"graph Model\")"
+        );
+        assert!(ranked_query(true).contains("r.propertyIri = p.iri"));
         assert_eq!(spike_from_rank(4).as_deref(), Some("Knowledge"));
         assert_eq!(spike_from_rank(0), None);
         let query = ranked_query(true);

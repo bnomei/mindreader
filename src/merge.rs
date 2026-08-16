@@ -11,6 +11,7 @@ use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, fetch_all_txn, fetch_one_txn, node_json,
     structural_rel_for, Episode,
 };
+use crate::iri::identity_kind_from_labels;
 use crate::payload::{finish_mutation, unify_review_item};
 use crate::{
     error::{Error, Result},
@@ -30,15 +31,6 @@ const FORBIDDEN_ENTITY_LABELS: &[&str] = &[
     "MindreaderMeta",
     "SemanticActivation",
     "TTL",
-];
-const CANONICAL_KIND_LABELS: &[&str] = &[
-    "Class",
-    "Property",
-    "Element",
-    "Signal",
-    "Pattern",
-    "Insight",
-    "Knowledge",
 ];
 const FACT_LOCK_SCOPE: &str = "@fact";
 const LAYERS_PROPERTY: &str = "mindreader:property/layers";
@@ -380,25 +372,33 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     ))
 }
 
-fn canonical_kinds(node: &Node) -> BTreeSet<String> {
-    node.labels()
-        .into_iter()
-        .filter(|label| CANONICAL_KIND_LABELS.contains(label))
-        .map(str::to_string)
-        .collect()
+/// Minimum Levenshtein similarity for advisory unify suggestions.
+const MERGE_SIMILARITY_FLOOR: f64 = 0.85;
+/// Stricter floor for Property suggestions.
+const PROPERTY_MERGE_SIMILARITY_FLOOR: f64 = 0.92;
+
+/// Whether an advisory unify suggestion clears the kind-specific similarity floor.
+pub(crate) fn merge_similarity_accepted(kind: &str, similarity: f64) -> bool {
+    if kind == "Property" {
+        similarity >= PROPERTY_MERGE_SIMILARITY_FLOOR
+    } else {
+        similarity >= MERGE_SIMILARITY_FLOOR
+    }
 }
 
-/// Require both nodes to share exactly one canonical kind (Class, Property, Element, or Spike).
+/// Require both nodes to share the same identity kind (Class, Property, Element, or one Spike).
 fn require_same_kind(source: &Node, target: &Node) -> Result<String> {
-    let source_kinds = canonical_kinds(source);
-    let target_kinds = canonical_kinds(target);
-    if source_kinds.len() != 1 || source_kinds != target_kinds {
-        return Err(DomainError::InvalidInput(
+    let source_kind = identity_kind_from_labels(source.labels());
+    let target_kind = identity_kind_from_labels(target.labels());
+    match (source_kind, target_kind) {
+        (Some(source_kind), Some(target_kind)) if source_kind == target_kind => {
+            Ok(source_kind.to_string())
+        }
+        _ => Err(DomainError::InvalidInput(
             "source and target must have the same single canonical kind".into(),
         )
-        .into());
+        .into()),
     }
-    Ok(source_kinds.into_iter().next().expect("one kind checked"))
 }
 
 /// Forbid merging system-owned Properties or Properties with different structural types.
@@ -715,24 +715,41 @@ pub async fn merge_suggestions_in_txn(
                    OR any(layer IN coalesce(candidate.layers, []) WHERE layer IN $layers))
               AND none(label IN labels(created) WHERE label IN $forbidden)
               AND none(label IN labels(candidate) WHERE label IN $forbidden)
-              AND size([label IN labels(created) WHERE label IN $canonicalKinds]) = 1
-              AND size([label IN labels(candidate) WHERE label IN $canonicalKinds]) = 1
-              AND all(label IN labels(created)
-                      WHERE NOT label IN $canonicalKinds OR label IN labels(candidate))
-              AND all(label IN labels(candidate)
-                      WHERE NOT label IN $canonicalKinds OR label IN labels(created))
               AND apoc.text.fuzzyMatch(toLower(created.name), toLower(candidate.name))
             WITH created, candidate,
-                 head([label IN labels(created) WHERE label IN $canonicalKinds]) AS canonicalKind,
+                 CASE
+                   WHEN created:Class THEN 'Class'
+                   WHEN created:Property THEN 'Property'
+                   WHEN created:Element THEN 'Element'
+                   WHEN created:Signal AND NOT created:Pattern AND NOT created:Insight AND NOT created:Knowledge THEN 'Signal'
+                   WHEN created:Pattern AND NOT created:Signal AND NOT created:Insight AND NOT created:Knowledge THEN 'Pattern'
+                   WHEN created:Insight AND NOT created:Signal AND NOT created:Pattern AND NOT created:Knowledge THEN 'Insight'
+                   WHEN created:Knowledge AND NOT created:Signal AND NOT created:Pattern AND NOT created:Insight THEN 'Knowledge'
+                   ELSE null
+                 END AS createdKind,
+                 CASE
+                   WHEN candidate:Class THEN 'Class'
+                   WHEN candidate:Property THEN 'Property'
+                   WHEN candidate:Element THEN 'Element'
+                   WHEN candidate:Signal AND NOT candidate:Pattern AND NOT candidate:Insight AND NOT candidate:Knowledge THEN 'Signal'
+                   WHEN candidate:Pattern AND NOT candidate:Signal AND NOT candidate:Insight AND NOT candidate:Knowledge THEN 'Pattern'
+                   WHEN candidate:Insight AND NOT candidate:Signal AND NOT candidate:Pattern AND NOT candidate:Knowledge THEN 'Insight'
+                   WHEN candidate:Knowledge AND NOT candidate:Signal AND NOT candidate:Pattern AND NOT candidate:Insight THEN 'Knowledge'
+                   ELSE null
+                 END AS candidateKind,
                  apoc.text.levenshteinSimilarity(
                    toLower(created.name), toLower(candidate.name)
                  ) AS similarity
+            WHERE createdKind IS NOT NULL
+              AND createdKind = candidateKind
+              AND similarity >= $similarityFloor
+              AND (createdKind <> 'Property' OR similarity >= $propertyFloor)
             ORDER BY created.iri ASC, similarity DESC,
                      size(candidate.name) ASC, candidate.iri ASC
             WITH created, collect({
               candidateIri: candidate.iri,
               candidateName: candidate.name,
-              canonicalKind: canonicalKind,
+              canonicalKind: createdKind,
               similarity: similarity
             })[..3] AS candidates
             UNWIND candidates AS candidate
@@ -753,13 +770,8 @@ pub async fn merge_suggestions_in_txn(
                 .map(|label| label.to_string())
                 .collect::<Vec<_>>(),
         )
-        .param(
-            "canonicalKinds",
-            CANONICAL_KIND_LABELS
-                .iter()
-                .map(|label| label.to_string())
-                .collect::<Vec<_>>(),
-        ),
+        .param("similarityFloor", MERGE_SIMILARITY_FLOOR)
+        .param("propertyFloor", PROPERTY_MERGE_SIMILARITY_FLOOR),
     )
     .await?;
     for row in rows {
@@ -768,6 +780,10 @@ pub async fn merge_suggestions_in_txn(
         let candidate_iri: String = row.get("candidateIri")?;
         let candidate_name: String = row.get("candidateName")?;
         let canonical_kind: String = row.get("canonicalKind")?;
+        let similarity: f64 = row.get("similarity")?;
+        if !merge_similarity_accepted(&canonical_kind, similarity) {
+            continue;
+        }
         if canonical_kind == "Property"
             && require_compatible_property_merge(&created_iri, &candidate_iri).is_err()
         {
@@ -820,8 +836,8 @@ pub async fn merge_suggestions_in_txn(
 mod tests {
     use super::{
         duplicate_consolidation_plan, is_bootstrap_seeded, is_transient, lucene_fuzzy_term,
-        merge_memberships, require_compatible_property_merge, DuplicateFact, DuplicateRetirement,
-        SurvivorUpdate,
+        merge_memberships, merge_similarity_accepted, require_compatible_property_merge,
+        DuplicateFact, DuplicateRetirement, SurvivorUpdate,
     };
     use crate::error::Error;
     use std::collections::BTreeMap;
@@ -833,6 +849,14 @@ mod tests {
             merge_memberships(&["project:b".into()], &["project:a".into()]),
             vec!["project:a", "project:b"]
         );
+    }
+
+    #[test]
+    fn merge_similarity_accepted_drops_false_friends() {
+        assert!(!merge_similarity_accepted("Element", 0.667));
+        assert!(merge_similarity_accepted("Element", 0.96));
+        assert!(!merge_similarity_accepted("Property", 0.85));
+        assert!(merge_similarity_accepted("Property", 0.96));
     }
 
     #[test]
