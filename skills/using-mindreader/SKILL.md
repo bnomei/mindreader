@@ -1,6 +1,6 @@
 ---
 name: using-mindreader
-description: "Operates Mindreader durable graph memory through scoped recall, semantic recall, fact writes, corrections, withdrawals, feedback, layer placement, and duplicate-node unification. Use whenever an agent should retrieve or maintain durable user, project, team, or task context through the Mindreader MCP server, including work that may depend on remembered decisions, facts, or identities."
+description: "Operates Mindreader durable graph memory through scoped recall, semantic recall, fact writes, revisions, withdrawals, judgments, layer placement, and duplicate-node unification. Use whenever an agent should retrieve or maintain durable user, project, team, or task context through the Mindreader MCP server, including work that may depend on remembered decisions, facts, or identities."
 ---
 
 # Using Mindreader

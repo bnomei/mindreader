@@ -7,10 +7,17 @@
 
 use crate::config::Config;
 use crate::error::Result;
-use crate::merge::{self, MergeArgs};
-use crate::search::{self, is_schema_catalog_labels, validate_recall_args, RecallArgs, SearchArgs};
-use crate::semantic::{self, SemanticRuntime, SemanticSearchArgs};
-use crate::tools::{self, JudgeArgs, PlaceArgs, ReviseArgs, WithdrawArgs, WriteArgs};
+use crate::merge;
+pub use crate::merge::UnifyArgs;
+pub use crate::search::RecallArgs;
+use crate::search::{self, is_schema_catalog_labels, validate_recall_args, SearchArgs};
+pub use crate::semantic::SemanticSearchArgs;
+use crate::semantic::{self, SemanticRuntime};
+use crate::tools;
+pub use crate::tools::{
+    JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, ReviseArgs, TargetArgs, WithdrawArgs, WriteArgs,
+    WriteFact,
+};
 use neo4rs::Graph;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -31,6 +38,20 @@ impl MemoryService {
             semantic: SemanticRuntime::from_config(config)?,
             secrets_path: config.secrets_path(),
         })
+    }
+
+    /// Build a service with a deterministic semantic runtime for developer tools.
+    #[cfg(feature = "developer-tools")]
+    pub fn with_semantic_runtime(
+        graph: Graph,
+        semantic: SemanticRuntime,
+        secrets_path: PathBuf,
+    ) -> Self {
+        Self {
+            graph,
+            semantic: Some(semantic),
+            secrets_path,
+        }
     }
 
     /// Borrow the Neo4j handle for smoke, bench, and diagnostics.
@@ -167,7 +188,7 @@ impl MemoryService {
         tools::memory_revise(&self.graph, args).await
     }
 
-    /// MCP `memory_withdraw`: soft-retract a fact handle or a subject/predicate slice.
+    /// MCP `memory_withdraw`: soft-withdraw a fact handle or a subject/predicate slice.
     pub async fn withdraw(&self, args: WithdrawArgs) -> Result<Value> {
         tools::memory_withdraw(&self.graph, args).await
     }
@@ -183,8 +204,8 @@ impl MemoryService {
     }
 
     /// MCP `memory_unify`: permanent same-kind merge with no visibility filter.
-    pub async fn unify(&self, args: MergeArgs) -> Result<Value> {
-        merge::memory_merge(&self.graph, args).await
+    pub async fn unify(&self, args: UnifyArgs) -> Result<Value> {
+        merge::memory_unify(&self.graph, args).await
     }
 }
 

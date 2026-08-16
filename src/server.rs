@@ -5,14 +5,14 @@
 //! and `memory_unify` as
 //! plain tagged object schemas (no `anyOf`/`oneOf`/`allOf`). Initialize and
 //! `tools/list` do not wait on Neo4j. Recoverable failures are structured
-//! `isError` results. The 120/min burst-40 limiter and 45s timeout apply only
+//! `isError` results. The 120/min burst-20 limiter and 45s timeout apply only
 //! to `#[tool]` handlers through the process-local invoke path.
 
 use crate::config::Config;
 use crate::domain::DomainError;
 use crate::error::{Error, Result as AppResult};
 use crate::graph;
-use crate::merge::MergeArgs;
+use crate::merge::UnifyArgs;
 use crate::search::RecallArgs;
 use crate::semantic::{SemanticSearchArgs, MAX_SEMANTIC_TEXT_BYTES};
 use crate::service::MemoryService;
@@ -21,10 +21,11 @@ use neo4rs::Error as Neo4jError;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ErrorData as McpError, Implementation, ProtocolVersion, ServerCapabilities,
-        ServerInfo,
+        CallToolResult, ErrorData as McpError, Implementation, InitializeRequestParams,
+        InitializeResult, ProtocolVersion, ServerCapabilities, ServerInfo,
     },
-    tool, tool_handler, tool_router, ServerHandler,
+    service::RequestContext,
+    tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
 use serde_json::{json, Value};
 use std::borrow::Cow;
@@ -36,7 +37,19 @@ use tokio::time::timeout;
 
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(45);
 const RATE_LIMIT_PER_MINUTE: f64 = 120.0;
-const RATE_LIMIT_BURST: f64 = 40.0;
+const RATE_LIMIT_BURST: f64 = 20.0;
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
+
+fn require_supported_protocol(requested: ProtocolVersion) -> Result<(), McpError> {
+    if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
+        Ok(())
+    } else {
+        Err(McpError::unsupported_protocol_version(
+            requested,
+            SUPPORTED_PROTOCOL_VERSIONS,
+        ))
+    }
+}
 
 fn object_schema(value: serde_json::Value) -> Arc<rmcp::model::JsonObject> {
     Arc::new(rmcp::model::object(value))
@@ -221,7 +234,7 @@ fn node_schema() -> Value {
             "mutable": { "type": "boolean" },
             "target": target_schema_with_kinds(&["node"], "Pasteable node handle.")
         },
-        "required": ["iri"]
+        "required": ["kind", "iri"]
     })
 }
 
@@ -240,7 +253,7 @@ fn relationship_schema() -> Value {
             "episodeId": { "type": "string" },
             "reason": { "type": "string" }
         },
-        "required": ["iri"]
+        "required": ["kind", "type", "iri", "from", "to", "propertyIri", "scope", "weight"]
     })
 }
 
@@ -264,7 +277,6 @@ fn fact_schema() -> Value {
             "s": node_schema(),
             "p": { "type": "string" },
             "o": node_schema(),
-            "relationship": relationship_schema(),
             "scope": scope_schema(),
             "spike": { "type": ["string", "null"], "enum": ["Signal", "Pattern", "Insight", "Knowledge", null] },
             "score": { "type": "number" },
@@ -458,7 +470,7 @@ impl TokenBucket {
         }
     }
 
-    /// Take one token from the process-local 120/min burst-40 bucket.
+    /// Take one token from the process-local 120/min burst-20 bucket.
     fn try_acquire(&self) -> std::result::Result<(), u64> {
         let mut state = self
             .inner
@@ -549,7 +561,7 @@ impl Mindreader {
         if let Err(retry_after_ms) = self.limiter.try_acquire() {
             return Ok(structured_error_with_retry_after(
                 "rate_limited",
-                "MCP invoke rate limit exceeded (120/min, burst 40)",
+                "MCP invoke rate limit exceeded (120/min, burst 20)",
                 retry_after_ms,
             ));
         }
@@ -980,7 +992,7 @@ fn schema_out_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
         "scope": scope_schema(),
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
-        "retracted": { "type": "integer" },
+        "withdrawn": { "type": "integer" },
         "withdrawnTargets": { "type": "array", "items": fact_target_schema() },
         "reason": { "type": ["string", "null"] },
         "handles": handles_schema()
@@ -1087,7 +1099,7 @@ impl Mindreader {
     #[tool(
         name = "memory_write",
         title = "Write facts",
-        description = "Use to add durable triples after recall. facts contains 1–20 input-ordered items under one call-level scope; the batch is atomic and records one Episode only when something changes. Exact reassertions are no-ops. Review review.unify before memory_unify and review.alternatives without assuming another set-valued fact is wrong.",
+        description = "Use to add durable triples after recall. facts contains 1–20 input-ordered items under one call-level scope; the batch is atomic and records one Episode only when something changes. Exact reassertions merge requested memberships and are no-ops only when every requested membership is already present. Review review.unify before memory_unify and review.alternatives without assuming another set-valued fact is wrong.",
         input_schema = schema_memory_write(),
         output_schema = schema_out_memory_write(),
         annotations(title = "Write facts", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1174,7 +1186,7 @@ impl Mindreader {
     )]
     async fn memory_unify(
         &self,
-        Parameters(args): Parameters<MergeArgs>,
+        Parameters(args): Parameters<UnifyArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.invoke(|service| async move { service.unify(args).await })
             .await
@@ -1185,7 +1197,7 @@ impl Mindreader {
 impl ServerHandler for Mindreader {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_protocol_version(ProtocolVersion::V_2025_11_25)
+            .with_protocol_version(ProtocolVersion::V_2026_07_28)
             .with_server_info(Implementation::new(
                 "mindreader",
                 env!("CARGO_PKG_VERSION"),
@@ -1196,20 +1208,24 @@ impl ServerHandler for Mindreader {
     }
 
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
-        Cow::Borrowed(&[
-            ProtocolVersion::V_2024_11_05,
-            ProtocolVersion::V_2025_03_26,
-            ProtocolVersion::V_2025_06_18,
-            ProtocolVersion::V_2025_11_25,
-        ])
+        Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
+    }
+
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        require_supported_protocol(request.protocol_version)?;
+        Ok(self.get_info())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_tool_error, map_connect_error, map_tool_result, structured_error, Mindreader,
-        TokenBucket,
+        classify_tool_error, map_connect_error, map_tool_result, require_supported_protocol,
+        structured_error, Mindreader, TokenBucket,
     };
     use crate::config::Config;
     use crate::domain::DomainError;
@@ -1435,11 +1451,11 @@ mod tests {
     }
 
     #[test]
-    fn get_info_advertises_2025_11_25_without_list_changed() {
+    fn get_info_and_discovery_advertise_only_2026_07_28() {
         let info = test_server().get_info();
         assert_eq!(
             info.protocol_version,
-            rmcp::model::ProtocolVersion::V_2025_11_25
+            rmcp::model::ProtocolVersion::V_2026_07_28
         );
         let tools = info.capabilities.tools.expect("tools capability");
         assert_ne!(tools.list_changed, Some(true));
@@ -1448,16 +1464,33 @@ mod tests {
         let versions = test_server().supported_protocol_versions();
         assert_eq!(
             versions.as_ref(),
-            &[
-                rmcp::model::ProtocolVersion::V_2024_11_05,
-                rmcp::model::ProtocolVersion::V_2025_03_26,
-                rmcp::model::ProtocolVersion::V_2025_06_18,
-                rmcp::model::ProtocolVersion::V_2025_11_25,
-            ]
+            &[rmcp::model::ProtocolVersion::V_2026_07_28]
         );
-        assert!(!versions
-            .iter()
-            .any(|version| version.as_str() == "2026-07-28"));
+
+        let discovery = rmcp::model::DiscoverResult::from_server_info(
+            versions.into_owned(),
+            test_server().get_info(),
+        );
+        let discovery = serde_json::to_value(discovery).expect("serialize discovery");
+        assert_eq!(discovery["resultType"], "complete");
+        assert_eq!(
+            discovery["supportedVersions"],
+            serde_json::json!(["2026-07-28"])
+        );
+    }
+
+    #[test]
+    fn rejects_every_older_and_unknown_initialize_protocol() {
+        for version in rmcp::model::ProtocolVersion::KNOWN_VERSIONS {
+            if version != &rmcp::model::ProtocolVersion::V_2026_07_28 {
+                let error = require_supported_protocol(version.clone())
+                    .expect_err("older protocol must be rejected");
+                assert_eq!(error.message, "Unsupported protocol version");
+            }
+        }
+        let unknown = serde_json::from_str::<rmcp::model::ProtocolVersion>("\"2099-01-01\"")
+            .expect("deserialize open protocol version");
+        require_supported_protocol(unknown).expect_err("unknown protocol must be rejected");
     }
 
     #[test]
@@ -1586,14 +1619,21 @@ mod tests {
     }
 
     #[test]
-    fn output_schemas_use_only_v04_field_names() {
+    fn output_schemas_use_only_current_field_names() {
         for tool in Mindreader::tool_router().list_all() {
             let output = tool.output_schema.as_ref().expect("output schema");
             let properties = output
                 .get("properties")
                 .and_then(Value::as_object)
                 .expect("output properties");
-            for legacy in ["layers", "mergeSuggestions", "next", "targets", "ratings"] {
+            for legacy in [
+                "layers",
+                "mergeSuggestions",
+                "next",
+                "targets",
+                "ratings",
+                "retracted",
+            ] {
                 assert!(
                     !properties.contains_key(legacy),
                     "{} advertises legacy output field {legacy}",
@@ -1618,6 +1658,7 @@ mod tests {
             .as_ref()
             .unwrap();
         assert!(withdraw["properties"].get("withdrawnTargets").is_some());
+        assert!(withdraw["properties"].get("withdrawn").is_some());
     }
 
     #[test]
@@ -1712,7 +1753,7 @@ mod tests {
     #[test]
     fn token_bucket_reports_a_bounded_retry_delay() {
         let limiter = TokenBucket::new();
-        for _ in 0..40 {
+        for _ in 0..20 {
             assert_eq!(limiter.try_acquire(), Ok(()));
         }
         let retry_after_ms = limiter.try_acquire().expect_err("burst is exhausted");

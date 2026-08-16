@@ -7,11 +7,13 @@ versions follow Semantic Versioning.
 
 ### Changed
 
+- Require MCP `2026-07-28`, advertise only that protocol through `server/discover`, require self-contained request metadata, and reject older initialization protocols instead of negotiating a fallback.
+- Advance the fresh-database graph contract to model v6 and use numeric weights only.
 - Name-only `spike` writes mint `mindreader:element/<slug>` and keep the spike as an extra label instead of minting `mindreader:knowledge/<slug>`.
 - Set-valued writes keep `review.alternatives` from sibling values and leave `facts[].conflicts` empty unless `contradicts` is true.
 - Advisory unify suggestions require similarity ≥ 0.85 (Properties ≥ 0.92).
 - `memory_recall.iris` applies `limit` per requested IRI. Concise iris recall keeps top-level `facts[]` empty and clears `paths`.
-- MCP burst limit is 40 tokens (still 120/min and 45s). Semantic space mismatch returns `reason: embedding_space`.
+- MCP burst limit is 20 tokens (still 120/min and 45s). Semantic space mismatch returns `reason: embedding_space`.
 - Smoke and bench use isolated Neo4j on port 7688 (`docker compose --profile tools` and `packaging/tools-config`) so they cannot rewrite a live MCP embedding space.
 - Batched fuzzy merge-candidate lookup into two set-oriented Neo4j queries instead of two Bolt round trips per newly created entity.
 - Fused embedding finiteness validation with squared-norm accumulation while preserving sequential floating-point order.
@@ -24,6 +26,10 @@ versions follow Semantic Versioning.
 ### Added
 
 - Added Divan coverage for representative embedding dimensions from tiny through the supported maximum and expanded the live graph benchmark to 1/4/20 newly created merge candidates.
+
+### Removed
+
+- Removed the obsolete in-process memory API, legacy search implementation, permissive legacy target payloads, relationship-handle fallbacks, and alternate Neo4j URI attempts. This release has no compatibility aliases or database migration.
 
 ## [0.4.0] - 2026-08-16
 
@@ -87,7 +93,8 @@ versions follow Semantic Versioning.
 - Reduced semantic activation recall to metadata plus the selected convergence vector and bounded embedding-provider retries, latency, and response-body memory.
 - Added crates.io and cargo-binstall distribution alongside the existing GitHub, npm, and container release channels.
 
-[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/bnomei/mindreader/releases/tag/v0.5.0
 [0.4.0]: https://github.com/bnomei/mindreader/releases/tag/v0.4.0
 [0.3.0]: https://github.com/bnomei/mindreader/releases/tag/v0.3.0
 [0.2.0]: https://github.com/bnomei/mindreader/releases/tag/v0.2.0

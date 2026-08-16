@@ -2,8 +2,8 @@
 //!
 //! Mutates the configured database and leaves fixtures in place; use a
 //! development or disposable instance only. Enabled with the `developer-tools`
-//! feature. Includes a deterministic smoke embedding provider when remote keys
-//! are absent.
+//! feature. Semantic coverage always uses a deterministic smoke embedding
+//! provider and never calls a remote service.
 
 use async_trait::async_trait;
 use mindreader::config::{Config, EmbeddingSpace, SemanticConfig};
@@ -14,15 +14,11 @@ use mindreader::graph::{
     self, acquire_fact_locks_in_txn, fetch_one, merge_node_in_txn, require_embedding_space,
     MergedNode, NodeSpec,
 };
-use mindreader::merge::{memory_merge, MergeArgs};
 use mindreader::operation_error;
-use mindreader::search::{RecallArgs, SearchArgs};
-use mindreader::semantic::{memory_semantic_search, SemanticRuntime, SemanticSearchArgs};
-use mindreader::service::MemoryService;
-use mindreader::tools::{
-    self, AssertArgs, AssertFact, FeedbackArgs, GetArgs, JudgeArgs, JudgeRating, LayersArgs,
-    PlaceArgs, PlaceEdit, ReplaceArgs, RetractArgs, RetractTargetArgs, SchemaArgs, StatsArgs,
-    TargetArgs,
+use mindreader::semantic::SemanticRuntime;
+use mindreader::service::{
+    JudgeArgs, JudgeRating, MemoryService, PlaceArgs, PlaceEdit, RecallArgs, ReviseArgs,
+    SemanticSearchArgs, TargetArgs, UnifyArgs, WithdrawArgs, WriteArgs, WriteFact,
 };
 use mindreader::Mindreader;
 use neo4rs::{query, Graph};
@@ -36,7 +32,7 @@ struct Report {
     failed: u32,
 }
 
-/// Deterministic 3-d fixture used when no remote embedding key is configured.
+/// Deterministic 3-d fixture used for every semantic smoke request.
 struct SmokeEmbedding;
 
 #[async_trait]
@@ -126,14 +122,9 @@ fn object_iri(iri: impl Into<String>) -> ObjectInput {
     }
 }
 
-fn assert_args(
-    s: EntityInput,
-    p: impl AsRef<str>,
-    o: ObjectInput,
-    scope: Vec<String>,
-) -> AssertArgs {
-    AssertArgs {
-        facts: vec![AssertFact {
+fn write_args(s: EntityInput, p: impl AsRef<str>, o: ObjectInput, scope: Vec<String>) -> WriteArgs {
+    WriteArgs {
+        facts: vec![WriteFact {
             s,
             p: p.as_ref().to_string(),
             o,
@@ -147,8 +138,7 @@ fn assert_args(
 fn relationship_iri(value: &Value) -> Result<String> {
     value
         .pointer("/facts/0/target/iri")
-        .or_else(|| value.pointer("/facts/0/relationship/iri"))
-        .or_else(|| value.pointer("/relationship/iri"))
+        .or_else(|| value.pointer("/target/iri"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| operation_error!("response has no relationship IRI: {value}"))
@@ -165,24 +155,40 @@ fn subject_iri(value: &Value) -> Result<String> {
 fn object_result_iri(value: &Value) -> Result<String> {
     value
         .pointer("/facts/0/o/iri")
-        .or_else(|| value.pointer("/new/iri"))
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| operation_error!("response has no object IRI: {value}"))
 }
 
-fn fact_relationships(value: &Value) -> Vec<String> {
-    value
+fn fact_relationships(value: &Value) -> Result<Vec<String>> {
+    let facts = value
         .get("facts")
         .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|fact| {
+        .ok_or_else(|| operation_error!("recall response has no facts array: {value}"))?;
+    facts
+        .iter()
+        .map(|fact| {
             fact.pointer("/target/iri")
-                .or_else(|| fact.pointer("/relationship/iri"))
                 .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| operation_error!("fact has no target.iri: {fact}"))
         })
-        .map(str::to_string)
+        .collect()
+}
+
+fn lookup_fact_iris(value: &Value) -> Result<Vec<String>> {
+    let facts = value
+        .pointer("/lookups/0/facts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| operation_error!("recall lookup has no facts array: {value}"))?;
+    facts
+        .iter()
+        .map(|fact| {
+            fact.pointer("/target/iri")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| operation_error!("lookup fact has no target.iri: {fact}"))
+        })
         .collect()
 }
 
@@ -231,25 +237,25 @@ fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
         .get("facts")
         .and_then(Value::as_array)?
         .iter()
-        .position(|fact| {
-            fact.pointer("/target/iri")
-                .or_else(|| fact.pointer("/relationship/iri"))
-                .and_then(Value::as_str)
-                == Some(relationship)
-        })
+        .position(|fact| fact.pointer("/target/iri").and_then(Value::as_str) == Some(relationship))
 }
 
-async fn search(graph: &neo4rs::Graph, scope: Vec<String>, text: &str) -> Result<Value> {
-    mindreader::search::memory_search(
-        graph,
-        SearchArgs {
-            layers: scope,
+async fn search(service: &MemoryService, scope: Vec<String>, text: &str) -> Result<Value> {
+    service
+        .recall(RecallArgs {
+            scope,
             text: Some(text.into()),
+            iris: None,
             labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            history: None,
+            detail: Some("detailed".into()),
             limit: Some(100),
-        },
-    )
-    .await
+        })
+        .await
 }
 
 async fn merge_node_once(graph: neo4rs::Graph, spec: NodeSpec) -> Result<MergedNode> {
@@ -268,19 +274,16 @@ async fn relation_state(
         query(
             "MATCH ()-[r]->() WHERE r.iri = $iri \
              RETURN coalesce(r.layers, []) AS layers, r.validTo IS NULL AS current, \
-                    coalesce(r.weightText, toString(coalesce(r.weight, 0))) AS weight",
+                    r.weight AS weight",
         )
         .param("iri", iri.to_string()),
     )
     .await?;
     row.map(|row| {
         Ok((
-            row.get::<Vec<String>>("layers").unwrap_or_default(),
-            row.get::<bool>("current").unwrap_or(false),
-            row.get::<String>("weight")
-                .ok()
-                .and_then(|value| value.parse().ok())
-                .unwrap_or(0),
+            row.get::<Vec<String>>("layers")?,
+            row.get::<bool>("current")?,
+            row.get::<i64>("weight")?,
         ))
     })
     .transpose()
@@ -306,6 +309,41 @@ async fn episode_count(graph: &Graph, tool: &str) -> Result<i64> {
     .await?
     .ok_or_else(|| operation_error!("episode count returned no row for {tool}"))?;
     Ok(row.get("count")?)
+}
+
+async fn current_contradicts_count(graph: &Graph, from: &str, to: &str) -> Result<i64> {
+    let row = fetch_one(
+        graph,
+        query(
+            "MATCH (a:Entity {iri: $from})-[r:CONTRADICTS]->(b:Entity {iri: $to}) \
+             WHERE r.validTo IS NULL RETURN count(r) AS count",
+        )
+        .param("from", from.to_string())
+        .param("to", to.to_string()),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("contradiction count returned no row"))?;
+    Ok(row.get("count")?)
+}
+
+async fn bootstrap_state(graph: &Graph) -> Result<Value> {
+    let row = fetch_one(
+        graph,
+        query(
+            "MATCH (model:MindreaderMeta {key: 'model'}), \
+                    (embedding:MindreaderMeta {key: 'embedding'}) \
+             RETURN model.version AS version, embedding.provider AS provider, \
+                    embedding.model AS model, embedding.dimensions AS dimensions",
+        ),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("bootstrap metadata is missing"))?;
+    Ok(serde_json::json!({
+        "version": row.get::<i64>("version")?,
+        "provider": row.get::<String>("provider")?,
+        "model": row.get::<String>("model")?,
+        "dimensions": row.get::<i64>("dimensions")?,
+    }))
 }
 
 #[tokio::main]
@@ -345,15 +383,22 @@ async fn run() -> Result<u32> {
     );
 
     let mut report = Report::new();
-    let tool_names = Mindreader::registered_tool_names();
+    let mut tool_names = Mindreader::registered_tool_names();
+    tool_names.sort();
+    let mut expected_tool_names = vec![
+        "memory_judge".to_string(),
+        "memory_place".to_string(),
+        "memory_recall".to_string(),
+        "memory_recall_semantic".to_string(),
+        "memory_revise".to_string(),
+        "memory_unify".to_string(),
+        "memory_withdraw".to_string(),
+        "memory_write".to_string(),
+    ];
+    expected_tool_names.sort();
     report.check(
         "MCP registers the eight-tool contract",
-        tool_names.len() == 8
-            && tool_names.contains(&"memory_recall".into())
-            && tool_names.contains(&"memory_recall_semantic".into())
-            && tool_names.contains(&"memory_write".into())
-            && tool_names.contains(&"memory_revise".into())
-            && tool_names.contains(&"memory_unify".into()),
+        tool_names == expected_tool_names,
         format!("tools={tool_names:?}"),
     );
 
@@ -369,16 +414,25 @@ async fn run() -> Result<u32> {
         mindreader::graph::SpaceReplace::Refuse,
     )
     .await?;
-    let stats = tools::memory_stats(&graph, StatsArgs { layers: Vec::new() }).await?;
+    let stats = bootstrap_state(&graph).await?;
     report.check(
-        "bootstrap is ready in global-only scope",
-        stats.pointer("/model/ready").and_then(Value::as_bool) == Some(true)
-            && stats
-                .get("layers")
-                .and_then(Value::as_array)
-                .is_some_and(Vec::is_empty),
+        "bootstrap records the current graph and embedding models",
+        stats.get("version").and_then(Value::as_i64) == Some(graph::MODEL_VERSION)
+            && stats.get("provider").and_then(Value::as_str) == Some("smoke")
+            && stats.get("model").and_then(Value::as_str) == Some("deterministic")
+            && stats.get("dimensions").and_then(Value::as_i64) == Some(3),
         &stats,
     );
+
+    let semantic_runtime = SemanticRuntime::new(
+        Arc::new(SmokeEmbedding),
+        SemanticConfig {
+            neighbor_limit: 100,
+            ..SemanticConfig::default()
+        },
+    );
+    let service =
+        MemoryService::with_semantic_runtime(graph.clone(), semantic_runtime, cfg.secrets_path());
 
     let tag = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -479,77 +533,77 @@ async fn run() -> Result<u32> {
         format!("initial={initial:?} relabeled={relabeled:?} concurrent=({left:?}, {right:?})"),
     );
 
-    let schema = tools::memory_schema(
+    let schema = service
+        .write(write_args(
+            entity(format!("schema-seed-subject-{tag}")),
+            property.clone(),
+            object(format!("schema-seed-object-{tag}")),
+            Vec::new(),
+        ))
+        .await?;
+    let schema_property = fetch_one(
         &graph,
-        SchemaArgs {
-            kind: "property".into(),
-            name: Some(property.clone()),
-            domain: Some("Element".into()),
-            range: Some("Element".into()),
-            ..SchemaArgs::default()
-        },
+        query(
+            "MATCH (property:Entity:Property {iri: $iri}) \
+             RETURN property.iri AS iri, property.layers AS layers",
+        )
+        .param("iri", format!("mindreader:property/{property}")),
     )
-    .await?;
+    .await?
+    .ok_or_else(|| operation_error!("memory_write did not declare property {property}"))?;
     report.check(
-        "schema writes remain global and provenance-backed",
-        schema
-            .pointer("/node/scope")
-            .and_then(Value::as_array)
-            .is_some_and(Vec::is_empty)
+        "memory_write declares global properties under its mutation Episode",
+        schema_property
+            .get::<Vec<String>>("layers")
+            .is_ok_and(|layers| layers.is_empty())
             && schema
                 .pointer("/episode/iri")
                 .and_then(Value::as_str)
                 .is_some(),
-        &schema,
+        format!("write={schema} property={schema_property:?}"),
     );
 
     let visibility_token = format!("visibility-{tag}");
-    let global = tools::memory_assert(
-        &graph,
-        assert_args(
+    let global = service
+        .write(write_args(
             entity(format!("{visibility_token}-global-subject")),
             property.clone(),
             object(format!("{visibility_token}-global-object")),
             Vec::new(),
-        ),
-    )
-    .await?;
-    let in_a = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let in_a = service
+        .write(write_args(
             entity(format!("{visibility_token}-a-subject")),
             property.clone(),
             object(format!("{visibility_token}-a-object")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    let in_b = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let in_b = service
+        .write(write_args(
             entity(format!("{visibility_token}-b-subject")),
             property.clone(),
             object(format!("{visibility_token}-b-object")),
             vec![layer_b.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let global_rel = relationship_iri(&global)?;
     let a_rel = relationship_iri(&in_a)?;
     let b_rel = relationship_iri(&in_b)?;
-    let only_global = fact_relationships(&search(&graph, Vec::new(), &visibility_token).await?);
+    let only_global = fact_relationships(&search(&service, Vec::new(), &visibility_token).await?)?;
     let seen_a =
-        fact_relationships(&search(&graph, vec![layer_a.clone()], &visibility_token).await?);
+        fact_relationships(&search(&service, vec![layer_a.clone()], &visibility_token).await?)?;
     let seen_b =
-        fact_relationships(&search(&graph, vec![layer_b.clone()], &visibility_token).await?);
+        fact_relationships(&search(&service, vec![layer_b.clone()], &visibility_token).await?)?;
     let seen_ab = fact_relationships(
         &search(
-            &graph,
+            &service,
             vec![layer_a.clone(), layer_b.clone()],
             &visibility_token,
         )
         .await?,
-    );
+    )?;
     report.check(
         "request scopes dynamically expose global plus intersecting layers",
         only_global == vec![global_rel.clone()]
@@ -566,25 +620,24 @@ async fn run() -> Result<u32> {
     );
 
     let batch_token = format!("batch-{tag}");
-    let batch = tools::memory_assert(
-        &graph,
-        AssertArgs {
+    let batch = service
+        .write(WriteArgs {
             facts: vec![
-                AssertFact {
+                WriteFact {
                     s: entity(format!("{batch_token}-one")),
                     p: property.clone(),
                     o: object(format!("{batch_token}-a")),
                     spike: None,
                     contradicts: false,
                 },
-                AssertFact {
+                WriteFact {
                     s: entity(format!("{batch_token}-two")),
                     p: property.clone(),
                     o: object(format!("{batch_token}-b")),
                     spike: None,
                     contradicts: false,
                 },
-                AssertFact {
+                WriteFact {
                     s: entity(format!("{batch_token}-three")),
                     p: property.clone(),
                     o: object(format!("{batch_token}-c")),
@@ -593,12 +646,11 @@ async fn run() -> Result<u32> {
                 },
             ],
             scope: vec![layer_a.clone()],
-        },
-    )
-    .await?;
+        })
+        .await?;
     let batch_episode = batch.pointer("/episode/iri").and_then(Value::as_str);
     report.check(
-        "one memory_assert facts[] call records one Episode for three triples",
+        "one memory_write facts[] call records one Episode for three triples",
         batch.get("noop").and_then(Value::as_bool) == Some(false)
             && batch
                 .get("facts")
@@ -620,12 +672,11 @@ async fn run() -> Result<u32> {
             Ok::<_, mindreader::error::Error>((subject.to_string(), object.to_string()))
         })
         .collect::<Result<Vec<_>>>()?;
-    let batch_noop = tools::memory_assert(
-        &graph,
-        AssertArgs {
+    let batch_noop = service
+        .write(WriteArgs {
             facts: batch_iris
                 .into_iter()
-                .map(|(subject, object)| AssertFact {
+                .map(|(subject, object)| WriteFact {
                     s: entity_iri(subject),
                     p: property.clone(),
                     o: object_iri(object),
@@ -634,11 +685,10 @@ async fn run() -> Result<u32> {
                 })
                 .collect(),
             scope: vec![layer_a.clone()],
-        },
-    )
-    .await?;
+        })
+        .await?;
     report.check(
-        "all-noop memory_assert facts[] rolls back without an Episode",
+        "all-noop memory_write facts[] rolls back without an Episode",
         batch_noop.get("noop").and_then(Value::as_bool) == Some(true)
             && batch_noop.get("episode").is_some_and(Value::is_null)
             && batch_noop
@@ -654,26 +704,22 @@ async fn run() -> Result<u32> {
     );
 
     let merge_token = format!("merge-{tag}");
-    let merged_a = tools::memory_assert(
-        &graph,
-        assert_args(
+    let merged_a = service
+        .write(write_args(
             entity(format!("{merge_token}-subject")),
             property.clone(),
             object(format!("{merge_token}-old")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    let merged_b = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let merged_b = service
+        .write(write_args(
             entity_iri(subject_iri(&merged_a)?),
             property.clone(),
             object_iri(object_result_iri(&merged_a)?),
             vec![layer_b.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let merged_rel = relationship_iri(&merged_a)?;
     let merged_state = relation_state(&graph, &merged_rel).await?;
     report.check(
@@ -683,26 +729,22 @@ async fn run() -> Result<u32> {
         format!("first={merged_a} second={merged_b} state={merged_state:?}"),
     );
 
-    let global_wins_1 = tools::memory_assert(
-        &graph,
-        assert_args(
+    let global_wins_1 = service
+        .write(write_args(
             entity(format!("global-wins-{tag}-subject")),
             property.clone(),
             object(format!("global-wins-{tag}-object")),
             Vec::new(),
-        ),
-    )
-    .await?;
-    let global_wins_2 = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let global_wins_2 = service
+        .write(write_args(
             entity_iri(subject_iri(&global_wins_1)?),
             property.clone(),
             object_iri(object_result_iri(&global_wins_1)?),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let global_wins_rel = relationship_iri(&global_wins_1)?;
     report.check(
         "global membership wins over later named assertions",
@@ -712,60 +754,49 @@ async fn run() -> Result<u32> {
         &global_wins_2,
     );
 
-    let contradiction_old_left = tools::memory_assert(
-        &graph,
-        assert_args(
+    let contradiction_old_left = service
+        .write(write_args(
             entity(format!("contradiction-left-{tag}")),
             format!("contradictionLeft{tag}"),
             object(format!("contradiction-old-{tag}")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let contradiction_old_iri = object_result_iri(&contradiction_old_left)?;
-    let contradiction_old_right = tools::memory_assert(
-        &graph,
-        assert_args(
+    let contradiction_old_right = service
+        .write(write_args(
             entity(format!("contradiction-right-{tag}")),
             format!("contradictionRight{tag}"),
             object_iri(contradiction_old_iri.clone()),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let contradiction_new_name = format!("contradiction-new-{tag}");
     let (contradiction_left, contradiction_right) = tokio::try_join!(
-        tools::memory_assert(
-            &graph,
-            AssertArgs {
-                facts: vec![AssertFact {
-                    s: entity_iri(subject_iri(&contradiction_old_left)?),
-                    p: format!("contradictionLeft{tag}"),
-                    o: object(contradiction_new_name.clone()),
-                    spike: None,
-                    contradicts: true,
-                }],
-                scope: vec![layer_a.clone()],
-            },
-        ),
-        tools::memory_assert(
-            &graph,
-            AssertArgs {
-                facts: vec![AssertFact {
-                    s: entity_iri(subject_iri(&contradiction_old_right)?),
-                    p: format!("contradictionRight{tag}"),
-                    o: object(contradiction_new_name),
-                    spike: None,
-                    contradicts: true,
-                }],
-                scope: vec![layer_a.clone()],
-            },
-        ),
+        service.write(WriteArgs {
+            facts: vec![WriteFact {
+                s: entity_iri(subject_iri(&contradiction_old_left)?),
+                p: format!("contradictionLeft{tag}"),
+                o: object(contradiction_new_name.clone()),
+                spike: None,
+                contradicts: true,
+            }],
+            scope: vec![layer_a.clone()],
+        },),
+        service.write(WriteArgs {
+            facts: vec![WriteFact {
+                s: entity_iri(subject_iri(&contradiction_old_right)?),
+                p: format!("contradictionRight{tag}"),
+                o: object(contradiction_new_name),
+                spike: None,
+                contradicts: true,
+            }],
+            scope: vec![layer_a.clone()],
+        },),
     )?;
     let contradiction_new_iri = object_result_iri(&contradiction_left)?;
     let contradiction_count =
-        tools::count_current_contradicts(&graph, &contradiction_new_iri, &contradiction_old_iri)
-            .await?;
+        current_contradicts_count(&graph, &contradiction_new_iri, &contradiction_old_iri).await?;
     report.check(
         "concurrent contradiction writes preserve one exact current relationship",
         object_result_iri(&contradiction_right)? == contradiction_new_iri
@@ -775,27 +806,26 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    let merged_subject = subject_iri(&merged_a)?;
-    let merged_old = object_result_iri(&merged_a)?;
-    let replacement = tools::memory_replace(
-        &graph,
-        ReplaceArgs {
-            s: entity_iri(merged_subject.clone()),
-            p: property.clone(),
-            old: object_iri(merged_old.clone()),
+    let replacement = service
+        .revise(ReviseArgs {
+            scope: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "fact".into(),
+                iri: merged_rel.clone(),
+            },
             new: object(format!("{merge_token}-new")),
-            layers: vec![layer_a.clone()],
             spike: None,
             contradicts: false,
-            reason: Some("smoke scoped replacement".into()),
-        },
-    )
-    .await?;
+            reason: Some("smoke scoped revision".into()),
+        })
+        .await?;
     let replacement_rel = relationship_iri(&replacement)?;
-    let replace_a = fact_relationships(&search(&graph, vec![layer_a.clone()], &merge_token).await?);
-    let replace_b = fact_relationships(&search(&graph, vec![layer_b.clone()], &merge_token).await?);
+    let replace_a =
+        fact_relationships(&search(&service, vec![layer_a.clone()], &merge_token).await?)?;
+    let replace_b =
+        fact_relationships(&search(&service, vec![layer_b.clone()], &merge_token).await?)?;
     report.check(
-        "replace moves only selected memberships and preserves unrelated scope",
+        "memory_revise moves only selected memberships and preserves unrelated scope",
         relation_state(&graph, &merged_rel).await? == Some((vec![layer_b.clone()], true, 0))
             && relation_state(&graph, &replacement_rel).await?
                 == Some((vec![layer_a.clone()], true, 0))
@@ -810,92 +840,77 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    let retracted = tools::memory_retract(
-        &graph,
-        RetractArgs {
-            target: RetractTargetArgs {
+    let withdrawn = service
+        .withdraw(WithdrawArgs {
+            scope: vec![layer_b.clone()],
+            target: Some(TargetArgs {
                 kind: "fact".into(),
-                s: entity_iri(merged_subject),
-                p: Some(property.clone()),
-                o: Some(object_iri(merged_old)),
-            },
-            layers: vec![layer_b.clone()],
-            reason: Some("smoke final scoped retract".into()),
-        },
-    )
-    .await?;
+                iri: merged_rel.clone(),
+            }),
+            subject: None,
+            p: None,
+            reason: Some("smoke final scoped withdrawal".into()),
+        })
+        .await?;
     report.check(
-        "retract retires a fact when its last named membership is removed",
-        retracted.get("retracted").and_then(Value::as_u64) == Some(1)
+        "memory_withdraw retires a fact when its last named membership is removed",
+        withdrawn.get("withdrawn").and_then(Value::as_u64) == Some(1)
             && relation_state(&graph, &merged_rel).await?
                 == Some((vec![layer_b.clone()], false, 0)),
         format!(
-            "response={retracted} state={:?}",
+            "response={withdrawn} state={:?}",
             relation_state(&graph, &merged_rel).await?
         ),
     );
 
-    let broad_subject_name = format!("broad-retract-{tag}");
-    let broad_a = tools::memory_assert(
-        &graph,
-        assert_args(
+    let broad_subject_name = format!("broad-withdraw-{tag}");
+    let broad_a = service
+        .write(write_args(
             entity(broad_subject_name.clone()),
             property.clone(),
             object(format!("broad-a-{tag}")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    let broad_ab = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let broad_ab = service
+        .write(write_args(
             entity(broad_subject_name.clone()),
             property.clone(),
             object(format!("broad-ab-{tag}")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    service
+        .write(write_args(
             entity(broad_subject_name.clone()),
             property.clone(),
             object_iri(object_result_iri(&broad_ab)?),
             vec![layer_b.clone()],
-        ),
-    )
-    .await?;
-    let broad_b = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let broad_b = service
+        .write(write_args(
             entity(broad_subject_name),
             property.clone(),
             object(format!("broad-b-{tag}")),
             vec![layer_b.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let broad_a_rel = relationship_iri(&broad_a)?;
     let broad_ab_rel = relationship_iri(&broad_ab)?;
     let broad_b_rel = relationship_iri(&broad_b)?;
-    let broad_retract = tools::memory_retract(
-        &graph,
-        RetractArgs {
-            target: RetractTargetArgs {
-                kind: "subject".into(),
-                s: entity_iri(subject_iri(&broad_a)?),
-                p: None,
-                o: None,
-            },
-            layers: vec![layer_a.clone()],
-            reason: Some("smoke broad retract batch".into()),
-        },
-    )
-    .await?;
+    let broad_withdrawal = service
+        .withdraw(WithdrawArgs {
+            scope: vec![layer_a.clone()],
+            target: None,
+            subject: Some(entity_iri(subject_iri(&broad_a)?)),
+            p: None,
+            reason: Some("smoke broad withdrawal batch".into()),
+        })
+        .await?;
     report.check(
-        "broad retract batches retirement and surviving membership updates",
-        broad_retract.get("retracted").and_then(Value::as_u64) == Some(2)
+        "broad withdrawal batches retirement and surviving membership updates",
+        broad_withdrawal.get("withdrawn").and_then(Value::as_u64) == Some(2)
             && relation_state(&graph, &broad_a_rel).await?
                 == Some((vec![layer_a.clone()], false, 0))
             && relation_state(&graph, &broad_ab_rel).await?
@@ -903,7 +918,7 @@ async fn run() -> Result<u32> {
             && relation_state(&graph, &broad_b_rel).await?
                 == Some((vec![layer_b.clone()], true, 0)),
         format!(
-            "response={broad_retract} a={:?} ab={:?} b={:?}",
+            "response={broad_withdrawal} a={:?} ab={:?} b={:?}",
             relation_state(&graph, &broad_a_rel).await?,
             relation_state(&graph, &broad_ab_rel).await?,
             relation_state(&graph, &broad_b_rel).await?
@@ -911,71 +926,76 @@ async fn run() -> Result<u32> {
     );
 
     let rank_token = format!("rank-{tag}");
-    let low = tools::memory_assert(
-        &graph,
-        assert_args(
+    let low = service
+        .write(write_args(
             entity(format!("{rank_token}-low-subject")),
             property.clone(),
             object(format!("{rank_token}-low-object")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    let high = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let high = service
+        .write(write_args(
             entity(format!("{rank_token}-high-subject")),
             property.clone(),
             object(format!("{rank_token}-high-object")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let low_rel = relationship_iri(&low)?;
     let high_rel = relationship_iri(&high)?;
     let high_subject = subject_iri(&high)?;
-    let strengthened_node = tools::memory_feedback(
-        &graph,
-        FeedbackArgs {
-            layers: vec![layer_a.clone()],
-            target: TargetArgs {
-                kind: "node".into(),
-                iri: high_subject,
-            },
-            mode: "strengthen".into(),
-        },
-    )
-    .await?;
-    let strengthened_rel = tools::memory_feedback(
-        &graph,
-        FeedbackArgs {
-            layers: vec![layer_a.clone()],
-            target: TargetArgs {
-                kind: "fact".into(),
-                iri: high_rel.clone(),
-            },
-            mode: "strengthen".into(),
-        },
-    )
-    .await?;
-    let weakened_rel = tools::memory_feedback(
-        &graph,
-        FeedbackArgs {
-            layers: vec![layer_a.clone()],
-            target: TargetArgs {
-                kind: "fact".into(),
-                iri: low_rel.clone(),
-            },
-            mode: "weaken".into(),
-        },
-    )
-    .await?;
-    let ranked = search(&graph, vec![layer_a.clone()], &rank_token).await?;
+    let strengthened_node = service
+        .judge(JudgeArgs {
+            scope: vec![layer_a.clone()],
+            ratings: vec![JudgeRating {
+                target: TargetArgs {
+                    kind: "node".into(),
+                    iri: high_subject,
+                },
+                mode: "strengthen".into(),
+            }],
+        })
+        .await?;
+    let strengthened_rel = service
+        .judge(JudgeArgs {
+            scope: vec![layer_a.clone()],
+            ratings: vec![JudgeRating {
+                target: TargetArgs {
+                    kind: "fact".into(),
+                    iri: high_rel.clone(),
+                },
+                mode: "strengthen".into(),
+            }],
+        })
+        .await?;
+    let weakened_rel = service
+        .judge(JudgeArgs {
+            scope: vec![layer_a.clone()],
+            ratings: vec![JudgeRating {
+                target: TargetArgs {
+                    kind: "fact".into(),
+                    iri: low_rel.clone(),
+                },
+                mode: "weaken".into(),
+            }],
+        })
+        .await?;
+    let ranked = search(&service, vec![layer_a.clone()], &rank_token).await?;
     report.check(
-        "node and relationship feedback are signed and affect ranking within a tier",
-        strengthened_node.get("weight").and_then(Value::as_i64) == Some(1)
-            && strengthened_rel.get("weight").and_then(Value::as_i64) == Some(1)
-            && weakened_rel.get("weight").and_then(Value::as_i64) == Some(-1)
+        "node and fact judgments are signed and affect ranking within a tier",
+        strengthened_node
+            .pointer("/items/0/after")
+            .and_then(Value::as_i64)
+            == Some(1)
+            && strengthened_rel
+                .pointer("/items/0/after")
+                .and_then(Value::as_i64)
+                == Some(1)
+            && weakened_rel
+                .pointer("/items/0/after")
+                .and_then(Value::as_i64)
+                == Some(-1)
             && fact_position(&ranked, &high_rel) == Some(0)
             && fact_position(&ranked, &high_rel) < fact_position(&ranked, &low_rel),
         format!(
@@ -985,22 +1005,22 @@ async fn run() -> Result<u32> {
 
     let mut concurrent_feedback = tokio::task::JoinSet::new();
     for _ in 0..8 {
-        let graph = graph.clone();
+        let service = service.clone();
         let layer = layer_a.clone();
         let relationship = high_rel.clone();
         concurrent_feedback.spawn(async move {
-            tools::memory_feedback(
-                &graph,
-                FeedbackArgs {
-                    layers: vec![layer],
-                    target: TargetArgs {
-                        kind: "fact".into(),
-                        iri: relationship,
-                    },
-                    mode: "strengthen".into(),
-                },
-            )
-            .await
+            service
+                .judge(JudgeArgs {
+                    scope: vec![layer],
+                    ratings: vec![JudgeRating {
+                        target: TargetArgs {
+                            kind: "fact".into(),
+                            iri: relationship,
+                        },
+                        mode: "strengthen".into(),
+                    }],
+                })
+                .await
         });
     }
     let mut concurrent_successes = 0;
@@ -1009,7 +1029,7 @@ async fn run() -> Result<u32> {
         concurrent_successes += 1;
     }
     report.check(
-        "concurrent feedback increments do not lose updates",
+        "concurrent judgments do not lose updates",
         concurrent_successes == 8
             && relation_state(&graph, &high_rel).await? == Some((vec![layer_a.clone()], true, 9)),
         format!(
@@ -1019,9 +1039,8 @@ async fn run() -> Result<u32> {
     );
 
     let judge_episodes_before = episode_count(&graph, "memory_judge").await?;
-    let judged = tools::memory_judge(
-        &graph,
-        JudgeArgs {
+    let judged = service
+        .judge(JudgeArgs {
             scope: vec![layer_a.clone()],
             ratings: vec![
                 JudgeRating {
@@ -1039,14 +1058,12 @@ async fn run() -> Result<u32> {
                     mode: "weaken".into(),
                 },
             ],
-        },
-    )
-    .await?;
+        })
+        .await?;
     let judge_episodes_after = episode_count(&graph, "memory_judge").await?;
     let high_after_batch = relation_state(&graph, &high_rel).await?;
-    let rollback = tools::memory_judge(
-        &graph,
-        JudgeArgs {
+    let rollback = service
+        .judge(JudgeArgs {
             scope: vec![layer_a.clone()],
             ratings: vec![
                 JudgeRating {
@@ -1064,9 +1081,8 @@ async fn run() -> Result<u32> {
                     mode: "strengthen".into(),
                 },
             ],
-        },
-    )
-    .await;
+        })
+        .await;
     report.check(
         "memory_judge batches atomically under one Episode and rolls back mixed failures",
         judged.pointer("/episode/tool").and_then(Value::as_str) == Some("memory_judge")
@@ -1084,113 +1100,108 @@ async fn run() -> Result<u32> {
     );
 
     let closure_token = format!("closure-{tag}");
-    let closure = tools::memory_assert(
-        &graph,
-        assert_args(
+    let closure = service
+        .write(write_args(
             entity(format!("{closure_token}-subject")),
             property.clone(),
             object(format!("{closure_token}-object")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let closure_rel = relationship_iri(&closure)?;
     let closure_subject = subject_iri(&closure)?;
     let closure_object = object_result_iri(&closure)?;
-    let premature_relation_add = tools::memory_layers(
-        &graph,
-        LayersArgs {
-            layers: vec![layer_a.clone()],
-            target: TargetArgs {
-                kind: "fact".into(),
-                iri: closure_rel.clone(),
-            },
-            add: vec![layer_c.clone()],
-            remove: Vec::new(),
-        },
-    )
-    .await;
-    let subject_add = tools::memory_layers(
-        &graph,
-        LayersArgs {
-            layers: vec![layer_a.clone()],
-            target: TargetArgs {
-                kind: "node".into(),
-                iri: closure_subject.clone(),
-            },
-            add: vec![layer_c.clone()],
-            remove: Vec::new(),
-        },
-    )
-    .await?;
-    let object_add = tools::memory_layers(
-        &graph,
-        LayersArgs {
-            layers: vec![layer_a.clone()],
-            target: TargetArgs {
-                kind: "node".into(),
-                iri: closure_object.clone(),
-            },
-            add: vec![layer_c.clone()],
-            remove: Vec::new(),
-        },
-    )
-    .await?;
-    let relation_add = tools::memory_layers(
-        &graph,
-        LayersArgs {
-            layers: vec![layer_a.clone()],
-            target: TargetArgs {
-                kind: "fact".into(),
-                iri: closure_rel.clone(),
-            },
-            add: vec![layer_c.clone()],
-            remove: Vec::new(),
-        },
-    )
-    .await?;
-    let invalid_endpoint_remove = tools::memory_layers(
-        &graph,
-        LayersArgs {
-            layers: vec![layer_a.clone(), layer_c.clone()],
-            target: TargetArgs {
-                kind: "node".into(),
-                iri: closure_subject.clone(),
-            },
-            add: Vec::new(),
-            remove: vec![layer_a.clone()],
-        },
-    )
-    .await;
+    let premature_relation_add = service
+        .place(PlaceArgs {
+            scope: vec![layer_a.clone()],
+            edits: vec![PlaceEdit {
+                target: TargetArgs {
+                    kind: "fact".into(),
+                    iri: closure_rel.clone(),
+                },
+                add: vec![layer_c.clone()],
+                remove: Vec::new(),
+            }],
+        })
+        .await;
+    let subject_add = service
+        .place(PlaceArgs {
+            scope: vec![layer_a.clone()],
+            edits: vec![PlaceEdit {
+                target: TargetArgs {
+                    kind: "node".into(),
+                    iri: closure_subject.clone(),
+                },
+                add: vec![layer_c.clone()],
+                remove: Vec::new(),
+            }],
+        })
+        .await?;
+    let object_add = service
+        .place(PlaceArgs {
+            scope: vec![layer_a.clone()],
+            edits: vec![PlaceEdit {
+                target: TargetArgs {
+                    kind: "node".into(),
+                    iri: closure_object.clone(),
+                },
+                add: vec![layer_c.clone()],
+                remove: Vec::new(),
+            }],
+        })
+        .await?;
+    let relation_add = service
+        .place(PlaceArgs {
+            scope: vec![layer_a.clone()],
+            edits: vec![PlaceEdit {
+                target: TargetArgs {
+                    kind: "fact".into(),
+                    iri: closure_rel.clone(),
+                },
+                add: vec![layer_c.clone()],
+                remove: Vec::new(),
+            }],
+        })
+        .await?;
+    let invalid_endpoint_remove = service
+        .place(PlaceArgs {
+            scope: vec![layer_a.clone(), layer_c.clone()],
+            edits: vec![PlaceEdit {
+                target: TargetArgs {
+                    kind: "node".into(),
+                    iri: closure_subject.clone(),
+                },
+                add: Vec::new(),
+                remove: vec![layer_a.clone()],
+            }],
+        })
+        .await;
     report.check(
-        "memory_layers succeeds only when endpoint/relationship closure is preserved",
+        "memory_place succeeds only when endpoint/fact closure is preserved",
         premature_relation_add.is_err()
             && subject_add.get("noop").and_then(Value::as_bool) == Some(false)
             && object_add.get("noop").and_then(Value::as_bool) == Some(false)
-            && relation_add.get("layers").and_then(Value::as_array).is_some_and(|values| values.len() == 2)
+            && relation_add.pointer("/items/0/memberships").and_then(Value::as_array).is_some_and(|values| values.len() == 2)
             && relation_state(&graph, &closure_rel).await?
                 == Some((vec![layer_a.clone(), layer_c.clone()], true, 0))
             && invalid_endpoint_remove.is_err(),
         format!("premature={premature_relation_add:?} subject={subject_add} object={object_add} relation={relation_add} invalidRemove={invalid_endpoint_remove:?}"),
     );
 
-    let place = tools::memory_assert(
-        &graph,
-        assert_args(
+    let place = service
+        .write(write_args(
             entity(format!("place-batch-{tag}-subject")),
             property.clone(),
             object(format!("place-batch-{tag}-object")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let place_subject = subject_iri(&place)?;
     let place_object = object_result_iri(&place)?;
     let place_fact = relationship_iri(&place)?;
     let place_episodes_before = episode_count(&graph, "memory_place").await?;
-    let placed = tools::memory_place(
-        &graph,
-        PlaceArgs {
+    let placed = service
+        .place(PlaceArgs {
             scope: vec![layer_a.clone()],
             edits: [
                 ("node", place_subject.clone()),
@@ -1207,13 +1218,11 @@ async fn run() -> Result<u32> {
                 remove: Vec::new(),
             })
             .collect(),
-        },
-    )
-    .await?;
+        })
+        .await?;
     let place_episodes_after = episode_count(&graph, "memory_place").await?;
-    let place_rollback = tools::memory_place(
-        &graph,
-        PlaceArgs {
+    let place_rollback = service
+        .place(PlaceArgs {
             scope: vec![layer_a.clone(), layer_c.clone()],
             edits: vec![
                 PlaceEdit {
@@ -1233,9 +1242,8 @@ async fn run() -> Result<u32> {
                     remove: Vec::new(),
                 },
             ],
-        },
-    )
-    .await;
+        })
+        .await;
     report.check(
         "memory_place validates combined final closure, records one Episode, and rolls back mixed failures",
         placed.pointer("/episode/tool").and_then(Value::as_str) == Some("memory_place")
@@ -1255,22 +1263,19 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    let concurrent_place = tools::memory_assert(
-        &graph,
-        assert_args(
+    let concurrent_place = service
+        .write(write_args(
             entity(format!("place-concurrent-{tag}-subject")),
             property.clone(),
             object(format!("place-concurrent-{tag}-object")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let concurrent_subject = subject_iri(&concurrent_place)?;
     let concurrent_object = object_result_iri(&concurrent_place)?;
     let concurrent_fact = relationship_iri(&concurrent_place)?;
-    tools::memory_place(
-        &graph,
-        PlaceArgs {
+    service
+        .place(PlaceArgs {
             scope: vec![layer_a.clone()],
             edits: vec![
                 PlaceEdit {
@@ -1290,9 +1295,8 @@ async fn run() -> Result<u32> {
                     remove: Vec::new(),
                 },
             ],
-        },
-    )
-    .await?;
+        })
+        .await?;
     let fact_edit = PlaceArgs {
         scope: vec![layer_a.clone(), layer_b.clone()],
         edits: vec![PlaceEdit {
@@ -1315,10 +1319,8 @@ async fn run() -> Result<u32> {
             remove: vec![layer_b.clone()],
         }],
     };
-    let (fact_edit_result, endpoint_edit_result) = tokio::join!(
-        tools::memory_place(&graph, fact_edit),
-        tools::memory_place(&graph, endpoint_edit),
-    );
+    let (fact_edit_result, endpoint_edit_result) =
+        tokio::join!(service.place(fact_edit), service.place(endpoint_edit),);
     let concurrent_successes =
         usize::from(fact_edit_result.is_ok()) + usize::from(endpoint_edit_result.is_ok());
     let concurrent_fact_layers = relation_state(&graph, &concurrent_fact)
@@ -1341,9 +1343,8 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    let schema_place = tools::memory_place(
-        &graph,
-        PlaceArgs {
+    let schema_place = service
+        .place(PlaceArgs {
             scope: Vec::new(),
             edits: vec![PlaceEdit {
                 target: TargetArgs {
@@ -1353,38 +1354,42 @@ async fn run() -> Result<u32> {
                 add: vec![layer_a.clone()],
                 remove: Vec::new(),
             }],
-        },
-    )
-    .await;
+        })
+        .await;
     report.check(
         "memory_place keeps Class and Property schema records global",
         schema_place.is_err(),
         format!("schemaPlace={schema_place:?}"),
     );
 
-    let exact = tools::memory_get(
-        &graph,
-        GetArgs {
-            iri: subject_iri(&in_b)?,
-            layers: vec![layer_b],
+    let exact = service
+        .recall(RecallArgs {
+            scope: vec![layer_b],
+            text: None,
+            iris: Some(vec![subject_iri(&in_b)?]),
+            labels: None,
+            around: None,
             hops: Some(1),
-        },
-    )
-    .await?;
+            p: None,
+            depth: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+        })
+        .await?;
     report.check(
         "stable relationship IRI round-trips through scoped retrieval",
         exact
-            .get("neighbors")
+            .pointer("/lookups/0/facts")
             .and_then(Value::as_array)
-            .is_some_and(|neighbors| {
-                neighbors.iter().any(|neighbor| {
-                    neighbor.pointer("/edge/iri").and_then(Value::as_str) == Some(&b_rel)
-                })
+            .is_some_and(|facts| {
+                facts
+                    .iter()
+                    .any(|fact| fact.pointer("/target/iri").and_then(Value::as_str) == Some(&b_rel))
             }),
         &exact,
     );
 
-    let service = MemoryService::new(graph.clone(), &cfg)?;
     let missing_iri = format!("mindreader:element/recall-missing-{tag}");
     let recall_order = vec![
         closure_object.clone(),
@@ -1409,13 +1414,15 @@ async fn run() -> Result<u32> {
     let lookup_order = recalled
         .get("lookups")
         .and_then(Value::as_array)
-        .map(|lookups| {
-            lookups
-                .iter()
-                .filter_map(|lookup| lookup.get("iri").and_then(Value::as_str))
-                .collect::<Vec<_>>()
+        .ok_or_else(|| operation_error!("IRI recall has no lookups array: {recalled}"))?
+        .iter()
+        .map(|lookup| {
+            lookup
+                .get("iri")
+                .and_then(Value::as_str)
+                .ok_or_else(|| operation_error!("recall lookup has no iri: {lookup}"))
         })
-        .unwrap_or_default();
+        .collect::<Result<Vec<_>>>()?;
     let filtered_around = service
         .recall(RecallArgs {
             scope: vec![layer_a.clone(), layer_c.clone()],
@@ -1550,11 +1557,7 @@ async fn run() -> Result<u32> {
             limit: Some(20),
         })
         .await?;
-    let history_iri = witnessed_around
-        .pointer("/facts/0/target/iri")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+    let history_iri = relationship_iri(&witnessed_around)?;
     let history = service
         .recall(RecallArgs {
             scope: vec![layer_a.clone(), layer_c.clone()],
@@ -1619,10 +1622,9 @@ async fn run() -> Result<u32> {
     );
 
     let spike_name = format!("spike-id-{tag}");
-    let spiked = tools::memory_assert(
-        &graph,
-        AssertArgs {
-            facts: vec![AssertFact {
+    let spiked = service
+        .write(WriteArgs {
+            facts: vec![WriteFact {
                 s: entity(spike_name.clone()),
                 p: property.clone(),
                 o: object(format!("spike-obj-{tag}")),
@@ -1630,14 +1632,9 @@ async fn run() -> Result<u32> {
                 contradicts: false,
             }],
             scope: vec![layer_a.clone()],
-        },
-    )
-    .await?;
-    let spiked_iri = spiked
-        .pointer("/facts/0/s/iri")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
+        })
+        .await?;
+    let spiked_iri = subject_iri(&spiked)?;
     report.check(
         "name-only Knowledge spike mints an Element IRI and keeps the extra label",
         spiked_iri == format!("mindreader:element/spike-id-{tag}")
@@ -1651,7 +1648,7 @@ async fn run() -> Result<u32> {
     let fanout_subject = format!("fanout-{tag}");
     let mut fanout_facts = Vec::new();
     for index in 0..20 {
-        fanout_facts.push(AssertFact {
+        fanout_facts.push(WriteFact {
             s: entity(fanout_subject.clone()),
             p: property.clone(),
             o: object(format!("fanout-{tag}-{index}")),
@@ -1659,17 +1656,15 @@ async fn run() -> Result<u32> {
             contradicts: false,
         });
     }
-    tools::memory_assert(
-        &graph,
-        AssertArgs {
+    service
+        .write(WriteArgs {
             facts: fanout_facts,
             scope: vec![layer_a.clone()],
-        },
-    )
-    .await?;
+        })
+        .await?;
     let mut extra_fanout = Vec::new();
     for index in 20..25 {
-        extra_fanout.push(AssertFact {
+        extra_fanout.push(WriteFact {
             s: entity(fanout_subject.clone()),
             p: property.clone(),
             o: object(format!("fanout-{tag}-{index}")),
@@ -1677,14 +1672,12 @@ async fn run() -> Result<u32> {
             contradicts: false,
         });
     }
-    tools::memory_assert(
-        &graph,
-        AssertArgs {
+    service
+        .write(WriteArgs {
             facts: extra_fanout,
             scope: vec![layer_a.clone()],
-        },
-    )
-    .await?;
+        })
+        .await?;
     let fanout_iri = format!("mindreader:element/{fanout_subject}");
     let hops0_budget = service
         .recall(RecallArgs {
@@ -1716,21 +1709,8 @@ async fn run() -> Result<u32> {
             limit: Some(20),
         })
         .await?;
-    let lookup_iris = |value: &Value| -> Vec<String> {
-        value
-            .pointer("/lookups/0/facts")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|fact| {
-                fact.pointer("/target/iri")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .collect()
-    };
-    let hops0_iris = lookup_iris(&hops0_budget);
-    let hops1_iris = lookup_iris(&hops1_budget);
+    let hops0_iris = lookup_fact_iris(&hops0_budget)?;
+    let hops1_iris = lookup_fact_iris(&hops1_budget)?;
     report.check(
         "iris hops 0 and 1 share a per-root fact budget and truncate at 20",
         hops0_iris == hops1_iris
@@ -1741,16 +1721,14 @@ async fn run() -> Result<u32> {
     );
 
     let camel_subject = format!("camel-{tag}");
-    tools::memory_assert(
-        &graph,
-        assert_args(
+    service
+        .write(write_args(
             entity(camel_subject.clone()),
             "graphModel",
             object(format!("camel-object-{tag}")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let camel_recall = service
         .recall(RecallArgs {
             scope: vec![layer_a.clone()],
@@ -1783,26 +1761,22 @@ async fn run() -> Result<u32> {
         &camel_recall,
     );
 
-    let merge_short = tools::memory_assert(
-        &graph,
-        assert_args(
+    let merge_short = service
+        .write(write_args(
             entity(format!("merge-{tag}")),
             "mindreader:property/merge-smoke",
             object(format!("merge-object-{tag}")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    let merge_long = tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    let merge_long = service
+        .write(write_args(
             entity(format!("merge-{tag}s")),
             "mindreader:property/merge-smoke",
             object(format!("merge-object-{tag}")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     let short_iri = subject_iri(&merge_short)?;
     let long_iri = subject_iri(&merge_long)?;
     let merge_survivor_relationship = std::cmp::min(
@@ -1820,36 +1794,38 @@ async fn run() -> Result<u32> {
             })
         });
     let (survivor, merge_feedback) = tokio::try_join!(
-        memory_merge(
-            &graph,
-            MergeArgs::from_iris(long_iri.clone(), short_iri.clone()),
-        ),
-        tools::memory_feedback(
-            &graph,
-            FeedbackArgs {
-                layers: vec![layer_a.clone()],
+        service.unify(UnifyArgs::from_iris(long_iri.clone(), short_iri.clone())),
+        service.judge(JudgeArgs {
+            scope: vec![layer_a.clone()],
+            ratings: vec![JudgeRating {
                 target: TargetArgs {
                     kind: "fact".into(),
                     iri: merge_survivor_relationship.clone(),
                 },
                 mode: "strengthen".into(),
-            },
-        )
+            }],
+        })
     )?;
-    let removed = tools::memory_get(
-        &graph,
-        GetArgs {
-            iri: long_iri,
-            layers: vec![layer_a.clone()],
+    let removed = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: Some(vec![long_iri]),
+            labels: None,
+            around: None,
             hops: Some(0),
-        },
-    )
-    .await?;
+            p: None,
+            depth: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+        })
+        .await?;
     report.check(
-        "merge suggestions prefer the shorter name and memory_merge keeps only the target",
+        "merge suggestions prefer the shorter name and memory_unify keeps only the target",
         suggested
             && survivor.pointer("/node/iri").and_then(Value::as_str) == Some(short_iri.as_str())
-            && removed.get("found").and_then(Value::as_bool) == Some(false)
+            && removed.pointer("/lookups/0/found").and_then(Value::as_bool) == Some(false)
             && relation_state(&graph, &merge_survivor_relationship)
                 .await?
                 .is_some_and(|(_, current, weight)| current && weight == 1),
@@ -1861,16 +1837,14 @@ async fn run() -> Result<u32> {
 
     let same_txn_short_name = format!("007-{tag}");
     let same_txn_long_name = format!("007s-{tag}");
-    let same_txn_merge = tools::memory_assert(
-        &graph,
-        assert_args(
+    let same_txn_merge = service
+        .write(write_args(
             entity(same_txn_long_name.clone()),
             "mindreader:property/same-transaction-merge-smoke",
             object(same_txn_short_name.clone()),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
+        ))
+        .await?;
     report.check(
         "merge suggestions include similar entities created in the same transaction",
         same_txn_merge
@@ -1889,59 +1863,30 @@ async fn run() -> Result<u32> {
 
     let target_property_name = format!("mergeProperty{tag}");
     let source_property_name = format!("mergeProperty{tag}s");
-    let target_property = tools::memory_schema(
-        &graph,
-        SchemaArgs {
-            kind: "property".into(),
-            name: Some(target_property_name.clone()),
-            ..SchemaArgs::default()
-        },
-    )
-    .await?;
-    let source_property = tools::memory_schema(
-        &graph,
-        SchemaArgs {
-            kind: "property".into(),
-            name: Some(source_property_name.clone()),
-            ..SchemaArgs::default()
-        },
-    )
-    .await?;
-    let target_property_iri = target_property
-        .pointer("/node/iri")
-        .and_then(Value::as_str)
-        .ok_or_else(|| operation_error!("target property has no IRI: {target_property}"))?
-        .to_string();
-    let source_property_iri = source_property
-        .pointer("/node/iri")
-        .and_then(Value::as_str)
-        .ok_or_else(|| operation_error!("source property has no IRI: {source_property}"))?
-        .to_string();
-    let property_fact = tools::memory_assert(
-        &graph,
-        assert_args(
+    let target_property_iri = format!("mindreader:property/{target_property_name}");
+    let source_property_iri = format!("mindreader:property/{source_property_name}");
+    let property_fact = service
+        .write(write_args(
             entity(format!("property-merge-subject-{tag}")),
             target_property_iri.clone(),
             object(format!("property-merge-object-{tag}")),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    tools::memory_assert(
-        &graph,
-        assert_args(
+        ))
+        .await?;
+    service
+        .write(write_args(
             entity_iri(subject_iri(&property_fact)?),
             source_property_iri.clone(),
             object_iri(object_result_iri(&property_fact)?),
             vec![layer_a.clone()],
-        ),
-    )
-    .await?;
-    memory_merge(
-        &graph,
-        MergeArgs::from_iris(source_property_iri.clone(), target_property_iri.clone()),
-    )
-    .await?;
+        ))
+        .await?;
+    service
+        .unify(UnifyArgs::from_iris(
+            source_property_iri.clone(),
+            target_property_iri.clone(),
+        ))
+        .await?;
     let property_state = fetch_one(
         &graph,
         query(
@@ -1955,24 +1900,24 @@ async fn run() -> Result<u32> {
     )
     .await?
     .ok_or_else(|| operation_error!("property merge aggregate returned no row"))?;
-    let wrong_kind = memory_merge(
-        &graph,
-        MergeArgs::from_iris(short_iri.clone(), target_property_iri.clone()),
-    )
-    .await;
-    let incompatible_property = memory_merge(
-        &graph,
-        MergeArgs::from_iris(target_property_iri.clone(), "mindreader:property/ABOUT"),
-    )
-    .await;
-    let system_property = memory_merge(
-        &graph,
-        MergeArgs::from_iris(
+    let wrong_kind = service
+        .unify(UnifyArgs::from_iris(
+            short_iri.clone(),
+            target_property_iri.clone(),
+        ))
+        .await;
+    let incompatible_property = service
+        .unify(UnifyArgs::from_iris(
+            target_property_iri.clone(),
+            "mindreader:property/ABOUT",
+        ))
+        .await;
+    let system_property = service
+        .unify(UnifyArgs::from_iris(
             target_property_iri.clone(),
             "mindreader:property/CONTRADICTS",
-        ),
-    )
-    .await;
+        ))
+        .await;
     report.check(
         "property merges preserve predicate representation and reject incompatible or system-owned kinds",
         property_state.get::<i64>("count").unwrap_or(0) == 1
@@ -2005,13 +1950,6 @@ async fn run() -> Result<u32> {
     let unresolved_ref = format!("mindreader:relationship/missing-{tag}");
     let (unresolved_activation_id, unresolved_ttl_before) =
         seed_semantic_activation(&graph, &semantic_embedding, &[unresolved_ref], 600_000).await?;
-    let semantic_runtime = SemanticRuntime::new(
-        Arc::new(SmokeEmbedding),
-        SemanticConfig {
-            neighbor_limit: 100,
-            ..SemanticConfig::default()
-        },
-    );
     let semantic_args = SemanticSearchArgs {
         scope: vec![layer_a],
         text: semantic_text,
@@ -2019,13 +1957,7 @@ async fn run() -> Result<u32> {
         detail: None,
         limit: Some(20),
     };
-    let semantic_first = memory_semantic_search(
-        &graph,
-        Some(&semantic_runtime),
-        cfg.secrets_path(),
-        semantic_args.clone(),
-    )
-    .await?;
+    let semantic_first = service.recall_semantic(semantic_args.clone()).await?;
     let activation_after_first = fetch_one(
         &graph,
         query(
@@ -2035,13 +1967,7 @@ async fn run() -> Result<u32> {
     )
     .await?
     .ok_or_else(|| operation_error!("semantic activation aggregate returned no row"))?;
-    let semantic_second = memory_semantic_search(
-        &graph,
-        Some(&semantic_runtime),
-        cfg.secrets_path(),
-        semantic_args,
-    )
-    .await?;
+    let semantic_second = service.recall_semantic(semantic_args).await?;
     let activation = fetch_one(
         &graph,
         query(

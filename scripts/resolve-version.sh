@@ -47,8 +47,19 @@ if [[ "$npm_version" != "$version" ]]; then
   exit 1
 fi
 
+docker_version="$(sed -n 's/^ARG MINDREADER_VERSION=//p' Dockerfile | head -n 1)"
+if [[ "$docker_version" != "$version" ]]; then
+  echo "Dockerfile version $docker_version does not match package version $version" >&2
+  exit 1
+fi
+
 if ! grep -Fq "\"@bnomei/mindreader@$version\"" README.md; then
   echo "README.md does not pin the current package version $version in its MCP example" >&2
+  exit 1
+fi
+
+if ! grep -Fq "@bnomei/mindreader@$version" npm/mindreader/README.md; then
+  echo "npm README does not pin the current package version $version" >&2
   exit 1
 fi
 

@@ -14,8 +14,8 @@ To exercise the release pipeline locally for the current host target:
 
 ```bash
 TARGET=aarch64-apple-darwin scripts/build-release.sh
-VERSION=0.4.0 TARGET=aarch64-apple-darwin scripts/package-release.sh
-VERSION=0.4.0 TARGET=aarch64-apple-darwin scripts/smoke-release.sh
+VERSION=0.5.0 TARGET=aarch64-apple-darwin scripts/package-release.sh
+VERSION=0.5.0 TARGET=aarch64-apple-darwin scripts/smoke-release.sh
 ```
 
 Release tags, `Cargo.toml`, `mcp.json`, and the npm manifest must all use the same SemVer version.

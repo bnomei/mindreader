@@ -9,7 +9,7 @@ use mindreader::error::{Context, Result};
 use mindreader::graph::{self, acquire_fact_locks_in_txn, fetch_one};
 use mindreader::merge::merge_suggestions_in_txn;
 use mindreader::operation_error;
-use mindreader::search::{self, SearchArgs};
+use mindreader::service::{MemoryService, RecallArgs};
 use neo4rs::{query, Graph};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -109,7 +109,7 @@ async fn seed(
                   name: 'common benchmark subject ' + toString(i),
                   searchText: 'common benchmark subject ' + toString(i),
                   mergeName: 'common benchmark subject ' + toString(i),
-                  layers: [$layer], weight: i % 17, weightText: toString(i % 17),
+                  layers: [$layer], weight: i % 17,
                   createdAt: datetime()
                 })
                 CREATE (o:Entity:Element {
@@ -117,14 +117,14 @@ async fn seed(
                   name: 'benchmark object ' + toString(i),
                   searchText: 'benchmark object ' + toString(i),
                   mergeName: 'benchmark object ' + toString(i),
-                  layers: [$layer], weight: i % 11, weightText: toString(i % 11),
+                  layers: [$layer], weight: i % 11,
                   createdAt: datetime()
                 })
                 CREATE (s)-[:ASSERTS {
                   iri: $prefix + '/fact/' + toString(i),
                   propertyIri: 'mindreader:property/benchmark',
                   factText: 'common benchmark fact ' + toString(i),
-                  layers: [$layer], weight: i % 13, weightText: toString(i % 13),
+                  layers: [$layer], weight: i % 13,
                   validFrom: datetime()
                 }]->(o)
                 "#,
@@ -163,12 +163,12 @@ async fn seed(
                 CREATE (:Entity:Element {
                   iri: pair.createdIri, name: pair.createdName,
                   searchText: pair.createdName, mergeName: toLower(pair.createdName),
-                  layers: [$layer], weight: 0, weightText: '0', createdAt: datetime()
+                  layers: [$layer], weight: 0, createdAt: datetime()
                 })
                 CREATE (:Entity:Element {
                   iri: pair.candidateIri, name: pair.candidateName,
                   searchText: pair.candidateName, mergeName: toLower(pair.candidateName),
-                  layers: [$layer], weight: 0, weightText: '0', createdAt: datetime()
+                  layers: [$layer], weight: 0, createdAt: datetime()
                 })
                 "#,
             )
@@ -190,44 +190,51 @@ async fn seed(
 }
 
 async fn benchmark_search(
-    graph: &Graph,
+    service: &MemoryService,
     layer: &str,
     prefix: &str,
     entities: i64,
     samples: usize,
 ) -> Result<(Value, Vec<String>)> {
-    let args = || SearchArgs {
-        layers: vec![layer.to_string()],
+    let args = || RecallArgs {
+        scope: vec![layer.to_string()],
         text: Some("common".into()),
+        iris: None,
         labels: None,
+        around: None,
+        hops: None,
+        p: None,
+        depth: None,
+        history: None,
+        detail: Some("detailed".into()),
         limit: Some(20),
     };
     for _ in 0..WARMUPS {
-        search::memory_search(graph, args()).await?;
+        service.recall(args()).await?;
     }
     let mut timings = Vec::with_capacity(samples);
     let mut reference = Vec::new();
     for sample in 0..samples {
         let started = Instant::now();
-        let result = search::memory_search(graph, args()).await?;
+        let result = service.recall(args()).await?;
         timings.push(started.elapsed().as_secs_f64() * 1_000.0);
         let relationships = result
             .get("facts")
             .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|fact| {
+            .ok_or_else(|| operation_error!("memory_recall response has no facts array"))?
+            .iter()
+            .map(|fact| {
                 fact.pointer("/target/iri")
-                    .or_else(|| fact.pointer("/relationship/iri"))
                     .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| operation_error!("memory_recall fact has no target.iri: {fact}"))
             })
-            .map(str::to_string)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         if sample == 0 {
             reference = relationships;
         } else if relationships != reference {
             return Err(operation_error!(
-                "memory_search returned nondeterministic relationship ordering"
+                "memory_recall returned nondeterministic fact ordering"
             ));
         }
     }
@@ -248,7 +255,7 @@ async fn benchmark_search(
         .collect::<Vec<_>>();
     if reference != expected {
         return Err(operation_error!(
-            "memory_search ranking diverged from the benchmark oracle: expected={expected:?} actual={reference:?}"
+            "memory_recall ranking diverged from the benchmark oracle: expected={expected:?} actual={reference:?}"
         ));
     }
     Ok((summary(timings), reference))
@@ -355,6 +362,7 @@ async fn run() -> Result<Value> {
     };
     let graph = graph::connect(&config).await?;
     graph::bootstrap(&graph, None, mindreader::graph::SpaceReplace::Refuse).await?;
+    let service = MemoryService::new(graph.clone(), &config)?;
     let pristine = fetch_one(
         &graph,
         query(
@@ -370,7 +378,8 @@ async fn run() -> Result<Value> {
     let existing_relationships = pristine.get::<i64>("relationships")?;
     if existing_nodes != 15 || existing_relationships != 0 {
         return Err(operation_error!(
-            "mindreader-bench requires a fresh disposable model-v5 database after bootstrap; found {existing_nodes} nodes and {existing_relationships} relationships"
+            "mindreader-bench requires a fresh disposable model-v{} database after bootstrap; found {existing_nodes} nodes and {existing_relationships} relationships",
+            graph::MODEL_VERSION,
         ));
     }
 
@@ -385,7 +394,7 @@ async fn run() -> Result<Value> {
     let seed_ms = seeded.elapsed().as_secs_f64() * 1_000.0;
 
     let (search, search_order) =
-        benchmark_search(&graph, &layer, &prefix, options.entities, options.samples).await?;
+        benchmark_search(&service, &layer, &prefix, options.entities, options.samples).await?;
     let locks = benchmark_locks(&graph, &layer, options.samples).await?;
     let suggestions = benchmark_suggestions(&graph, &merge_pairs, &layer, options.samples).await?;
 
@@ -402,12 +411,12 @@ async fn run() -> Result<Value> {
             "seedMs": seed_ms,
             "layer": layer,
         },
-        "memorySearch": {
+        "memoryRecall": {
             "latency": search,
-            "relationshipOrder": search_order,
+            "factOrder": search_order,
         },
         "factLocksByFactCount": locks,
-        "mergeSuggestionsByCreatedCount": suggestions,
+        "unifySuggestionsByCreatedCount": suggestions,
     }))
 }
 

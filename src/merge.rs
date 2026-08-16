@@ -1,6 +1,6 @@
 //! Permanent same-kind unify and advisory duplicate suggestions.
 //!
-//! MCP `memory_unify` calls [`memory_merge`]: source memberships, history, and
+//! MCP `memory_unify` calls [`memory_unify`]: source memberships, history, and
 //! edges move onto a surviving target of the same canonical kind, with no
 //! `scope` filter. Bootstrap-seeded Class/Property IRIs cannot be sources.
 //! Writes may attach [`merge_suggestions_in_txn`] results as review-only
@@ -68,12 +68,12 @@ fn lucene_fuzzy_term(name: &str) -> String {
 
 /// MCP `memory_unify` arguments: surviving `target` node absorbs `source`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-pub struct MergeArgs {
+pub struct UnifyArgs {
     pub source: NodeHandle,
     pub target: NodeHandle,
 }
 
-impl MergeArgs {
+impl UnifyArgs {
     /// Build unify arguments from two node IRIs (smoke, bench, and in-process callers).
     pub fn from_iris(source: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
@@ -84,9 +84,9 @@ impl MergeArgs {
 }
 
 /// Permanently unify two same-kind nodes; MCP name is `memory_unify`.
-pub async fn memory_merge(graph: &Graph, args: MergeArgs) -> Result<Value> {
+pub async fn memory_unify(graph: &Graph, args: UnifyArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
-        match memory_merge_once(graph, &args).await {
+        match memory_unify_once(graph, &args).await {
             Err(error) if attempt < 2 && is_transient(&error) => {
                 sleep(Duration::from_millis(25 * (attempt + 1))).await;
             }
@@ -101,7 +101,7 @@ fn is_transient(error: &Error) -> bool {
 }
 
 /// One unify attempt: validate kinds, move history in one transaction, commit or roll back.
-async fn memory_merge_once(graph: &Graph, args: &MergeArgs) -> Result<Value> {
+async fn memory_unify_once(graph: &Graph, args: &UnifyArgs) -> Result<Value> {
     let source = args.source.iri()?.to_string();
     let target = args.target.iri()?.to_string();
     let source = source.as_str();
@@ -150,7 +150,7 @@ async fn affected_fact_locks_in_txn(
                 OR r.propertyIri IN [$source, $target] \
              WITH DISTINCT s, r \
              UNWIND [ \
-               {subject: s.iri, property: coalesce(r.propertyIri, 'mindreader:property/' + type(r))}, \
+               {subject: s.iri, property: r.propertyIri}, \
                {subject: r.iri, property: $weightProperty} \
              ] AS guard \
              RETURN DISTINCT guard.subject AS subject, guard.property AS property",
@@ -213,7 +213,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     let locked_affected = affected_fact_locks_in_txn(txn, source_iri, target_iri).await?;
     if locked_affected != initial_affected {
         return Err(Error::ConcurrentMutation(
-            "the relationships affected by memory_merge; retry the merge".into(),
+            "the relationships affected by memory_unify; retry the operation".into(),
         ));
     }
     let row = fetch_one_txn(
@@ -241,13 +241,13 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
         require_compatible_property_merge(source_iri, target_iri)?;
     }
 
-    let source_layers = source.get::<Vec<String>>("layers").unwrap_or_default();
-    let target_layers = target.get::<Vec<String>>("layers").unwrap_or_default();
+    let source_layers = source.get::<Vec<String>>("layers")?;
+    let target_layers = target.get::<Vec<String>>("layers")?;
     let layers = merge_memberships(&target_layers, &source_layers);
-    let weight = node_weight(&target).saturating_add(node_weight(&source));
+    let weight = node_weight(&target)?.saturating_add(node_weight(&source)?);
     let episode = create_episode_in_txn(txn, "memory_unify", None).await?;
 
-    let source_relationships = fetch_all_txn(
+    let source_relationships_row = fetch_all_txn(
         txn,
         query(
             "MATCH (source:Entity {iri: $source})-[r]-() \
@@ -258,8 +258,8 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     .await?
     .into_iter()
     .next()
-    .and_then(|row| row.get::<Vec<String>>("iris").ok())
-    .unwrap_or_default();
+    .ok_or_else(|| operation_error!("source relationship lookup returned no row"))?;
+    let source_relationships = source_relationships_row.get::<Vec<String>>("iris")?;
 
     txn.run(
         query(
@@ -286,7 +286,6 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
             ) YIELD node
             SET node.layers = $layers,
                 node.weight = $weight,
-                node.weightText = toString($weight),
                 node.mergeName = toLower(coalesce(node.name, '')),
                 node.searchText = trim(coalesce(node.name, '') + ' ' + node.iri + ' ' + coalesce(node.value, '')),
                 node.mergeEpisodeId = $episode
@@ -333,7 +332,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
             WHERE r.mergeEpisodeId = $episode
                OR ($propertyMerge AND r.propertyIri = $target)
             WITH s, r, o,
-                 coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
+                 r.propertyIri AS property
             WITH s, r, o,
                  CASE
                    WHEN property CONTAINS '/' THEN last(split(property, '/'))
@@ -352,7 +351,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     )
     .await?;
     consolidate_current_duplicates(txn, target_iri, property_merge, &episode).await?;
-    let node = node_json(&merged_node);
+    let node = node_json(&merged_node)?;
     let current = node.get("target").cloned();
     Ok(finish_mutation(
         json!({
@@ -446,20 +445,12 @@ fn reject_internal_node(node: &Node, field: &str) -> Result<()> {
     Ok(())
 }
 
-// Prefer `weightText` so signed weights survive neo4rs 0.8 integer decoding.
-fn node_weight(node: &Node) -> i64 {
-    node.get::<String>("weightText")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| node.get::<i64>("weight").unwrap_or(0))
+fn node_weight(node: &Node) -> Result<i64> {
+    Ok(node.get::<i64>("weight")?)
 }
 
-fn relation_weight(relation: &Relation) -> i64 {
-    relation
-        .get::<String>("weightText")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| relation.get::<i64>("weight").unwrap_or(0))
+fn relation_weight(relation: &Relation) -> Result<i64> {
+    Ok(relation.get::<i64>("weight")?)
 }
 
 /// Union named memberships; either empty list is global and wins.
@@ -567,7 +558,7 @@ async fn consolidate_current_duplicates(
             "MATCH (s:Entity)-[r]->(o:Entity) \
              WHERE r.validTo IS NULL AND (s.iri = $target OR o.iri = $target \
                 OR ($includePropertyFacts AND r.propertyIri = $target)) \
-             RETURN s.iri AS s, type(r) AS type, coalesce(r.propertyIri, '') AS property, \
+             RETURN s.iri AS s, type(r) AS type, r.propertyIri AS property, \
                     o.iri AS o, r",
         )
         .param("target", target_iri.to_string())
@@ -578,10 +569,7 @@ async fn consolidate_current_duplicates(
         BTreeMap::new();
     for row in rows {
         let relation: Relation = row.get("r")?;
-        let iri = relation.get::<String>("iri").unwrap_or_default();
-        if iri.is_empty() {
-            continue;
-        }
+        let iri = relation.get::<String>("iri")?;
         let mut episodes = relation
             .get::<Vec<String>>("provenanceEpisodeIds")
             .unwrap_or_default();
@@ -600,8 +588,8 @@ async fn consolidate_current_duplicates(
             .or_default()
             .push(DuplicateFact {
                 iri,
-                layers: relation.get::<Vec<String>>("layers").unwrap_or_default(),
-                weight: relation_weight(&relation),
+                layers: relation.get::<Vec<String>>("layers")?,
+                weight: relation_weight(&relation)?,
                 episodes,
             });
     }
@@ -614,7 +602,6 @@ async fn consolidate_current_duplicates(
                 "UNWIND $updates AS update \
                  MATCH ()-[r]->() WHERE r.iri = update.iri AND r.validTo IS NULL \
                  SET r.layers = update.layers, r.weight = update.weight, \
-                     r.weightText = toString(update.weight), \
                      r.provenanceEpisodeIds = update.provenance, r.mergeEpisodeId = $episode \
                  RETURN count(r) AS updated",
             )

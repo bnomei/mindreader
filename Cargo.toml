@@ -10,6 +10,7 @@ documentation = "https://docs.rs/mindreader"
 homepage = "https://github.com/bnomei/mindreader"
 include = [
   "/src/**",
+  "/benches/**",
   "/Cargo.toml",
   "/Cargo.lock",
   "/README.md",
@@ -62,7 +63,7 @@ async-trait = "0.1.92"
 directories = "6.0.0"
 dotenvy = "0.15.7"
 httpdate = "1.0.3"
-neo4rs = "0.8.0"
+neo4rs = "=0.9.0-rc.10"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rmcp = { version = "3.1.2", default-features = false, features = ["server", "transport-io", "macros", "schemars"] }
 schemars = "1.2.2"

@@ -112,9 +112,6 @@ impl Error {
 
 fn neo4j_is_transient(error: &Neo4jError) -> bool {
     matches!(error, Neo4jError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
-        // neo4rs 0.8 surfaces FAILURE received during PULL as an
-        // UnexpectedMessage string instead of its typed Neo4j variant.
-        || matches!(error, Neo4jError::UnexpectedMessage(message) if message.contains("Neo.TransientError."))
 }
 
 /// Adds operational context while retaining a typed source chain.
@@ -209,10 +206,10 @@ mod tests {
     }
 
     #[test]
-    fn pull_failures_preserve_transient_retry_classification() {
+    fn untyped_driver_messages_are_not_retryable() {
         let error = Error::Neo4j(Neo4jError::UnexpectedMessage(
             "FAILURE code=Neo.TransientError.Transaction.DeadlockDetected".into(),
         ));
-        assert!(error.is_transient_neo4j());
+        assert!(!error.is_transient_neo4j());
     }
 }

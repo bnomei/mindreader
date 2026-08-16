@@ -35,7 +35,7 @@ That is a different contract from chat-memory extractors such as [Graphiti](http
 - Pasteable `target` handles on nodes and facts so the next tool call copies identity instead of inventing it.
 - Request-scoped layer visibility (`scope`). `[]` is global-only, not all memory. Layers are a flashlight, not an ACL.
 - RDFS schema-as-data: Class and Property nodes live in the graph and are listed with `memory_recall` `labels`.
-- Set-valued current facts, explicit `SUPERSEDES` corrections, optional `CONTRADICTS` links, and soft retraction (`validTo`).
+- Set-valued current facts, explicit `SUPERSEDES` corrections, optional `CONTRADICTS` links, and soft withdrawal (`validTo`).
 - Advisory `review.unify` / `review.alternatives` queues. Merges and corrections stay intentional.
 - Shared signed weights changed only by `memory_judge`. Retrieval never updates rank by itself.
 - Spike categories ranked `Knowledge > Insight > Pattern > Signal`, then weight, then text.
@@ -151,7 +151,7 @@ NEO4J_PASSWORD='<same-password-as-repository-.env>' cargo run --features develop
 
 The smoke process reads secrets from `packaging/tools-config` (Bolt 7688) so it cannot rewrite a live MCP embedding space on 7687. Process `NEO4J_PASSWORD` still wins over the colocated `.env`.
 
-The smoke test creates test graph data and exercises schema creation, dynamic multi-layer visibility, membership merging, scoped replacement and retraction, signed feedback ranking, concurrent feedback, membership auditing, endpoint closure, and stable relationship retrieval. A successful run ends with:
+The smoke test creates test graph data and exercises catalog creation, dynamic multi-layer visibility, membership merging, scoped revision and withdrawal, signed judgment ranking, concurrent judgments, membership auditing, endpoint closure, and stable fact-handle retrieval. A successful run ends with:
 
 ```text
 ALL PASS
@@ -171,7 +171,7 @@ Run the binary without arguments to serve MCP. It also accepts `-h`/`--help` and
 
 ## Connect an MCP client
 
-Mindreader uses stdio transport. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all eight tools in the [MCP tool reference](#mcp-tool-reference).
+Mindreader uses stdio transport and supports only MCP `2026-07-28`, including the discovery lifecycle and self-contained request metadata. Older initialization protocols are rejected rather than downgraded. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all eight tools in the [MCP tool reference](#mcp-tool-reference).
 
 ### Local binary
 
@@ -338,7 +338,7 @@ Call `memory_recall` with `around` and optional predicate names:
 For `around`, `paths[i]` is the deterministic shortest witness path for
 `facts[i]`; intermediate path edges do not consume the requested fact limit.
 
-Reasserting the same current triple returns `"noop": true`. Asserting a different object adds another current value. Use `memory_revise` when one exact current value is a correction of another.
+Reasserting the same current triple merges any missing requested memberships; it returns `"noop": true` only when those memberships are already present. Writing a different object adds another current value. Use `memory_revise` when one exact current value is a correction of another.
 
 After a returned fact helps, strengthen its shared weight explicitly:
 
@@ -381,7 +381,7 @@ Both `memory_judge` and `memory_place` accept 1–20 input items, reject duplica
 
 All successful results include `ok:true`. Successful mutations include `noop` and `episode`, and scoped mutations echo `scope`; batch mutations include `summary:{requested,changed,noop}` plus input-ordered `items` with stable indexes, targets, statuses, and operation-specific fields. An all-noop mutation has `noop:true` and `episode:null`.
 
-Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable,outcome}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. `outcome:"not_applied"` confirms no mutation committed. `outcome:"unknown"` means the caller must not assume retrying a non-idempotent mutation is safe. Every scoped tool requires a `scope` array; permanent `memory_unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers apply a 120/min burst-40 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
+Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable,outcome}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. `outcome:"not_applied"` confirms no mutation committed. `outcome:"unknown"` means the caller must not assume retrying a non-idempotent mutation is safe. Every scoped tool requires a `scope` array; permanent `memory_unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
@@ -400,7 +400,7 @@ Successful results include a `handles` bag. Fact envelopes include `current`, `r
 
 MCP annotations explicitly describe host-facing risk. Ordinary recall is read-only and closed-world. Semantic recall is additive, non-idempotent, and open-world because it contacts the configured provider and maintains activations. Write is additive and idempotent; place is destructive but idempotent; judge is destructive and non-idempotent. Revise, withdraw, and unify use conservative destructive, non-idempotent, closed-world hints. These hints help a host present consent UI, but Mindreader still validates every call.
 
-### Assertion values
+### Writing values
 
 Subjects and entity objects use an explicit `kind` tag and require `iri` or `name`:
 
@@ -509,13 +509,13 @@ The embedding provider, model, and dimensions define one vector space for the da
 
 ### Provenance and history
 
-Each state-changing mutation creates one `Episode` with its public 0.4 tool name (`memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, or `memory_unify`) and timestamp; no-op mutations create none. Internal semantic-activation maintenance is excluded. Relationships carry the episode identifier. Withdrawal sets `validTo` and optionally records a reason; it does not delete graph nodes. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be asserted, revised, or withdrawn directly.
+Each state-changing mutation creates one `Episode` with its canonical tool name (`memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, or `memory_unify`) and timestamp; no-op mutations create none. Internal semantic-activation maintenance is excluded. Relationships carry the episode identifier. Withdrawal sets `validTo` and optionally records a reason; it does not delete graph nodes. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be written, revised, or withdrawn directly.
 
 `memory_revise` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction. Its result exposes the replacement as `target` and the retired handle as `previousTarget`. `memory_recall` with `history` walks the current and `validTo` facts for one node or fact IRI.
 
 Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because their outcome may be ambiguous.
 
-`CONTRADICTS` is multi-valued. Setting `contradicts: true` on an assertion or replacement records explicit links to conflicting visible current objects.
+`CONTRADICTS` is multi-valued. Setting `contradicts: true` on a write or revision records explicit links to conflicting visible current objects.
 
 `memory_unify` is the intentional destructive exception to soft history: it requires matching canonical kinds and removes the source node after moving its memberships and current and historical relationships onto the target. Bootstrap-seeded Class and Property IRIs are permanent targets and cannot be sources. It records exactly one `memory_unify` Episode, preserves the target IRI and name, combines memberships and weights, marks moved relationships with unification provenance, and soft-closes unification-created self-relations and duplicate facts. Unifying Properties rewrites their predicate references and refreshed search text transactionally, but both Properties must use the same structural relationship representation; system-owned `CONTRADICTS` and `SUPERSEDES` Properties cannot be unified. It creates no alias. Review the direction before calling it.
 
@@ -612,9 +612,9 @@ A non-empty process environment secret takes precedence over the colocated `.env
 
 ### Database bootstrap
 
-At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 5, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. The merge-candidate index uses a synchronous keyword-analyzed lowercase whole-name property so APOC can rerank a small indexed candidate set without scanning every entity. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
+At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 6, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. The merge-candidate index uses a synchronous keyword-analyzed lowercase whole-name property so APOC can rerank a small indexed candidate set without scanning every entity. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
 
-Initializing model version 5 requires an empty database. Subsequent starts accept a compatible model-v5 database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
+Initializing model version 6 requires an empty database. Subsequent starts accept a compatible model-v6 database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
 
 ## Run entirely with Docker
 
@@ -658,7 +658,7 @@ Run the release-mode graph benchmark against a disposable database before changi
 cargo run --release --features developer-tools --bin mindreader-bench -- --config-dir packaging/tools-config --entities 10000 --samples 30
 ```
 
-The benchmark refuses any database that is not pristine after model-v5 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions at 1/4/20 newly created entities. Never point it at production or a database whose contents must be preserved.
+The benchmark refuses any database that is not pristine after model-v6 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions at 1/4/20 newly created entities. Never point it at production or a database whose contents must be preserved.
 
 Use Divan for graph-free CPU regressions:
 
@@ -675,8 +675,8 @@ The normalization matrix covers dimensions 3, 256, 512, 1536, 3072, and 4096. Ke
 | [`src/server.rs`](src/server.rs) | MCP tool registration, advertised input schemas, protocol negotiation, and lazy database access. |
 | [`src/service.rs`](src/service.rs) | Typed application boundary used by transport adapters. |
 | [`src/error.rs`](src/error.rs) | Typed application errors, retained source context, and Neo4j retry classification. |
-| [`src/domain.rs`](src/domain.rs) | Validated layer IDs and tagged entity, literal, target, replacement, and retraction concepts. |
-| [`src/tools.rs`](src/tools.rs) | Mutation arguments, scoped graph behavior, feedback, membership auditing, supersession, contradiction, and retraction. |
+| [`src/domain.rs`](src/domain.rs) | Validated layer IDs and tagged entity, literal, target, revision, and withdrawal concepts. |
+| [`src/tools.rs`](src/tools.rs) | Mutation arguments, scoped graph behavior, judgment, membership auditing, supersession, contradiction, and withdrawal. |
 | [`src/search.rs`](src/search.rs) | Full-text and label-only retrieval, complete database-side ranking, and bounded result assembly. |
 | [`src/merge.rs`](src/merge.rs) | Permanent entity merging and APOC-backed fuzzy suggestions. |
 | [`src/semantic.rs`](src/semantic.rs) | Direct-plus-vector semantic ranking, activation convergence, and TTL refresh. |
@@ -688,7 +688,7 @@ The normalization matrix covers dimensions 3, 256, 512, 1536, 3072, and 4096. Ke
 | [`src/bin/mindreader-smoke.rs`](src/bin/mindreader-smoke.rs) | Live end-to-end graph behavior checks. |
 | [`src/bin/mindreader-bench.rs`](src/bin/mindreader-bench.rs) | Reproducible release-mode search, logical-lock, and merge-suggestion benchmarks. |
 | [`benches/cpu_hotspots.rs`](benches/cpu_hotspots.rs) | Divan microbenchmarks for graph-free CPU paths and supported workload bounds. |
-| [`scripts/mcp_handshake_probe.py`](scripts/mcp_handshake_probe.py) | Portable MCP initialize and tool-discovery diagnostic. |
+| [`scripts/mcp_handshake_probe.py`](scripts/mcp_handshake_probe.py) | Portable MCP discovery, protocol-rejection, and tool-inventory diagnostic. |
 | [`mcp.json`](mcp.json) | Server metadata, transport, environment, and exported tool inventory. |
 
 ## Troubleshooting
@@ -716,7 +716,7 @@ docker compose ps
 docker compose logs neo4j
 ```
 
-Mindreader tries the configured endpoint up to three times with bounded backoff. MCP initialization and tool discovery can still succeed before Neo4j connects; the first database-backed tool call reports the connection error if Neo4j remains unavailable.
+Mindreader uses the configured URI exactly as written and connects lazily on the first database-backed call. MCP discovery and `tools/list` can still succeed while Neo4j is unavailable; that first database-backed call reports the connection error.
 
 ### The MCP client connects but lists no tools
 

@@ -1,7 +1,7 @@
-//! Validated domain values for layer ids, nodes, literals, spikes, and retract width.
+//! Validated domain values for layer ids, nodes, literals, spikes, and withdrawal width.
 //!
 //! These types run before Neo4j work: kebab-case layer ids, `node`/`literal`
-//! object shapes, predicate IRIs, Spike ranks, and retract scopes. Graph
+//! object shapes, predicate IRIs, Spike ranks, and withdrawal scopes. Graph
 //! adapters turn the validated values into Cypher parameters.
 
 use crate::iri::{default_lower_for_kind, is_iri, kind_for_label, mint_iri, slugify};
@@ -379,23 +379,23 @@ impl SpikeRank {
     }
 }
 
-/// In-process retract width: one fact, all facts for a predicate, or a whole subject.
+/// Withdrawal width: one fact, all facts for a predicate, or a whole subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RetractScope {
+pub enum WithdrawalScope {
     Fact,
     Predicate,
     Subject,
 }
 
-impl RetractScope {
-    /// Parse retract width: `fact`, `predicate`, or `subject`.
+impl WithdrawalScope {
+    /// Parse withdrawal width: `fact`, `predicate`, or `subject`.
     pub fn parse(value: &str) -> Result<Self, DomainError> {
         match value {
             "fact" => Ok(Self::Fact),
             "predicate" => Ok(Self::Predicate),
             "subject" => Ok(Self::Subject),
             _ => Err(DomainError::InvalidInput(
-                "retract target kind must be fact, predicate, or subject".into(),
+                "withdrawal target kind must be fact, predicate, or subject".into(),
             )),
         }
     }

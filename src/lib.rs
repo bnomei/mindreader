@@ -6,7 +6,7 @@
 //! revise, withdraw, judge, place, and unify.
 //!
 //! Facts are explicit triples with Episode provenance, request `scope`
-//! (stored as `layers` memberships), signed feedback weights, soft retraction
+//! (stored as `layers` memberships), signed judgment weights, soft withdrawal
 //! (`validTo`), and intentional same-kind unify.
 
 pub mod config;
@@ -22,7 +22,7 @@ pub mod search;
 pub mod semantic;
 pub mod server;
 pub mod service;
-pub mod tools;
+mod tools;
 
 /// Stdio MCP server: eight tools, lazy Neo4j, and the process-local invoke limiter.
 pub use server::Mindreader;

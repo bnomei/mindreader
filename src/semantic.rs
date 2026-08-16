@@ -185,10 +185,9 @@ pub async fn memory_semantic_search(
     let mut facts_by_iri = HashMap::new();
     let mut direct_order = Vec::new();
     for fact in direct_facts {
-        if let Some(iri) = crate::search::fact_handle_iri(&fact) {
-            direct_order.push(iri.to_string());
-            facts_by_iri.insert(iri.to_string(), fact);
-        }
+        let iri = crate::search::fact_handle_iri(&fact)?.to_string();
+        direct_order.push(iri.clone());
+        facts_by_iri.insert(iri, fact);
     }
 
     let recalled_iris = activations
@@ -361,7 +360,7 @@ async fn query_activations(
         .map(|row| {
             Ok(Activation {
                 element_id: row.get("elementId")?,
-                result_refs: row.get::<Vec<String>>("resultRefs").unwrap_or_default(),
+                result_refs: row.get::<Vec<String>>("resultRefs")?,
                 similarity: row.get("score")?,
             })
         })
@@ -408,26 +407,31 @@ async fn resolve_facts(
         let r: Relation = row.get("r")?;
         let o: Node = row.get("o")?;
         let iri = r.get::<String>("iri")?;
-        let s_json = endpoint_json(&s);
-        let o_json = endpoint_json(&o);
-        let s_iri = s.get::<String>("iri").unwrap_or_default();
-        let o_iri = o.get::<String>("iri").unwrap_or_default();
-        let relation = rel_json(&r, &s_iri, &o_iri);
-        let p = r
-            .get::<String>("propertyIri")
-            .unwrap_or_else(|_| format!("mindreader:property/{}", r.typ()));
+        let s_json = endpoint_json(&s)?;
+        let o_json = endpoint_json(&o)?;
+        let s_iri = s.get::<String>("iri")?;
+        let o_iri = o.get::<String>("iri")?;
+        let relation = rel_json(&r, &s_iri, &o_iri)?;
+        let p = r.get::<String>("propertyIri")?;
         let subject_labels = s
             .labels()
             .into_iter()
             .filter(|label| *label != "Entity")
             .map(str::to_string)
             .collect::<Vec<_>>();
-        let effective_weight = s_json["weight"]
-            .as_i64()
-            .unwrap_or(0)
-            .saturating_add(relation["weight"].as_i64().unwrap_or(0))
-            .saturating_add(o_json["weight"].as_i64().unwrap_or(0));
-        let scope = r.get::<Vec<String>>("layers").unwrap_or_default();
+        let effective_weight =
+            s_json["weight"]
+                .as_i64()
+                .ok_or_else(|| operation_error!("serialized subject weight is not an integer"))?
+                .saturating_add(
+                    relation["weight"].as_i64().ok_or_else(|| {
+                        operation_error!("serialized fact weight is not an integer")
+                    })?,
+                )
+                .saturating_add(o_json["weight"].as_i64().ok_or_else(|| {
+                    operation_error!("serialized object weight is not an integer")
+                })?);
+        let scope = r.get::<Vec<String>>("layers")?;
         let mut fact = fact_envelope(
             s_json,
             &p,
@@ -435,7 +439,7 @@ async fn resolve_facts(
             &relation,
             &scope,
             spike_label(&subject_labels).map(Value::String),
-        );
+        )?;
         fact["score"] = json!(0.0);
         fact["effectiveWeight"] = json!(effective_weight);
         facts.push((iri, fact));

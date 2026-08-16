@@ -20,7 +20,6 @@ use neo4rs::{query, Graph, Node, Path, Relation, Row, Txn, UnboundedRelation};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use tokio::time::{sleep, Duration};
 use uuid::Uuid;
 
 /// Fixed relationship types known to the schema (including system-owned edges).
@@ -76,7 +75,7 @@ const LABEL_OK: &str = "label";
 /// Property key on the singleton model marker node.
 pub const MODEL_MARKER_KEY: &str = "model";
 /// Current graph model version; incompatible databases must be recreated.
-pub const MODEL_VERSION: i64 = 5;
+pub const MODEL_VERSION: i64 = 6;
 /// Vector index name for expiring semantic activations.
 pub const SEMANTIC_INDEX: &str = "semantic_activation_embeddings";
 /// Keyword full-text index used for advisory merge candidate names.
@@ -98,56 +97,12 @@ const REQUIRED_FULLTEXT_INDEXES: &[(&str, &str)] = &[
 ];
 const WAKEUP_NODE_PROPERTIES: &[&str] = &["name", "iri", "searchText", "value"];
 
-/// Connect to Neo4j with password from config, retrying alternate URI forms.
+/// Configure the Neo4j driver from the exact endpoint supplied by the user.
 pub async fn connect(cfg: &Config) -> Result<Graph> {
     let password = cfg.neo4j_password()?;
-    let stripped = cfg
-        .uri
-        .trim_start_matches("bolt://")
-        .trim_start_matches("neo4j://")
-        .trim_start_matches("bolt+s://")
-        .trim_start_matches("neo4j+s://")
-        .to_string();
-    let mut endpoints = vec![cfg.uri.clone()];
-    if stripped != cfg.uri {
-        endpoints.push(stripped);
-    }
-
-    let mut errors = Vec::new();
-    let mut last_error = None;
-    for attempt in 1..=3 {
-        for endpoint in &endpoints {
-            match Graph::new(endpoint.as_str(), cfg.user.as_str(), password).await {
-                Ok(g) => {
-                    if attempt > 1 {
-                        eprintln!(
-                            "{}",
-                            json!({
-                                "level": "info",
-                                "event": "neo4j_connect_recovered",
-                                "attempt": attempt,
-                                "endpoint": endpoint
-                            })
-                        );
-                    }
-                    return Ok(g);
-                }
-                Err(err) => {
-                    errors.push(format!("attempt={attempt} endpoint={endpoint} error={err}"));
-                    last_error = Some(err);
-                }
-            }
-        }
-        if attempt < 3 {
-            sleep(Duration::from_millis(250 * attempt as u64)).await;
-        }
-    }
-
-    let message = format!("neo4j connect failed after retries: {}", errors.join(" | "));
-    match last_error {
-        Some(error) => Err(Error::from(error).context(message)),
-        None => Err(graph_error!("{message}")),
-    }
+    Graph::new(cfg.uri.as_str(), cfg.user.as_str(), password)
+        .map_err(Error::from)
+        .context(format!("configure Neo4j endpoint {}", cfg.uri))
 }
 
 /// Ensure model marker, constraints, indexes, and seed schema for an empty or current database.
@@ -205,7 +160,7 @@ pub async fn bootstrap(
             ] AS row
             MERGE (c:Entity:Class {iri: row.iri})
             ON CREATE SET c.name = row.name, c.createdAt = datetime(),
-              c.weight = 0, c.weightText = '0', c.layers = []
+              c.weight = 0, c.layers = []
             SET c.searchText = trim(coalesce(c.name, row.name) + ' ' + c.iri),
                 c.mergeName = toLower(coalesce(c.name, row.name))
             "#,
@@ -231,7 +186,7 @@ pub async fn bootstrap(
             ] AS row
             MERGE (p:Entity:Property {iri: row.iri})
             ON CREATE SET p.name = row.name, p.createdAt = datetime(),
-              p.weight = 0, p.weightText = '0', p.layers = []
+              p.weight = 0, p.layers = []
             SET p.searchText = trim(coalesce(p.name, row.name) + ' ' + p.iri),
                 p.mergeName = toLower(coalesce(p.name, row.name))
             "#,
@@ -254,7 +209,7 @@ pub async fn bootstrap(
 
 /// Require APOC Core/Extended plus TTL before bootstrap continues.
 async fn verify_required_apoc(graph: &Graph) -> Result<()> {
-    let functions = fetch_all(
+    let functions_row = fetch_all(
         graph,
         query(
             "SHOW FUNCTIONS YIELD name WHERE name IN [\
@@ -266,8 +221,8 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     .context("inspect required APOC functions")?
     .into_iter()
     .next()
-    .and_then(|row| row.get::<Vec<String>>("names").ok())
-    .unwrap_or_default();
+    .ok_or_else(|| graph_error!("Neo4j returned no APOC function catalog row"))?;
+    let functions = functions_row.get::<Vec<String>>("names")?;
     for name in ["apoc.text.fuzzyMatch", "apoc.text.levenshteinSimilarity"] {
         if !functions.iter().any(|actual| actual == name) {
             return Err(graph_error!(
@@ -276,7 +231,7 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
         }
     }
 
-    let procedures = fetch_all(
+    let procedures_row = fetch_all(
         graph,
         query(
             "SHOW PROCEDURES YIELD name WHERE name IN [\
@@ -289,8 +244,8 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     .context("inspect required APOC procedures")?
     .into_iter()
     .next()
-    .and_then(|row| row.get::<Vec<String>>("names").ok())
-    .unwrap_or_default();
+    .ok_or_else(|| graph_error!("Neo4j returned no APOC procedure catalog row"))?;
+    let procedures = procedures_row.get::<Vec<String>>("names")?;
     for name in [
         "apoc.config.list",
         "apoc.merge.node",
@@ -303,7 +258,7 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
             ));
         }
     }
-    let ttl_enabled = fetch_one(
+    let ttl_value = fetch_one(
         graph,
         query(
             "CALL apoc.config.list() YIELD key, value \
@@ -313,8 +268,9 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     )
     .await
     .context("read APOC TTL configuration")?
-    .and_then(|row| row.get::<String>("value").ok())
-    .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+    .ok_or_else(|| graph_error!("APOC TTL configuration is missing"))?
+    .get::<String>("value")?;
+    let ttl_enabled = ttl_value.eq_ignore_ascii_case("true");
     if !ttl_enabled {
         return Err(graph_error!(
             "APOC TTL is disabled; set apoc.ttl.enabled=true before starting Mindreader"
@@ -323,11 +279,11 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
-fn read_embedding_marker(row: &Row) -> Option<(String, String, i64)> {
-    Some((
-        row.get::<String>("provider").ok()?,
-        row.get::<String>("model").ok()?,
-        row.get::<i64>("dimensions").ok()?,
+fn read_embedding_marker(row: &Row) -> Result<(String, String, i64)> {
+    Ok((
+        row.get::<String>("provider")?,
+        row.get::<String>("model")?,
+        row.get::<i64>("dimensions")?,
     ))
 }
 
@@ -375,12 +331,12 @@ pub async fn require_embedding_space(graph: &Graph, embedding: &EmbeddingSpace) 
     )
     .await
     .context("read embedding-space marker")?;
-    let Some((provider, model, dimensions)) = marker.as_ref().and_then(read_embedding_marker)
-    else {
+    let Some(marker) = marker.as_ref() else {
         return Err(Error::EmbeddingSpace(
             "semantic activation embedding marker is missing".into(),
         ));
     };
+    let (provider, model, dimensions) = read_embedding_marker(marker)?;
     if !marker_matches_space(&provider, &model, dimensions, embedding) {
         return Err(Error::EmbeddingSpace(format!(
             "database embedding space {provider}/{model}/{dimensions} does not match {}/{}/{}",
@@ -397,10 +353,10 @@ pub async fn require_embedding_space(graph: &Graph, embedding: &EmbeddingSpace) 
     )
     .await
     .context("inspect semantic activation vector index")?;
-    let online = index
-        .as_ref()
-        .and_then(|row| row.get::<String>("state").ok())
-        .is_some_and(|state| state == "ONLINE");
+    let online = match index.as_ref() {
+        Some(row) => row.get::<String>("state")? == "ONLINE",
+        None => false,
+    };
     if !online {
         return Err(Error::EmbeddingSpace(format!(
             "required vector index {SEMANTIC_INDEX} is missing or not online"
@@ -430,7 +386,7 @@ async fn ensure_semantic_index(
     )
     .await
     .context("read embedding-space marker")?;
-    let current = marker.as_ref().and_then(read_embedding_marker);
+    let current = marker.as_ref().map(read_embedding_marker).transpose()?;
     let replace = should_replace_embedding_space(
         space_replace,
         current
@@ -808,39 +764,27 @@ pub async fn fetch_all_txn(txn: &mut Txn, q: neo4rs::Query) -> Result<Vec<Row>> 
     Ok(rows)
 }
 
-// neo4rs 0.8 can decode negative Bolt integers as unsigned values. `weight`
-// remains the numeric source of truth in Neo4j; `weightText` is its canonical
-// decimal mirror at the driver boundary so signed values round-trip correctly.
-fn node_weight(node: &Node) -> i64 {
-    node.get::<String>("weightText")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| node.get::<i64>("weight").unwrap_or(0))
+fn node_weight(node: &Node) -> Result<i64> {
+    Ok(node.get::<i64>("weight")?)
 }
 
-fn relation_weight(rel: &Relation) -> i64 {
-    rel.get::<String>("weightText")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| rel.get::<i64>("weight").unwrap_or(0))
+fn relation_weight(rel: &Relation) -> Result<i64> {
+    Ok(rel.get::<i64>("weight")?)
 }
 
-fn unbounded_relation_weight(rel: &UnboundedRelation) -> i64 {
-    rel.get::<String>("weightText")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| rel.get::<i64>("weight").unwrap_or(0))
+fn unbounded_relation_weight(rel: &UnboundedRelation) -> Result<i64> {
+    Ok(rel.get::<i64>("weight")?)
 }
 
 /// Serialize a graph node as agent-facing JSON (`kind=node`, signed `weight`).
-pub fn node_json(node: &Node) -> Value {
+pub fn node_json(node: &Node) -> Result<Value> {
     let labels: Vec<String> = node
         .labels()
         .into_iter()
         .filter(|l| *l != "Entity")
         .map(|s| s.to_string())
         .collect();
-    let iri = node.get::<String>("iri").unwrap_or_default();
+    let iri = node.get::<String>("iri")?;
     let name = node.get::<String>("name").ok();
     let is_literal = labels.iter().any(|label| label == "Literal");
     let mut obj = json!({
@@ -849,11 +793,9 @@ pub fn node_json(node: &Node) -> Value {
         "name": name,
         "labels": labels,
     });
-    if let Ok(v) = node.get::<String>("value") {
-        obj["value"] = json!(v);
-    }
-    if let Ok(v) = node.get::<String>("datatype") {
-        obj["datatype"] = json!(v);
+    if is_literal {
+        obj["value"] = json!(node.get::<String>("value")?);
+        obj["datatype"] = json!(node.get::<String>("datatype")?);
     }
     if let Ok(v) = node.get::<bool>("stub") {
         obj["stub"] = json!(v);
@@ -861,27 +803,26 @@ pub fn node_json(node: &Node) -> Value {
     if let Ok(v) = node.get::<String>("tool") {
         obj["tool"] = json!(v);
     }
-    obj["scope"] = json!(node.get::<Vec<String>>("layers").unwrap_or_default());
-    obj["weight"] = json!(node_weight(node));
+    obj["scope"] = json!(node.get::<Vec<String>>("layers")?);
+    obj["weight"] = json!(node_weight(node)?);
     if !is_literal {
         obj["target"] = json!({ "kind": "node", "iri": iri });
     }
-    obj
+    Ok(obj)
 }
 
 /// Serialize a current edge as a fact (`kind=fact`) with endpoint IRIs.
-pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
+pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Result<Value> {
+    if from.is_empty() || to.is_empty() {
+        return Err(graph_error!("fact endpoints must have non-empty IRIs"));
+    }
     let mut obj = json!({
         "type": rel.typ(),
         "from": from,
         "to": to,
+        "iri": rel.get::<String>("iri")?,
+        "propertyIri": rel.get::<String>("propertyIri")?,
     });
-    if let Ok(v) = rel.get::<String>("propertyIri") {
-        obj["propertyIri"] = json!(v);
-    }
-    if let Ok(v) = rel.get::<String>("iri") {
-        obj["iri"] = json!(v);
-    }
     obj["kind"] = json!("fact");
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
@@ -889,23 +830,22 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("reason") {
         obj["reason"] = json!(v);
     }
-    obj["scope"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
-    obj["weight"] = json!(relation_weight(rel));
-    obj
+    obj["scope"] = json!(rel.get::<Vec<String>>("layers")?);
+    obj["weight"] = json!(relation_weight(rel)?);
+    Ok(obj)
 }
 
-fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Value {
+fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Result<Value> {
+    if from.is_empty() || to.is_empty() {
+        return Err(graph_error!("path edge endpoints must have non-empty IRIs"));
+    }
     let mut obj = json!({
         "type": rel.typ(),
         "from": from,
         "to": to,
+        "iri": rel.get::<String>("iri")?,
+        "propertyIri": rel.get::<String>("propertyIri")?,
     });
-    if let Ok(v) = rel.get::<String>("propertyIri") {
-        obj["propertyIri"] = json!(v);
-    }
-    if let Ok(v) = rel.get::<String>("iri") {
-        obj["iri"] = json!(v);
-    }
     obj["kind"] = json!("fact");
     if let Ok(v) = rel.get::<String>("episodeId") {
         obj["episodeId"] = json!(v);
@@ -913,22 +853,31 @@ fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Value {
     if let Ok(v) = rel.get::<String>("reason") {
         obj["reason"] = json!(v);
     }
-    obj["scope"] = json!(rel.get::<Vec<String>>("layers").unwrap_or_default());
-    obj["weight"] = json!(unbounded_relation_weight(rel));
-    obj
+    obj["scope"] = json!(rel.get::<Vec<String>>("layers")?);
+    obj["weight"] = json!(unbounded_relation_weight(rel)?);
+    Ok(obj)
 }
 
-fn node_iri(node: &Node) -> String {
-    node.get::<String>("iri").unwrap_or_default()
+fn node_iri(node: &Node) -> Result<String> {
+    Ok(node.get::<String>("iri")?)
 }
 
 /// Expand a Neo4j path into node JSON, edge JSON, and ordered node IRIs.
-pub fn path_to_json(path: &Path) -> (Vec<Value>, Vec<Value>, Vec<String>) {
-    let nodes = path.nodes();
-    let rels = path.rels();
-    let indices = path.indices();
-    let node_jsons: Vec<Value> = nodes.iter().map(node_json).collect();
-    let iris: Vec<String> = nodes.iter().map(node_iri).collect();
+pub fn path_to_json(path: &Path) -> Result<(Vec<Value>, Vec<Value>, Vec<String>)> {
+    let nodes = path.nodes_as::<Node>()?;
+    let rels = path.relationships_as::<UnboundedRelation>()?;
+    let indices = path.indices_as::<i64>()?;
+    let node_jsons = nodes.iter().map(node_json).collect::<Result<Vec<_>>>()?;
+    let iris = nodes.iter().map(node_iri).collect::<Result<Vec<_>>>()?;
+
+    if indices.len() % 2 != 0 {
+        return Err(graph_error!("Neo4j returned a path with malformed indices"));
+    }
+    if !rels.is_empty() && indices.is_empty() {
+        return Err(graph_error!(
+            "Neo4j returned a path without relationship indices"
+        ));
+    }
 
     let mut edges = Vec::new();
     let mut cursor = 0usize;
@@ -939,7 +888,7 @@ pub fn path_to_json(path: &Path) -> (Vec<Value>, Vec<Value>, Vec<String>) {
         k += 2;
         let abs = rel_signed.unsigned_abs() as usize;
         if abs == 0 || abs > rels.len() || next >= nodes.len() || cursor >= nodes.len() {
-            continue;
+            return Err(graph_error!("Neo4j returned out-of-range path indices"));
         }
         let (from_i, to_i) = if rel_signed >= 0 {
             (cursor, next)
@@ -948,19 +897,12 @@ pub fn path_to_json(path: &Path) -> (Vec<Value>, Vec<Value>, Vec<String>) {
         };
         edges.push(unbounded_rel_json(
             &rels[abs - 1],
-            &node_iri(&nodes[from_i]),
-            &node_iri(&nodes[to_i]),
-        ));
+            &iris[from_i],
+            &iris[to_i],
+        )?);
         cursor = next;
     }
-    if edges.is_empty() {
-        for (i, rel) in rels.iter().enumerate() {
-            let from = nodes.get(i).map(node_iri).unwrap_or_default();
-            let to = nodes.get(i + 1).map(node_iri).unwrap_or_default();
-            edges.push(unbounded_rel_json(rel, &from, &to));
-        }
-    }
-    (node_jsons, edges, iris)
+    Ok((node_jsons, edges, iris))
 }
 
 /// Result of merging an entity or literal inside a transaction.
@@ -1014,7 +956,11 @@ fn resolved_node_parts(
     let iri = if let Some(iri) = spec.iri.as_deref().filter(|value| !value.is_empty()) {
         iri.to_string()
     } else {
-        let seed = spec.name.as_deref().unwrap_or("unnamed");
+        let seed = spec
+            .name
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| graph_error!("node requires a non-empty iri or name"))?;
         mint_iri(&kind, seed, default_lower_for_kind(&kind))
     };
     let name = spec.name.clone().unwrap_or_else(|| name_from_iri(&iri));
@@ -1036,8 +982,8 @@ fn resolved_node_parts(
 /// MERGE an entity using only the supplied transaction.
 ///
 /// `searchText` deliberately contains intrinsic node data only. Fact text belongs
-/// on relationships and must not accumulate on nodes when facts are replaced or
-/// retracted.
+/// on relationships and must not accumulate on nodes when facts are revised or
+/// withdrawn.
 pub async fn merge_node_in_txn(
     txn: &mut Txn,
     spec: &NodeSpec,
@@ -1053,11 +999,11 @@ pub async fn merge_node_in_txn(
             CALL apoc.merge.node(
               ['Entity'],
               {iri: $iri},
-              {name: $name, createdAt: datetime(), weight: 0, weightText: '0', layers: [],
+              {name: $name, createdAt: datetime(), weight: 0, layers: [],
                mindreaderCreateMarker: $creationMarker},
               {}
             ) YIELD node
-            WITH node, node.mindreaderCreateMarker = $creationMarker AS created
+            WITH node, coalesce(node.mindreaderCreateMarker = $creationMarker, false) AS created
             REMOVE node.mindreaderCreateMarker
             SET node:$($labels)
             SET node.name = coalesce(node.name, $name),
@@ -1073,7 +1019,7 @@ pub async fn merge_node_in_txn(
     )
     .await?
     .ok_or_else(|| graph_error!("failed to MERGE node {iri}"))?;
-    let created = row.get::<bool>("created").unwrap_or(false);
+    let created = row.get::<bool>("created")?;
 
     let node: Node = row.get("node")?;
     let labels = node
@@ -1087,7 +1033,7 @@ pub async fn merge_node_in_txn(
         name,
         labels,
         created,
-        json: node_json(&node),
+        json: node_json(&node)?,
     })
 }
 
@@ -1105,7 +1051,7 @@ pub async fn merge_literal_in_txn(
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Literal {iri: $iri})
             ON CREATE SET n.name = $name, n.value = $value, n.datatype = $datatype,
-              n.createdAt = datetime(), n.weight = 0, n.weightText = '0', n.layers = []
+              n.createdAt = datetime(), n.weight = 0, n.layers = []
             ON MATCH SET n.name = coalesce(n.name, $name),
               n.value = coalesce(n.value, $value), n.datatype = coalesce(n.datatype, $datatype)
             SET n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, $value))
@@ -1120,13 +1066,13 @@ pub async fn merge_literal_in_txn(
     .await?
     .ok_or_else(|| graph_error!("failed to MERGE literal {iri}"))?;
     let node: Node = row.get("n")?;
-    let created = row.get::<bool>("created").unwrap_or(false);
+    let created = row.get::<bool>("created")?;
     Ok(MergedNode {
         iri,
         name: value.to_string(),
         labels: vec!["Literal".into()],
         created,
-        json: node_json(&node),
+        json: node_json(&node)?,
     })
 }
 
@@ -1144,7 +1090,7 @@ pub async fn ensure_property_in_txn(
             OPTIONAL MATCH (existing:Entity {iri: $iri})
             MERGE (n:Entity:Property {iri: $iri})
             ON CREATE SET n.name = $name, n.createdAt = datetime(), n.stub = false,
-              n.weight = 0, n.weightText = '0', n.layers = []
+              n.weight = 0, n.layers = []
             ON MATCH SET n.name = coalesce(n.name, $name)
             SET n.mergeName = toLower(coalesce(n.name, $name)),
                 n.searchText = trim(coalesce(n.name, $name) + ' ' + n.iri + ' ' + coalesce(n.value, ''))
@@ -1157,8 +1103,8 @@ pub async fn ensure_property_in_txn(
     .await?
     .ok_or_else(|| graph_error!("failed to MERGE property {iri}"))?;
     let node: Node = row.get("n")?;
-    let created = row.get::<bool>("created").unwrap_or(false);
-    Ok((iri, created, node_json(&node)))
+    let created = row.get::<bool>("created")?;
+    Ok((iri, created, node_json(&node)?))
 }
 
 /// Length-prefixed SHA-256 so IRI fragments cannot collide across fields.
@@ -1268,7 +1214,7 @@ fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
             createdAt: datetime(),
             name: $iri,
             weight: 0,
-            weightText: '0'
+            layers: []
         })
         SET e.note = $note
         RETURN e.iri AS iri, toString(e.at) AS at
@@ -1282,7 +1228,7 @@ fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
 fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
     Ok(Episode {
         iri: row.get::<String>("iri")?,
-        at: row.get::<String>("at").unwrap_or_default(),
+        at: row.get::<String>("at")?,
         tool: tool.to_string(),
     })
 }
@@ -1341,41 +1287,35 @@ pub fn fact_text(s_name: &str, s_iri: &str, prop_iri: &str, o: &MergedNode) -> S
 }
 
 /// Compact endpoint JSON for facts: entities expose name/labels; literals expose value/datatype.
-pub fn endpoint_json(node: &Node) -> Value {
+pub fn endpoint_json(node: &Node) -> Result<Value> {
     let labels: Vec<String> = node
         .labels()
         .into_iter()
         .filter(|l| *l != "Entity")
         .map(|s| s.to_string())
         .collect();
-    let iri = node.get::<String>("iri").unwrap_or_default();
+    let iri = node.get::<String>("iri")?;
     if labels.iter().any(|l| l == "Literal") {
-        let value = node
-            .get::<String>("value")
-            .ok()
-            .or_else(|| node.get::<String>("name").ok())
-            .unwrap_or_default();
-        let datatype = node
-            .get::<String>("datatype")
-            .unwrap_or_else(|_| "xsd:string".into());
-        return json!({
+        let value = node.get::<String>("value")?;
+        let datatype = node.get::<String>("datatype")?;
+        return Ok(json!({
             "kind": "literal",
             "iri": iri,
             "value": value,
             "datatype": datatype,
-            "scope": node.get::<Vec<String>>("layers").unwrap_or_default(),
-            "weight": node_weight(node),
-        });
+            "scope": node.get::<Vec<String>>("layers")?,
+            "weight": node_weight(node)?,
+        }));
     }
-    json!({
+    Ok(json!({
         "kind": "node",
         "iri": iri,
         "name": node.get::<String>("name").ok(),
         "labels": labels,
-        "scope": node.get::<Vec<String>>("layers").unwrap_or_default(),
-        "weight": node_weight(node),
+        "scope": node.get::<Vec<String>>("layers")?,
+        "weight": node_weight(node)?,
         "target": { "kind": "node", "iri": iri },
-    })
+    }))
 }
 
 /// Local predicate name for agent-facing `p` (IRI or already-local name).
@@ -1391,20 +1331,25 @@ pub fn fact_envelope(
     relationship: &Value,
     scope: &[String],
     spike: Option<Value>,
-) -> Value {
+) -> Result<Value> {
     let iri = relationship
         .get("iri")
         .and_then(Value::as_str)
-        .unwrap_or_default();
-    json!({
+        .filter(|iri| !iri.is_empty())
+        .ok_or_else(|| graph_error!("fact relationship is missing its IRI"))?;
+    let weight = relationship
+        .get("weight")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| graph_error!("fact relationship is missing its numeric weight"))?;
+    Ok(json!({
         "target": { "kind": "fact", "iri": iri },
         "s": subject,
         "p": local_predicate_name(property),
         "o": object,
         "scope": scope,
         "spike": spike,
-        "weight": relationship.get("weight").cloned().unwrap_or(json!(0)),
-    })
+        "weight": weight,
+    }))
 }
 
 /// Highest Spike label present on a label set, or `None` if unranked.
@@ -1431,11 +1376,41 @@ pub fn spike_rank(label: Option<&str>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        fact_lock_params, fact_lock_specs, lock_key, safe_label, safe_rel, same_string_members,
-        should_replace_embedding_space, spike_rank, validate_model_version, SpaceReplace,
-        MODEL_VERSION,
+        fact_lock_params, fact_lock_specs, lock_key, node_json, rel_json, resolved_node_parts,
+        safe_label, safe_rel, same_string_members, should_replace_embedding_space, spike_rank,
+        validate_model_version, NodeSpec, SpaceReplace, MODEL_VERSION,
     };
     use crate::config::EmbeddingSpace;
+    use neo4rs::{
+        BoltInteger, BoltList, BoltMap, BoltNode, BoltRelation, BoltString, BoltType, Node,
+        Relation,
+    };
+
+    fn node_with(properties: impl IntoIterator<Item = (&'static str, BoltType)>) -> Node {
+        let mut map = BoltMap::new();
+        for (key, value) in properties {
+            map.put(BoltString::from(key), value);
+        }
+        Node::new(BoltNode::new(
+            BoltInteger::new(1),
+            BoltList::from(vec![BoltType::String(BoltString::from("Entity"))]),
+            map,
+        ))
+    }
+
+    fn relation_with(properties: impl IntoIterator<Item = (&'static str, BoltType)>) -> Relation {
+        let mut map = BoltMap::new();
+        for (key, value) in properties {
+            map.put(BoltString::from(key), value);
+        }
+        Relation::new(BoltRelation {
+            id: BoltInteger::new(1),
+            start_node_id: BoltInteger::new(1),
+            end_node_id: BoltInteger::new(2),
+            typ: BoltString::from("ASSERTS"),
+            properties: map,
+        })
+    }
 
     #[test]
     fn should_replace_embedding_space_refuses_mismatch() {
@@ -1466,13 +1441,55 @@ mod tests {
     }
 
     #[test]
-    fn model_v5_requires_recreating_older_databases() {
-        assert_eq!(MODEL_VERSION, 5);
-        assert!(validate_model_version(5).is_ok());
+    fn model_v6_requires_recreating_older_databases() {
+        assert_eq!(MODEL_VERSION, 6);
+        assert!(validate_model_version(6).is_ok());
         assert_eq!(
-            validate_model_version(4).unwrap_err().to_string(),
-            "Mindreader database model version 4 is incompatible with required version 5; recreate the Neo4j database or volume before starting Mindreader"
+            validate_model_version(5).unwrap_err().to_string(),
+            "Mindreader database model version 5 is incompatible with required version 6; recreate the Neo4j database or volume before starting Mindreader"
         );
+    }
+
+    #[test]
+    fn serialization_requires_identity_and_preserves_negative_integer_weight() {
+        let missing_iri = node_with([
+            ("layers", BoltType::List(BoltList::new())),
+            ("weight", BoltType::Integer(BoltInteger::new(-3))),
+        ]);
+        assert!(node_json(&missing_iri).is_err());
+
+        let complete = node_with([
+            (
+                "iri",
+                BoltType::String(BoltString::from("mindreader:element/strict")),
+            ),
+            ("layers", BoltType::List(BoltList::new())),
+            ("weight", BoltType::Integer(BoltInteger::new(-3))),
+        ]);
+        assert_eq!(node_json(&complete).unwrap()["weight"], -3);
+
+        let relation = relation_with([
+            (
+                "iri",
+                BoltType::String(BoltString::from("mindreader:relationship/strict")),
+            ),
+            (
+                "propertyIri",
+                BoltType::String(BoltString::from("mindreader:property/strict")),
+            ),
+            ("layers", BoltType::List(BoltList::new())),
+            ("weight", BoltType::Integer(BoltInteger::new(-4))),
+        ]);
+        assert_eq!(
+            rel_json(&relation, "mindreader:element/a", "mindreader:element/b").unwrap()["weight"],
+            -4
+        );
+    }
+
+    #[test]
+    fn node_resolution_rejects_missing_identity_instead_of_minting_unnamed() {
+        let error = resolved_node_parts(&NodeSpec::default(), "element", &[]).unwrap_err();
+        assert_eq!(error.to_string(), "node requires a non-empty iri or name");
     }
 
     #[test]

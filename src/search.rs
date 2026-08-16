@@ -211,11 +211,12 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     Ok(())
 }
 
-/// Fact IRI from a result envelope (`target.iri`, else legacy `relationship.iri`).
-pub fn fact_handle_iri(fact: &Value) -> Option<&str> {
+/// Required fact IRI from the canonical pasteable target envelope.
+pub fn fact_handle_iri(fact: &Value) -> Result<&str> {
     fact.pointer("/target/iri")
-        .or_else(|| fact.pointer("/relationship/iri"))
         .and_then(Value::as_str)
+        .filter(|iri| !iri.is_empty())
+        .ok_or_else(|| crate::graph_error!("fact result is missing target.iri"))
 }
 
 /// True when every label is `Class` or `Property` (catalog path, not ranked search).
@@ -331,9 +332,9 @@ WITH s, r, o, indexScore, ownSpikeRank,
        WHEN sp:Signal THEN 1
        ELSE 0
      END) AS attachedSpikeRank,
-     coalesce(toInteger(s.weightText), s.weight, 0) AS subjectWeight,
-     coalesce(toInteger(r.weightText), r.weight, 0) AS relationshipWeight,
-     coalesce(toInteger(o.weightText), o.weight, 0) AS objectWeight
+     s.weight AS subjectWeight,
+     r.weight AS relationshipWeight,
+     o.weight AS objectWeight
 WITH s, r, o, indexScore,
      CASE WHEN ownSpikeRank > 0 THEN ownSpikeRank ELSE attachedSpikeRank END AS spikeRank,
      CASE
@@ -349,11 +350,11 @@ WITH s, r, o, spikeRank,
        ELSE subjectRelationshipWeight + objectWeight
      END AS effectiveWeight,
      CASE WHEN indexScore > 1.0 THEN indexScore ELSE 1.0 END AS score,
-     coalesce(r.propertyIri, 'mindreader:property/' + type(r)) AS property
+     r.propertyIri AS property
 ORDER BY spikeRank DESC, effectiveWeight DESC, score DESC,
          s.iri ASC, property ASC, o.iri ASC, r.iri ASC
 LIMIT $limit
-RETURN s, r, o, property, spikeRank, toString(effectiveWeight) AS effectiveWeight, score
+RETURN s, r, o, property, spikeRank, effectiveWeight, score
 "#;
 
 /// Assemble the closed-world rank query: text index or label filter, then Spike/weight/score.
@@ -399,9 +400,9 @@ async fn spike_context(
                    WHEN sp:Signal THEN 1
                    ELSE 0
                  END AS spikeRank,
-                 coalesce(toInteger(sp.weightText), sp.weight, 0) AS spikeWeight,
-                 coalesce(toInteger(a.weightText), a.weight, 0) AS relationshipWeight,
-                 coalesce(toInteger(el.weightText), el.weight, 0) AS elementWeight
+                 sp.weight AS spikeWeight,
+                 a.weight AS relationshipWeight,
+                 el.weight AS elementWeight
             WITH sp, a, el, spikeRank,
                  CASE
                    WHEN spikeWeight > 0 AND relationshipWeight > $maxWeight - spikeWeight THEN $maxWeight
@@ -418,7 +419,7 @@ async fn spike_context(
             WITH sp, a, el, spikeRank, effectiveWeight
             ORDER BY spikeRank DESC, effectiveWeight DESC, el.iri ASC, sp.iri ASC
             LIMIT $limit
-            RETURN sp, a, el, toString(effectiveWeight) AS effectiveWeight
+            RETURN sp, a, el, effectiveWeight
             "#,
         )
         .param("layers", layers.to_vec())
@@ -429,13 +430,9 @@ async fn spike_context(
     )
     .await?
     {
-        let (Ok(sp), Ok(about_rel), Ok(element)) = (
-            row.get::<Node>("sp"),
-            row.get::<Relation>("a"),
-            row.get::<Node>("el"),
-        ) else {
-            continue;
-        };
+        let sp = row.get::<Node>("sp")?;
+        let about_rel = row.get::<Relation>("a")?;
+        let element = row.get::<Node>("el")?;
         let labels = sp
             .labels()
             .into_iter()
@@ -445,22 +442,14 @@ async fn spike_context(
         let Some(rank) = spike_label(&labels) else {
             continue;
         };
-        let about = element.get::<String>("iri").unwrap_or_default();
-        let sp_iri = sp.get::<String>("iri").unwrap_or_default();
-        let relationship = rel_json(&about_rel, &sp_iri, &about);
-        let combined = row
-            .get::<String>("effectiveWeight")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or_else(|| {
-                node_weight(&sp)
-                    .saturating_add(relation_weight(&about_rel))
-                    .saturating_add(node_weight(&element))
-            });
-        let rel_iri = about_rel.get::<String>("iri").unwrap_or_default();
+        let about = element.get::<String>("iri")?;
+        let sp_iri = sp.get::<String>("iri")?;
+        let relationship = rel_json(&about_rel, &sp_iri, &about)?;
+        let combined = row.get::<i64>("effectiveWeight")?;
+        let rel_iri = about_rel.get::<String>("iri")?;
         if seen_spike.insert(rel_iri) {
             spike_list.push(json!({
-                "node": node_json(&sp),
+                "node": node_json(&sp)?,
                 "about": about,
                 "rank": rank,
                 "relationship": relationship,
@@ -489,22 +478,6 @@ async fn spike_context(
             })
     });
     Ok(spike_list)
-}
-
-// Prefer `weightText` so signed weights survive neo4rs 0.8 integer decoding.
-fn node_weight(node: &Node) -> i64 {
-    node.get::<String>("weightText")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| node.get::<i64>("weight").unwrap_or(0))
-}
-
-fn relation_weight(relation: &Relation) -> i64 {
-    relation
-        .get::<String>("weightText")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or_else(|| relation.get::<i64>("weight").unwrap_or(0))
 }
 
 /// Rank current visible `ASSERTS`/`ABOUT` facts for text and/or non-schema labels.
@@ -545,44 +518,23 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
 
     let mut facts = Vec::new();
     for row in fetch_all(graph, ranked).await? {
-        let (Ok(subject), Ok(relationship), Ok(object)) = (
-            row.get::<Node>("s"),
-            row.get::<Relation>("r"),
-            row.get::<Node>("o"),
-        ) else {
-            continue;
-        };
-        let subject_iri = subject.get::<String>("iri").unwrap_or_default();
-        let object_iri = object.get::<String>("iri").unwrap_or_default();
-        let effective_weight = row
-            .get::<String>("effectiveWeight")
-            .ok()
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0);
+        let subject = row.get::<Node>("s")?;
+        let relationship = row.get::<Relation>("r")?;
+        let object = row.get::<Node>("o")?;
+        let subject_iri = subject.get::<String>("iri")?;
+        let object_iri = object.get::<String>("iri")?;
+        let effective_weight = row.get::<i64>("effectiveWeight")?;
         let property = row.get::<String>("property")?;
-        let relationship = rel_json(&relationship, &subject_iri, &object_iri);
-        let scope = relationship
-            .get("scope")
-            .cloned()
-            .unwrap_or_else(|| json!([]));
-        let scope_vec = scope
-            .as_array()
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+        let scope_vec = relationship.get::<Vec<String>>("layers")?;
+        let relationship = rel_json(&relationship, &subject_iri, &object_iri)?;
         let mut fact = fact_envelope(
-            endpoint_json(&subject),
+            endpoint_json(&subject)?,
             &property,
-            endpoint_json(&object),
+            endpoint_json(&object)?,
             &relationship,
             &scope_vec,
-            spike_from_rank(row.get::<i64>("spikeRank").unwrap_or(0)).map(Value::String),
-        );
+            spike_from_rank(row.get::<i64>("spikeRank")?).map(Value::String),
+        )?;
         fact["score"] = json!(row.get::<f64>("score")?);
         fact["effectiveWeight"] = json!(effective_weight);
         facts.push(fact);
@@ -627,9 +579,10 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        lucene_escape, lucene_query, ranked_query, spike_from_rank, validate_recall_args,
-        RecallArgs,
+        fact_handle_iri, lucene_escape, lucene_query, ranked_query, spike_from_rank,
+        validate_recall_args, RecallArgs,
     };
+    use serde_json::json;
 
     #[test]
     fn search_helpers_preserve_contract_values() {
@@ -645,6 +598,15 @@ mod tests {
         assert!(query.contains("ORDER BY spikeRank DESC, effectiveWeight DESC, score DESC"));
         assert!(query.contains("LIMIT $limit"));
         assert!(!query.contains("collect("));
+    }
+
+    #[test]
+    fn fact_handle_accepts_only_the_canonical_target() {
+        assert_eq!(
+            fact_handle_iri(&json!({"target": {"kind": "fact", "iri": "fact:1"}})).unwrap(),
+            "fact:1"
+        );
+        assert!(fact_handle_iri(&json!({"relationship": {"iri": "fact:legacy"}})).is_err());
     }
 
     #[test]

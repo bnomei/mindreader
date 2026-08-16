@@ -14,7 +14,7 @@ Usage:
   curl -fsSL https://raw.githubusercontent.com/bnomei/mindreader/main/scripts/install.sh | sh
 
 Environment:
-  MINDREADER_VERSION      Version or tag, for example 0.1.0 or v0.1.0; defaults to latest.
+  MINDREADER_VERSION      Version or tag, for example 0.5.0 or v0.5.0; defaults to latest.
   MINDREADER_INSTALL_DIR  Install directory; defaults to $HOME/.local/bin.
 
 Supported: x86_64/aarch64 GNU Linux and macOS. Windows users can use npm or the release .zip.
