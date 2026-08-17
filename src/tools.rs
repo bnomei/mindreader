@@ -237,7 +237,7 @@ pub struct WriteFact {
     pub p: String,
     /// Object node or typed literal.
     pub o: ObjectInput,
-    /// Optional Spike label attached to the subject and, for Element objects, an ABOUT fact.
+    /// Optional epistemic classification stored on this exact fact.
     #[serde(default)]
     pub spike: Option<String>,
     /// When true, add current CONTRADICTS edges from this object to other current values.
@@ -471,6 +471,7 @@ struct CurrentFact {
     rel_id: i64,
     iri: String,
     layers: Vec<String>,
+    spike: Option<String>,
 }
 
 /// Remaining memberships for one current fact after a revise/withdraw selection.
@@ -522,7 +523,7 @@ async fn find_current_pairs_txn(
         let cypher = format!(
             "MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity {{iri: $o}}) \
              WHERE r.validTo IS NULL RETURN id(r) AS rid, r.iri AS iri, \
-             r.layers AS layers"
+             r.layers AS layers, r.spike AS spike"
         );
         fetch_all_txn(
             txn,
@@ -537,7 +538,7 @@ async fn find_current_pairs_txn(
             query(
                 "MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity {iri: $o}) \
                  WHERE r.validTo IS NULL AND r.propertyIri = $p \
-                 RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers",
+                 RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers, r.spike AS spike",
             )
             .param("s", s.to_string())
             .param("o", o.to_string())
@@ -551,6 +552,7 @@ async fn find_current_pairs_txn(
                 rel_id: row.get("rid")?,
                 iri: row.get("iri")?,
                 layers: row.get("layers")?,
+                spike: row.get::<String>("spike").ok(),
             })
         })
         .collect()
@@ -566,10 +568,15 @@ struct RelationWrite<'a> {
     episode: &'a Episode,
     reason: Option<&'a str>,
     fact_text: &'a str,
+    /// `Some` classifies or reclassifies the exact fact; `None` preserves an existing value.
+    spike: Option<&'a str>,
 }
 
 /// Reassert an exact triple by merging memberships, or CREATE a new fact identity.
-async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result<(String, bool)> {
+async fn ensure_relation_txn(
+    txn: &mut Txn,
+    write: &RelationWrite<'_>,
+) -> Result<(String, bool, Option<String>)> {
     let current = find_current_pairs_txn(
         txn,
         write.s,
@@ -588,23 +595,26 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
     }
     if let Some(current) = current.first() {
         let merged = merge_memberships(&current.layers, write.layers);
-        if merged == current.layers {
-            return Ok((current.iri.clone(), false));
+        let next_spike = write.spike.or(current.spike.as_deref());
+        if merged == current.layers && next_spike == current.spike.as_deref() {
+            return Ok((current.iri.clone(), false, current.spike.clone()));
         }
         fetch_one_txn(
             txn,
             query(
                 "MATCH ()-[r]->() WHERE id(r) = $rid AND r.validTo IS NULL \
                  SET r.layers = $layers, r.layersUpdatedAt = datetime(), \
-                     r.layerEpisodeId = $episode RETURN r.iri AS iri",
+                     r.layerEpisodeId = $episode, r.spike = $spike \
+                 RETURN r.iri AS iri",
             )
             .param("rid", current.rel_id)
             .param("layers", merged)
-            .param("episode", write.episode.iri.clone()),
+            .param("episode", write.episode.iri.clone())
+            .param("spike", next_spike.map(str::to_string)),
         )
         .await?
         .ok_or_else(|| operation_error!("relationship disappeared while merging layers"))?;
-        return Ok((current.iri.clone(), true));
+        return Ok((current.iri.clone(), true, next_spike.map(str::to_string)));
     }
 
     let rel_type = safe_rel(write.rel_type)?;
@@ -620,7 +630,8 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
             weight: 0,
             validFrom: datetime(),
             episodeId: $episode,
-            factText: $factText
+            factText: $factText,
+            spike: $spike
         }}]->(o)
         SET r.reason = $reason
         RETURN r.iri AS iri
@@ -636,11 +647,12 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
             .param("layers", write.layers.to_vec())
             .param("episode", write.episode.iri.clone())
             .param("reason", write.reason.map(str::to_string))
-            .param("factText", write.fact_text.to_string()),
+            .param("factText", write.fact_text.to_string())
+            .param("spike", write.spike.map(str::to_string)),
     )
     .await?
     .ok_or_else(|| operation_error!("failed to create relationship {iri}"))?;
-    Ok((iri, true))
+    Ok((iri, true, write.spike.map(str::to_string)))
 }
 
 /// Reload agent-facing node JSON after membership or weight updates in this transaction.
@@ -652,6 +664,22 @@ async fn refreshed_node_json_txn(txn: &mut Txn, iri: &str) -> Result<Value> {
     .await?
     .ok_or_else(|| operation_error!("missing node {iri}"))?;
     node_json(&row.get::<Node>("n")?)
+}
+
+/// Reload one relationship after membership merging so mutation responses show complete state.
+async fn refreshed_relation_json_txn(
+    txn: &mut Txn,
+    iri: &str,
+    subject_iri: &str,
+    object_iri: &str,
+) -> Result<Value> {
+    let row = fetch_one_txn(
+        txn,
+        query("MATCH ()-[r]->() WHERE r.iri = $iri RETURN r").param("iri", iri.to_string()),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("missing relationship {iri}"))?;
+    rel_json(&row.get::<Relation>("r")?, subject_iri, object_iri)
 }
 
 /// Other current values of the same subject+predicate visible in `layers` (set-valued alternatives).
@@ -722,7 +750,7 @@ async fn ensure_contradictions_txn(
     old_objects.dedup();
     for old_o in old_objects {
         let text = format!("{new_o} CONTRADICTS {old_o}");
-        let (_, relation_changed) = ensure_relation_txn(
+        let (_, relation_changed, _) = ensure_relation_txn(
             txn,
             &RelationWrite {
                 rel_type: "CONTRADICTS",
@@ -733,6 +761,7 @@ async fn ensure_contradictions_txn(
                 episode,
                 reason: None,
                 fact_text: &text,
+                spike: None,
             },
         )
         .await?;
@@ -876,20 +905,14 @@ struct PreparedFactResult {
     alternatives: Vec<Value>,
 }
 
-/// MERGE endpoints, merge or create the fact, optionally attach ABOUT and CONTRADICTS.
+/// MERGE endpoints, merge or create the classified fact, and optionally attach CONTRADICTS.
 async fn write_prepared_fact_txn(
     txn: &mut Txn,
     fact: PreparedWriteFact,
     layers: &[String],
     episode: &Episode,
 ) -> Result<PreparedFactResult> {
-    let subject = merge_node_in_txn(
-        txn,
-        &fact.subject_spec,
-        &fact.subject_kind,
-        &fact.spike.clone().into_iter().collect::<Vec<_>>(),
-    )
-    .await?;
+    let subject = merge_node_in_txn(txn, &fact.subject_spec, &fact.subject_kind, &[]).await?;
     let (object, object_is_literal) = merge_object_in_txn(txn, fact.object_value).await?;
     let (_, property_created, _) = ensure_property_in_txn(txn, &fact.prop_iri).await?;
     let mut changed = property_created;
@@ -904,7 +927,7 @@ async fn write_prepared_fact_txn(
         &object.labels,
         layers,
     );
-    let (relationship_iri, relationship_changed) = ensure_relation_txn(
+    let (relationship_iri, relationship_changed, _) = ensure_relation_txn(
         txn,
         &RelationWrite {
             rel_type: fact.structural.as_deref().unwrap_or("ASSERTS"),
@@ -915,37 +938,14 @@ async fn write_prepared_fact_txn(
             episode,
             reason: None,
             fact_text: &fact_text_value,
+            spike: fact.spike.as_deref(),
         },
     )
     .await?;
     changed |= relationship_changed;
-    let need_about = fact.spike.is_some()
-        && !object_is_literal
-        && object.labels.iter().any(|label| label == "Element")
-        && fact.structural.as_deref() != Some("ABOUT");
-    if need_about {
-        let about_text = fact_text(
-            &subject.name,
-            &subject.iri,
-            "mindreader:property/ABOUT",
-            &object,
-        );
-        let (_, about_changed) = ensure_relation_txn(
-            txn,
-            &RelationWrite {
-                rel_type: "ABOUT",
-                s: &subject.iri,
-                o: &object.iri,
-                prop_iri: "mindreader:property/ABOUT",
-                layers,
-                episode,
-                reason: None,
-                fact_text: &about_text,
-            },
-        )
-        .await?;
-        changed |= about_changed;
-    }
+    let relationship_json =
+        refreshed_relation_json_txn(txn, &relationship_iri, &subject.iri, &object.iri).await?;
+    let relationship_scope = serialized_scope(&relationship_json)?;
     let conflicts = find_conflicts_txn(
         txn,
         &subject.iri,
@@ -977,9 +977,8 @@ async fn write_prepared_fact_txn(
                 subject_json,
                 &fact.prop_iri,
                 object_json,
-                &json!({ "kind": "fact", "iri": relationship_iri, "weight": 0 }),
-                relation_scope,
-                fact.spike.clone().map(Value::String),
+                &relationship_json,
+                &relationship_scope,
             )?;
             item["noop"] = json!(!changed);
             item["conflicts"] = if fact.contradicts {
@@ -1179,14 +1178,9 @@ async fn apply_revision_once(
             unify: Vec::new(),
         });
     }
+    let effective_spike = spike.clone().or_else(|| old_current.spike.clone());
     let result = async {
-        let subject = merge_node_in_txn(
-            &mut txn,
-            &subject_spec,
-            &subject_kind,
-            &spike.clone().into_iter().collect::<Vec<_>>(),
-        )
-        .await?;
+        let subject = merge_node_in_txn(&mut txn, &subject_spec, &subject_kind, &[]).await?;
         let (new_object, new_object_is_literal) = merge_object_in_txn(&mut txn, new_value).await?;
         let (_, property_created, _) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
         let episode = create_episode_in_txn(&mut txn, "revise", args.reason.as_deref()).await?;
@@ -1201,7 +1195,7 @@ async fn apply_revision_once(
         )
         .await?;
         let new_text = fact_text(&subject.name, &subject.iri, &prop_iri, &new_object);
-        let (new_relationship_iri, _) = ensure_relation_txn(
+        let (new_relationship_iri, _, _) = ensure_relation_txn(
             &mut txn,
             &RelationWrite {
                 rel_type: structural.as_deref().unwrap_or("ASSERTS"),
@@ -1212,11 +1206,12 @@ async fn apply_revision_once(
                 episode: &episode,
                 reason: args.reason.as_deref(),
                 fact_text: &new_text,
+                spike: effective_spike.as_deref(),
             },
         )
         .await?;
         let supersedes_text = format!("{} SUPERSEDES {old_iri}", new_object.iri);
-        ensure_relation_txn(
+        let (supersedes_iri, _, _) = ensure_relation_txn(
             &mut txn,
             &RelationWrite {
                 rel_type: "SUPERSEDES",
@@ -1227,7 +1222,23 @@ async fn apply_revision_once(
                 episode: &episode,
                 reason: args.reason.as_deref(),
                 fact_text: &supersedes_text,
+                spike: None,
             },
+        )
+        .await?;
+        txn.run(
+            query(
+                "MATCH (e:Entity:Episode {iri: $episode}) \
+                 SET e.previousFactIri = $previousFactIri, \
+                     e.replacementFactIri = $replacementFactIri, \
+                     e.supersedesIri = $supersedesIri, \
+                     e.selectedScope = $selectedScope",
+            )
+            .param("episode", episode.iri.clone())
+            .param("previousFactIri", old_current.iri.clone())
+            .param("replacementFactIri", new_relationship_iri.clone())
+            .param("supersedesIri", supersedes_iri)
+            .param("selectedScope", layers.clone()),
         )
         .await?;
         let conflicts = find_conflicts_txn(
@@ -1299,7 +1310,7 @@ async fn apply_revision_once(
             "p": prop_iri,
             "o": new,
             "scope": layers.clone(),
-            "spike": spike,
+            "spike": effective_spike,
             "conflicts": conflicts,
     });
     Ok(RevisionResult {
@@ -1465,6 +1476,7 @@ async fn apply_withdrawal_once(
                 rel_id: row.get("rid")?,
                 iri: row.get("iri")?,
                 layers: row.get("layers")?,
+                spike: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1563,6 +1575,22 @@ fn membership_allows(record: &[String], required: &[String]) -> bool {
     record.is_empty() || required.iter().all(|layer| record.contains(layer))
 }
 
+/// Read the normalized string memberships from a serialized node or relationship.
+fn serialized_scope(record: &Value) -> Result<Vec<String>> {
+    record
+        .get("scope")
+        .and_then(Value::as_array)
+        .ok_or_else(|| operation_error!("serialized scope is not an array"))?
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| operation_error!("serialized scope contains a non-string value"))
+        })
+        .collect()
+}
+
 /// Input-ordered node lookup for `recall` `iris`; misses stay `found: false`.
 const RECALL_IRI_NODES_QUERY: &str = r#"
 UNWIND range(0, size($iris) - 1) AS inputIndex
@@ -1585,6 +1613,7 @@ CALL {
   WITH root
   MATCH (root)-[r]-(other:Entity)
   WHERE r.validTo IS NULL
+    AND type(r) <> 'ABOUT'
     AND (size(r.layers) = 0
          OR any(layer IN r.layers WHERE layer IN $layers))
     AND (size(other.layers) = 0
@@ -1626,7 +1655,7 @@ pub async fn memory_recall_iris(
         .collect::<Vec<_>>();
     let mut lookups = iris
         .iter()
-        .map(|iri| json!({ "iri": iri, "found": false, "facts": [] }))
+        .map(|iri| json!({ "iri": iri, "found": false, "facts": [], "truncated": false }))
         .collect::<Vec<_>>();
     let mut nodes = Vec::with_capacity(iris.len());
     for row in fetch_all(
@@ -1665,6 +1694,11 @@ pub async fn memory_recall_iris(
         *counts.entry(row.get::<i64>("inputIndex")?).or_default() += 1;
     }
     let truncated = counts.values().any(|count| *count > fact_limit as usize);
+    for (index, lookup) in lookups.iter_mut().enumerate() {
+        lookup["truncated"] = json!(counts
+            .get(&(index as i64))
+            .is_some_and(|count| *count > fact_limit as usize));
+    }
     let mut kept: HashMap<i64, usize> = HashMap::new();
     for row in rows {
         let index = row.get::<i64>("inputIndex")?;
@@ -1680,24 +1714,13 @@ pub async fn memory_recall_iris(
         let subject_iri = subject.get::<String>("iri")?;
         let object_iri = object.get::<String>("iri")?;
         let relationship = rel_json(&relationship, &subject_iri, &object_iri)?;
-        let memberships = relationship
-            .get("scope")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(|| operation_error!("serialized fact scope is not an array"))?;
+        let memberships = serialized_scope(&relationship)?;
         let fact = crate::graph::fact_envelope(
             endpoint_json(&subject)?,
             &property,
             endpoint_json(&object)?,
             &relationship,
             &memberships,
-            None,
         )?;
         if let Some(lookup_facts) = lookups
             .get_mut(index as usize)
@@ -1723,44 +1746,117 @@ pub async fn memory_recall_iris(
     }))
 }
 
-/// Variable-length walk query for `recall` `around` at the requested depth.
-fn recall_around_query(depth: u32) -> String {
+/// Non-start witness nodes above this eligible degree receive one route penalty.
+const HUB_DEGREE_THRESHOLD: u32 = 16;
+
+#[derive(Debug, Clone, Copy)]
+enum RecallDirection {
+    Both,
+    Outgoing,
+    Incoming,
+}
+
+impl RecallDirection {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "both" => Ok(Self::Both),
+            "outgoing" => Ok(Self::Outgoing),
+            "incoming" => Ok(Self::Incoming),
+            _ => Err(DomainError::InvalidInput(
+                "recall direction must be both, outgoing, or incoming".into(),
+            )
+            .into()),
+        }
+    }
+}
+
+/// Variable-length walk query with whole-path predicate/direction constraints and hub-aware order.
+fn recall_around_query(depth: u32, direction: RecallDirection) -> String {
+    let (walk, degree_walk) = match direction {
+        RecallDirection::Both => (
+            format!("(start:Entity {{iri: $from}})-[pathRels*1..{depth}]-(x:Entity)"),
+            "(witnessNode)-[hubRel]-(hubOther:Entity)",
+        ),
+        RecallDirection::Outgoing => (
+            format!("(start:Entity {{iri: $from}})-[pathRels*1..{depth}]->(x:Entity)"),
+            "(witnessNode)-[hubRel]->(hubOther:Entity)",
+        ),
+        RecallDirection::Incoming => (
+            format!("(start:Entity {{iri: $from}})<-[pathRels*1..{depth}]-(x:Entity)"),
+            "(witnessNode)<-[hubRel]-(hubOther:Entity)",
+        ),
+    };
+    let hub_probe_limit = HUB_DEGREE_THRESHOLD + 1;
     format!(
         r#"
-        MATCH path = (start:Entity {{iri: $from}})-[pathRels*1..{depth}]-(x:Entity)
+        MATCH path = {walk}
         WHERE all(n IN nodes(path) WHERE
           size(n.layers) = 0
           OR any(layer IN n.layers WHERE layer IN $layers))
           AND all(pathRel IN relationships(path) WHERE
             type(pathRel) IN $rels AND pathRel.validTo IS NULL
             AND (size(pathRel.layers) = 0
-                 OR any(layer IN pathRel.layers WHERE layer IN $layers)))
+                 OR any(layer IN pathRel.layers WHERE layer IN $layers))
+            AND (size($predicates) = 0 OR pathRel.propertyIri IN $predicates))
+        CALL {{
+          WITH path
+          UNWIND tail(nodes(path)) AS witnessNode
+          CALL {{
+            WITH witnessNode
+            MATCH {degree_walk}
+            WHERE type(hubRel) IN $rels AND hubRel.validTo IS NULL
+              AND (size(witnessNode.layers) = 0
+                   OR any(layer IN witnessNode.layers WHERE layer IN $layers))
+              AND (size(hubRel.layers) = 0
+                   OR any(layer IN hubRel.layers WHERE layer IN $layers))
+              AND (size(hubOther.layers) = 0
+                   OR any(layer IN hubOther.layers WHERE layer IN $layers))
+              AND (size($predicates) = 0 OR hubRel.propertyIri IN $predicates)
+            WITH hubRel LIMIT {hub_probe_limit}
+            RETURN count(hubRel) AS eligibleDegree
+          }}
+          RETURN sum(CASE WHEN eligibleDegree > {HUB_DEGREE_THRESHOLD} THEN 1 ELSE 0 END) AS hubCount
+        }}
         UNWIND relationships(path) AS r
         WITH path, r,
              r.propertyIri AS property,
              length(path) AS distance,
+             length(path) + hubCount AS routeCost,
+             hubCount,
              [node IN nodes(path) | node.iri] AS pathNodes,
              [pathRel IN relationships(path) | pathRel.iri] AS pathEdgeIris
-        WHERE size($predicates) = 0 OR property IN $predicates
-        ORDER BY r.iri ASC, distance ASC, pathNodes ASC, pathEdgeIris ASC
-        WITH r, property, head(collect(path)) AS path,
-             head(collect(pathNodes)) AS witnessNodes, min(distance) AS distance
-        WITH distance, path, witnessNodes, startNode(r) AS s, r, endNode(r) AS o,
+        ORDER BY r.iri ASC, routeCost ASC, hubCount ASC, distance ASC,
+                 pathNodes ASC, pathEdgeIris ASC
+        WITH r, property, head(collect({{
+          path: path,
+          nodes: pathNodes,
+          routeCost: routeCost,
+          hubCount: hubCount,
+          distance: distance,
+          edgeIris: pathEdgeIris
+        }})) AS witness
+        WITH witness.distance AS distance, witness.routeCost AS routeCost,
+             witness.hubCount AS hubCount, witness.path AS path,
+             witness.nodes AS witnessNodes, witness.edgeIris AS witnessEdgeIris,
+             startNode(r) AS s, r, endNode(r) AS o,
              property
-        ORDER BY distance ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
+        ORDER BY routeCost ASC, hubCount ASC, distance ASC,
+                 witnessNodes ASC, witnessEdgeIris ASC,
+                 s.iri ASC, property ASC, o.iri ASC, r.iri ASC
         LIMIT $limit
         RETURN distance, path, witnessNodes AS pathNodes, s, r, o, property
         "#
     )
 }
 
-/// `recall` `around` path with predicate filtering before a deterministic fact limit.
+/// `recall` `around` path with whole-path constraints and hub-aware deterministic ranking.
 pub async fn memory_recall_around(
     graph: &Graph,
     from: &str,
     scope: Vec<String>,
     predicates: Vec<String>,
     depth: u32,
+    direction: &str,
     limit: u32,
 ) -> Result<Value> {
     use crate::domain::PredicateRef;
@@ -1770,6 +1866,7 @@ pub async fn memory_recall_around(
     if !(1..=100).contains(&limit) {
         return Err(DomainError::InvalidInput("recall limit must be 1..=100".into()).into());
     }
+    let direction = RecallDirection::parse(direction)?;
     let layers = normalize_layers(scope)?;
     let mut wanted = predicates
         .into_iter()
@@ -1806,13 +1903,14 @@ pub async fn memory_recall_around(
     let start: Node = start_row.get("n")?;
     let rows = fetch_all(
         graph,
-        query(&recall_around_query(depth))
+        query(&recall_around_query(depth, direction))
             .param("from", from.to_string())
             .param("layers", layers.clone())
             .param(
                 "rels",
                 FIXED_RELS
                     .iter()
+                    .filter(|relationship| **relationship != "ABOUT")
                     .map(|relationship| (*relationship).to_string())
                     .collect::<Vec<_>>(),
             )
@@ -1844,24 +1942,13 @@ pub async fn memory_recall_around(
         }
         paths.push(json!({ "nodes": path_nodes, "edges": path_edges }));
         let relationship = rel_json(&relationship, &subject_iri, &object_iri)?;
-        let memberships = relationship
-            .get("scope")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(|| operation_error!("serialized fact scope is not an array"))?;
+        let memberships = serialized_scope(&relationship)?;
         facts.push(crate::graph::fact_envelope(
             endpoint_json(&subject)?,
             &property,
             endpoint_json(&object)?,
             &relationship,
             &memberships,
-            None,
         )?);
     }
     let mut nodes = nodes_by_iri.into_iter().collect::<Vec<_>>();
@@ -1887,16 +1974,29 @@ MATCH (s:Entity)-[anchor]->(o:Entity)
 WHERE anchor.iri = $iri
   AND (size(s.layers) = 0
        OR any(layer IN s.layers WHERE layer IN $layers))
-  AND (size(anchor.layers) = 0
-       OR any(layer IN anchor.layers WHERE layer IN $layers))
   AND (size(o.layers) = 0
        OR any(layer IN o.layers WHERE layer IN $layers))
+  AND ((size(anchor.layers) = 0
+        OR any(layer IN anchor.layers WHERE layer IN $layers))
+       OR EXISTS {
+         MATCH (event:Entity:Episode {tool: 'revise'})
+         WHERE anchor.iri IN [event.previousFactIri, event.replacementFactIri]
+           AND (size(event.selectedScope) = 0
+                OR any(layer IN event.selectedScope WHERE layer IN $layers))
+       })
 WITH s, anchor.propertyIri AS property
 MATCH (s)-[r]->(other:Entity)
 WHERE r.propertyIri = property
+  AND type(r) <> 'ABOUT'
   AND NOT type(r) IN $protected
-  AND (size(r.layers) = 0
-       OR any(layer IN r.layers WHERE layer IN $layers))
+  AND ((size(r.layers) = 0
+        OR any(layer IN r.layers WHERE layer IN $layers))
+       OR EXISTS {
+         MATCH (event:Entity:Episode {tool: 'revise'})
+         WHERE r.iri IN [event.previousFactIri, event.replacementFactIri]
+           AND (size(event.selectedScope) = 0
+                OR any(layer IN event.selectedScope WHERE layer IN $layers))
+       })
   AND (size(other.layers) = 0
        OR any(layer IN other.layers WHERE layer IN $layers))
 WITH s, r, other, property, r.validTo IS NULL AS current, toString(r.validTo) AS validTo
@@ -1911,9 +2011,16 @@ MATCH (n:Entity {iri: $iri})
 WHERE size(n.layers) = 0
    OR any(layer IN n.layers WHERE layer IN $layers)
 MATCH (n)-[r]-(other:Entity)
-WHERE NOT type(r) IN $protected
-  AND (size(r.layers) = 0
-       OR any(layer IN r.layers WHERE layer IN $layers))
+WHERE type(r) <> 'ABOUT'
+  AND NOT type(r) IN $protected
+  AND ((size(r.layers) = 0
+        OR any(layer IN r.layers WHERE layer IN $layers))
+       OR EXISTS {
+         MATCH (event:Entity:Episode {tool: 'revise'})
+         WHERE r.iri IN [event.previousFactIri, event.replacementFactIri]
+           AND (size(event.selectedScope) = 0
+                OR any(layer IN event.selectedScope WHERE layer IN $layers))
+       })
   AND (size(other.layers) = 0
        OR any(layer IN other.layers WHERE layer IN $layers))
 WITH startNode(r) AS s, r, endNode(r) AS o,
@@ -1922,6 +2029,59 @@ WITH startNode(r) AS s, r, endNode(r) AS o,
 ORDER BY current DESC, validTo DESC, r.iri ASC
 LIMIT $limit
 RETURN s, r, o, property, current, validTo
+"#;
+
+/// Exact revision events for the fact family selected by one fact handle.
+const RECALL_REVISIONS_FACT_QUERY: &str = r#"
+MATCH (anchorS:Entity)-[anchor]->(anchorO:Entity)
+WHERE anchor.iri = $iri
+  AND (size(anchorS.layers) = 0
+       OR any(layer IN anchorS.layers WHERE layer IN $layers))
+  AND (size(anchorO.layers) = 0
+       OR any(layer IN anchorO.layers WHERE layer IN $layers))
+WITH anchorS, anchor.propertyIri AS property
+MATCH (event:Entity:Episode {tool: 'revise'})
+WHERE size(event.selectedScope) = 0
+   OR any(layer IN event.selectedScope WHERE layer IN $layers)
+MATCH (anchorS)-[family]->(familyObject:Entity)
+WHERE family.propertyIri = property
+  AND family.iri IN [event.previousFactIri, event.replacementFactIri]
+  AND (size(familyObject.layers) = 0
+       OR any(layer IN familyObject.layers WHERE layer IN $layers))
+MATCH ()-[previous]->() WHERE previous.iri = event.previousFactIri
+MATCH ()-[replacement]->() WHERE replacement.iri = event.replacementFactIri
+MATCH (supersedesS:Entity)-[supersedes:SUPERSEDES]->(supersedesO:Entity)
+WHERE supersedes.iri = event.supersedesIri
+RETURN DISTINCT event, toString(event.at) AS episodeAt,
+       previous.iri AS previousFactIri,
+       replacement.iri AS replacementFactIri,
+       supersedesS, supersedes, supersedesO
+ORDER BY event.at DESC, event.iri ASC
+LIMIT $limit
+"#;
+
+/// Exact revision events involving any ordinary fact incident to one node handle.
+const RECALL_REVISIONS_NODE_QUERY: &str = r#"
+MATCH (n:Entity {iri: $iri})
+WHERE size(n.layers) = 0
+   OR any(layer IN n.layers WHERE layer IN $layers)
+MATCH (event:Entity:Episode {tool: 'revise'})
+WHERE size(event.selectedScope) = 0
+   OR any(layer IN event.selectedScope WHERE layer IN $layers)
+MATCH (n)-[family]-(familyObject:Entity)
+WHERE family.iri IN [event.previousFactIri, event.replacementFactIri]
+  AND (size(familyObject.layers) = 0
+       OR any(layer IN familyObject.layers WHERE layer IN $layers))
+MATCH ()-[previous]->() WHERE previous.iri = event.previousFactIri
+MATCH ()-[replacement]->() WHERE replacement.iri = event.replacementFactIri
+MATCH (supersedesS:Entity)-[supersedes:SUPERSEDES]->(supersedesO:Entity)
+WHERE supersedes.iri = event.supersedesIri
+RETURN DISTINCT event, toString(event.at) AS episodeAt,
+       previous.iri AS previousFactIri,
+       replacement.iri AS replacementFactIri,
+       supersedesS, supersedes, supersedesO
+ORDER BY event.at DESC, event.iri ASC
+LIMIT $limit
 "#;
 
 /// `recall` `history` path: current and superseded facts for one handle.
@@ -1941,9 +2101,19 @@ pub async fn memory_recall_history(
         .collect::<Vec<_>>();
     let fact_iri = iri.starts_with("mindreader:relationship/");
     let found_query = if fact_iri {
-        "MATCH ()-[r]->() WHERE r.iri = $iri \
-         AND (size(r.layers) = 0 \
-              OR any(layer IN r.layers WHERE layer IN $layers)) \
+        "MATCH (s:Entity)-[r]->(o:Entity) WHERE r.iri = $iri \
+         AND (size(s.layers) = 0 \
+              OR any(layer IN s.layers WHERE layer IN $layers)) \
+         AND (size(o.layers) = 0 \
+              OR any(layer IN o.layers WHERE layer IN $layers)) \
+         AND ((size(r.layers) = 0 \
+               OR any(layer IN r.layers WHERE layer IN $layers)) \
+              OR EXISTS { \
+                MATCH (event:Entity:Episode {tool: 'revise'}) \
+                WHERE r.iri IN [event.previousFactIri, event.replacementFactIri] \
+                  AND (size(event.selectedScope) = 0 \
+                       OR any(layer IN event.selectedScope WHERE layer IN $layers)) \
+              }) \
          RETURN count(r) AS n"
     } else {
         "MATCH (n:Entity {iri: $iri}) \
@@ -1970,8 +2140,10 @@ pub async fn memory_recall_history(
             "facts": [],
             "nodes": [],
             "paths": [],
+            "revisions": [],
+            "revisionsTruncated": false,
             "about": [],
-            "lookups": [{ "iri": iri, "found": false, "facts": [] }],
+            "lookups": [{ "iri": iri, "found": false, "facts": [], "truncated": false }],
             "truncated": false,
         }));
     }
@@ -1989,7 +2161,20 @@ pub async fn memory_recall_history(
             .param("limit", i64::from(limit.saturating_add(1))),
     )
     .await?;
-    let truncated = rows.len() > limit as usize;
+    let facts_truncated = rows.len() > limit as usize;
+    let revision_rows = fetch_all(
+        graph,
+        query(if fact_iri {
+            RECALL_REVISIONS_FACT_QUERY
+        } else {
+            RECALL_REVISIONS_NODE_QUERY
+        })
+        .param("iri", iri.to_string())
+        .param("layers", layers.clone())
+        .param("limit", i64::from(limit.saturating_add(1))),
+    )
+    .await?;
+    let revisions_truncated = revision_rows.len() > limit as usize;
     let mut facts = Vec::new();
     let mut nodes_by_iri = std::collections::HashMap::new();
     if !fact_iri {
@@ -2021,24 +2206,13 @@ pub async fn memory_recall_history(
         nodes_by_iri.insert(subject_iri.clone(), node_json(&subject)?);
         nodes_by_iri.insert(object_iri.clone(), node_json(&object)?);
         let relationship = rel_json(&relationship, &subject_iri, &object_iri)?;
-        let memberships = relationship
-            .get("scope")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .ok_or_else(|| operation_error!("serialized fact scope is not an array"))?;
+        let memberships = serialized_scope(&relationship)?;
         let mut fact = crate::graph::fact_envelope(
             endpoint_json(&subject)?,
             &property,
             endpoint_json(&object)?,
             &relationship,
             &memberships,
-            None,
         )?;
         fact["current"] = json!(current);
         if let Ok(valid_to) = row.get::<String>("validTo") {
@@ -2047,6 +2221,38 @@ pub async fn memory_recall_history(
             }
         }
         facts.push(fact);
+    }
+    let mut revisions = Vec::new();
+    for row in revision_rows.into_iter().take(limit as usize) {
+        let event = row.get::<Node>("event")?;
+        let supersedes_subject = row.get::<Node>("supersedesS")?;
+        let supersedes_relationship = row.get::<Relation>("supersedes")?;
+        let supersedes_object = row.get::<Node>("supersedesO")?;
+        let supersedes_from = supersedes_subject.get::<String>("iri")?;
+        let supersedes_to = supersedes_object.get::<String>("iri")?;
+        let supersedes = rel_json(&supersedes_relationship, &supersedes_from, &supersedes_to)?;
+        revisions.push(json!({
+            "replacement": {
+                "kind": "fact",
+                "iri": row.get::<String>("replacementFactIri")?,
+            },
+            "previous": {
+                "kind": "fact",
+                "iri": row.get::<String>("previousFactIri")?,
+            },
+            "scope": event.get::<Vec<String>>("selectedScope")?,
+            "episode": {
+                "iri": event.get::<String>("iri")?,
+                "at": row.get::<String>("episodeAt")?,
+                "tool": "revise",
+            },
+            "supersedes": {
+                "iri": supersedes["iri"],
+                "from": supersedes["from"],
+                "to": supersedes["to"],
+                "reason": supersedes.get("reason").cloned().unwrap_or(Value::Null),
+            },
+        }));
     }
     let mut nodes = nodes_by_iri.into_iter().collect::<Vec<_>>();
     nodes.sort_by(|left, right| left.0.cmp(&right.0));
@@ -2059,9 +2265,16 @@ pub async fn memory_recall_history(
         "facts": facts.clone(),
         "nodes": nodes,
         "paths": [],
+        "revisions": revisions,
+        "revisionsTruncated": revisions_truncated,
         "about": [],
-        "lookups": [{ "iri": iri, "found": true, "facts": facts }],
-        "truncated": truncated,
+        "lookups": [{
+            "iri": iri,
+            "found": true,
+            "facts": [],
+            "truncated": facts_truncated,
+        }],
+        "truncated": facts_truncated || revisions_truncated,
     }))
 }
 
@@ -3056,9 +3269,10 @@ mod tests {
         recall_around_query, reject_system_owned_predicate, remove_memberships,
         revision_fact_lock_requests, select_revision_current, validate_judge_args,
         validate_write_args, withdrawal_fact_lock_requests, write_fact_lock_requests, CurrentFact,
-        FactMembershipChange, JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, TargetArgs, WriteArgs,
-        WriteFact, CONTRADICTS_PROPERTY, LAYERS_PROPERTY, MAX_WRITE_FACTS,
-        PREDICATE_USAGE_PROPERTY, RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
+        FactMembershipChange, JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, RecallDirection,
+        TargetArgs, WriteArgs, WriteFact, CONTRADICTS_PROPERTY, HUB_DEGREE_THRESHOLD,
+        LAYERS_PROPERTY, MAX_WRITE_FACTS, PREDICATE_USAGE_PROPERTY, RECALL_IRI_FACTS_QUERY,
+        RECALL_IRI_NODES_QUERY,
     };
     use crate::domain::{DomainError, EntityInput, ObjectInput};
     use crate::error::Error;
@@ -3080,18 +3294,21 @@ mod tests {
         assert!(!RECALL_IRI_FACTS_QUERY.contains("collect("));
         assert!(RECALL_IRI_FACTS_QUERY.contains("ORDER BY inputIndex ASC"));
         assert!(RECALL_IRI_FACTS_QUERY.contains("LIMIT $limit"));
+        assert!(RECALL_IRI_FACTS_QUERY.contains("type(r) <> 'ABOUT'"));
 
-        let around = recall_around_query(3);
-        let predicate_filter = around.find("property IN $predicates").unwrap();
+        let around = recall_around_query(3, RecallDirection::Both);
+        let predicate_filter = around.find("pathRel.propertyIri IN $predicates").unwrap();
         let limit = around.find("LIMIT $limit").unwrap();
         assert!(around.contains("pathRels*1..3"));
         assert!(predicate_filter < limit);
         assert!(around.contains("pathNodes ASC, pathEdgeIris ASC"));
-        assert!(around.contains("head(collect(path)) AS path"));
+        assert!(around.contains("length(path) + hubCount AS routeCost"));
+        assert!(around.contains(&format!("eligibleDegree > {HUB_DEGREE_THRESHOLD}")));
         assert!(around.contains("RETURN distance, path, witnessNodes AS pathNodes"));
-        assert!(
-            around.contains("ORDER BY distance ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC")
-        );
+        assert!(around.contains("ORDER BY routeCost ASC, hubCount ASC, distance ASC"));
+        assert!(recall_around_query(1, RecallDirection::Outgoing).contains("-[pathRels*1..1]->"));
+        assert!(recall_around_query(1, RecallDirection::Incoming).contains("<-[pathRels*1..1]-"));
+        assert!(RecallDirection::parse("sideways").is_err());
     }
 
     #[test]
@@ -3116,6 +3333,7 @@ mod tests {
             rel_id: 2,
             iri: "fact:new".into(),
             layers: vec!["project:a".into()],
+            spike: None,
         };
         assert!(select_revision_current(
             std::slice::from_ref(&replacement),
@@ -3291,6 +3509,7 @@ mod tests {
             rel_id,
             iri: format!("mindreader:fact/{rel_id}"),
             layers: layers.iter().map(|layer| (*layer).to_string()).collect(),
+            spike: None,
         }
     }
 

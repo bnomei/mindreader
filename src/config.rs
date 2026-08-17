@@ -95,8 +95,10 @@ pub struct SemanticConfig {
     pub convergence_result_overlap_threshold: f64,
     /// Reciprocal-rank fusion `k`; larger values flatten rank gaps.
     pub rrf_k: f64,
-    /// Extra RRF weight on the closed-world `memory_search` list versus activations.
+    /// RRF weight for direct facts with exact phrase or property evidence.
     pub direct_weight: f64,
+    /// RRF weight for direct facts found only through fallback keywords.
+    pub keyword_weight: f64,
 }
 
 impl Default for SemanticConfig {
@@ -104,11 +106,12 @@ impl Default for SemanticConfig {
         Self {
             ttl_days: 30,
             neighbor_limit: 10,
-            recall_similarity_threshold: 0.70,
+            recall_similarity_threshold: 0.65,
             convergence_similarity_threshold: 0.90,
             convergence_result_overlap_threshold: 0.60,
-            rrf_k: 60.0,
+            rrf_k: 15.0,
             direct_weight: 2.0,
+            keyword_weight: 0.5,
         }
     }
 }
@@ -133,10 +136,6 @@ impl SemanticConfig {
         }
         for (name, value) in [
             (
-                "semantic.recall_similarity_threshold",
-                self.recall_similarity_threshold,
-            ),
-            (
                 "semantic.convergence_similarity_threshold",
                 self.convergence_similarity_threshold,
             ),
@@ -151,12 +150,29 @@ impl SemanticConfig {
                 ));
             }
         }
+        if !(0.0..1.0).contains(&self.recall_similarity_threshold)
+            || !self.recall_similarity_threshold.is_finite()
+        {
+            return Err(config_error!(
+                "semantic.recall_similarity_threshold must be a finite value between zero (inclusive) and one (exclusive)"
+            ));
+        }
         if !self.rrf_k.is_finite() || self.rrf_k <= 0.0 {
             return Err(config_error!("semantic.rrf_k must be greater than zero"));
         }
         if !self.direct_weight.is_finite() || self.direct_weight <= 0.0 {
             return Err(config_error!(
                 "semantic.direct_weight must be greater than zero"
+            ));
+        }
+        if !self.keyword_weight.is_finite() || self.keyword_weight <= 0.0 {
+            return Err(config_error!(
+                "semantic.keyword_weight must be greater than zero"
+            ));
+        }
+        if self.direct_weight <= self.keyword_weight {
+            return Err(config_error!(
+                "semantic.direct_weight must be greater than semantic.keyword_weight"
             ));
         }
         Ok(())
@@ -449,6 +465,12 @@ mod tests {
         assert!(config.validate().is_err());
         config.convergence_similarity_threshold = 0.9;
         config.neighbor_limit = 0;
+        assert!(config.validate().is_err());
+        config.neighbor_limit = 10;
+        config.recall_similarity_threshold = 1.0;
+        assert!(config.validate().is_err());
+        config.recall_similarity_threshold = 0.65;
+        config.direct_weight = config.keyword_weight;
         assert!(config.validate().is_err());
     }
 

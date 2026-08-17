@@ -207,6 +207,7 @@ async fn benchmark_search(
         hops: None,
         p: None,
         depth: None,
+        direction: None,
         history: None,
         detail: Some("detailed".into()),
         limit: Some(20),

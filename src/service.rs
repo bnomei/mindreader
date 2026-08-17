@@ -104,6 +104,7 @@ impl MemoryService {
                 scope.clone(),
                 args.p.unwrap_or_default(),
                 args.depth.unwrap_or(1),
+                args.direction.as_deref().unwrap_or("both"),
                 args.limit.unwrap_or(20),
             )
             .await?

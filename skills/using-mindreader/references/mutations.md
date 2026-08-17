@@ -12,7 +12,7 @@ Read this file before revise, withdraw, place, judge, or unify, and before using
 
 ## Write facts
 
-Write proactively when discussion, investigation, decisions, implementation, debugging, review, or handoff establishes supported knowledge that another agent or session should reuse. The user need not ask. Send 1–20 facts in one atomic `mindreader:write` call with call-level `scope`. Reasserting an exact fact merges memberships or is a no-op; another object preserves existing values.
+Write proactively when discussion, investigation, decisions, implementation, debugging, review, or handoff establishes supported knowledge that another agent or session should reuse. The user need not ask. Send 1–20 facts in one atomic `mindreader:write` call with call-level `scope`. Reasserting an exact fact merges memberships; an explicit `spike` reclassifies only that fact. Another object preserves existing values.
 
 Subjects and entity objects are `{"kind":"node","iri":"..."}` or `{"kind":"node","name":"..."}`. Literals are `{"kind":"literal","value":"...","datatype":"xsd:string"}`; `datatype` defaults to `xsd:string`. A predicate accepts its name or IRI.
 
@@ -30,13 +30,13 @@ Subjects and entity objects are `{"kind":"node","iri":"..."}` or `{"kind":"node"
 }
 ```
 
-SPIKE progresses `Signal -> Pattern -> Insight -> Knowledge`: use Signal for raw evidence, Pattern for recurrence, Insight for interpretation, and Knowledge only for a fact worth relying on. Retrieval priority is the reverse. Do not auto-promote. Name-only subjects stay `mindreader:element/<slug>`; `spike` is an extra label and ranking, not a new IRI kind. Reuse established Property/Class vocabulary; make one bounded catalog recall only when vocabulary is uncertain.
+SPIKE progresses `Signal -> Pattern -> Insight -> Knowledge`: use Signal for raw evidence, Pattern for recurrence, Insight for interpretation, and Knowledge only for a fact worth relying on. Retrieval priority is the reverse. Do not auto-promote. `spike` is stored on the exact relationship: it does not label either endpoint or generate `ABOUT`. Omission preserves an existing classification on exact reassertion and revision. Write `p:"ABOUT"` explicitly only for genuine context; explicit ABOUT appears in detailed recall's `about[]`, never ordinary `facts[]` or semantic bundles. Bulk-imported source edges normally omit `spike` unless each edge has independently justified epistemic classification. Reuse established Property/Class vocabulary; make one bounded catalog recall only when vocabulary is uncertain.
 
 ## Revise or withdraw facts
 
 When current work establishes that stored knowledge is wrong, obsolete, or no longer true, maintain it without waiting for a user correction request. Use an exact fact target retained from an earlier result or obtained through one targeted recall.
 
-- `mindreader:revise` replaces only the object. Its `scope` selects memberships removed from the old fact; the replacement receives the full requested scope, while unrelated current values and memberships remain. `scope: []` selects a global fact. A global fact visible through a named scope cannot be revised there.
+- `mindreader:revise` replaces only the object. Its `scope` selects memberships removed from the old fact; the replacement receives the full requested scope, while unrelated current values and memberships remain. The replacement preserves the old fact's `spike` unless a new classification is supplied. `scope: []` selects a global fact. A global fact visible through a named scope cannot be revised there.
 - `mindreader:withdraw` softly removes selected memberships and preserves history. Prefer an exact fact `target`. Subject form withdraws every mutable ordinary current outgoing fact for the subject in the selected memberships, optionally restricted by `p`; use it only when that broad slice is intentional. Supply exactly one of `target` or `subject`. A named scope cannot withdraw a global fact; use `scope: []` only when a global withdrawal is intended.
 - If revision or withdrawal removes a fact's final selected named membership, the old fact becomes historical; it does not become global.
 

@@ -392,7 +392,7 @@ pub(crate) fn merge_similarity_accepted(kind: &str, similarity: f64) -> bool {
     }
 }
 
-/// Require both nodes to share the same identity kind (Class, Property, Element, or one Spike).
+/// Require both nodes to share the same identity kind (Class, Property, or Element).
 fn require_same_kind(source: &Node, target: &Node) -> Result<String> {
     let source_kind = identity_kind_from_labels(source.labels());
     let target_kind = identity_kind_from_labels(target.labels());
@@ -725,20 +725,12 @@ pub async fn merge_suggestions_in_txn(
                    WHEN created:Class THEN 'Class'
                    WHEN created:Property THEN 'Property'
                    WHEN created:Element THEN 'Element'
-                   WHEN created:Signal AND NOT created:Pattern AND NOT created:Insight AND NOT created:Knowledge THEN 'Signal'
-                   WHEN created:Pattern AND NOT created:Signal AND NOT created:Insight AND NOT created:Knowledge THEN 'Pattern'
-                   WHEN created:Insight AND NOT created:Signal AND NOT created:Pattern AND NOT created:Knowledge THEN 'Insight'
-                   WHEN created:Knowledge AND NOT created:Signal AND NOT created:Pattern AND NOT created:Insight THEN 'Knowledge'
                    ELSE null
                  END AS createdKind,
                  CASE
                    WHEN candidate:Class THEN 'Class'
                    WHEN candidate:Property THEN 'Property'
                    WHEN candidate:Element THEN 'Element'
-                   WHEN candidate:Signal AND NOT candidate:Pattern AND NOT candidate:Insight AND NOT candidate:Knowledge THEN 'Signal'
-                   WHEN candidate:Pattern AND NOT candidate:Signal AND NOT candidate:Insight AND NOT candidate:Knowledge THEN 'Pattern'
-                   WHEN candidate:Insight AND NOT candidate:Signal AND NOT candidate:Pattern AND NOT candidate:Knowledge THEN 'Insight'
-                   WHEN candidate:Knowledge AND NOT candidate:Signal AND NOT candidate:Pattern AND NOT candidate:Insight THEN 'Knowledge'
                    ELSE null
                  END AS candidateKind,
                  apoc.text.levenshteinSimilarity(

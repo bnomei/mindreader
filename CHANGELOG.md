@@ -7,6 +7,15 @@ versions follow Semantic Versioning.
 
 ### Changed
 
+- Advance the fresh-database graph contract to model v8. Spike classification is stored on each exact relationship rather than as a subject-node label; exact revision Episodes retain previous/replacement fact and SUPERSEDES identities; explicit reassertion can reclassify one fact and revision preserves the old classification unless replaced.
+- Expose newest-first exact `revisions[]` audit events from history, including pasteable previous/replacement fact handles and non-actionable SUPERSEDES metadata.
+- Make neighborhood predicates and incoming/outgoing direction constrain every traversed edge, retain compact witness paths in concise recall, rank witnesses with a bounded hub penalty, and report per-IRI truncation.
+- Return complete merged memberships in write responses instead of echoing only the requested membership slice.
+- Stop generating `ABOUT` from spiked writes. `ABOUT` is explicit-only context and is excluded from ordinary recall facts, neighborhood/history traversal, and semantic activation bundles.
+- Prefer a relationship's own full-text evidence over endpoint fan-out, and diversify three-fact semantic activation bundles so one subject-and-property group cannot consume every slot when another group is available.
+- Normalize activation cosine above its admission threshold and cap it at keyword evidence, with direct evidence winning ties. Persist only direct-supported bundle facts, so activation-only recall can refresh but cannot recursively create or rewrite semantic bundles.
+- Scale semantic keyword evidence by query-token coverage, exclude endpoint-only fallback from semantic fusion, allow only exact or complete-coverage relationship evidence to teach activation bundles, and advance learned activations to V4 so older ranking evidence stays dormant.
+- Add bounded query-time one-hop structural context around grounded semantic anchors, with endpoint-degree and anchor-property penalties; expanded facts remain weaker than anchors and never teach or boost activation evidence.
 - Accept MCP initialize `2025-11-25` in addition to preferred `2026-07-28` so hosts that still request the older version can complete the handshake. Discovery lists both. Older and unknown initialize protocols remain rejected.
 - Remove the `memory_` prefix from all eight MCP tools: `recall`, `recall_semantic`, `write`, `revise`, `withdraw`, `judge`, `place`, and `unify`. New mutation Episodes use the same unprefixed names; no compatibility aliases are provided.
 

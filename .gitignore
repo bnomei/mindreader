@@ -1,5 +1,6 @@
 /target
 /dist
+/tmp
 .env
 .orchid
 .frigg

@@ -93,6 +93,16 @@ fn entity(name: impl Into<String>) -> EntityInput {
     }
 }
 
+/// Element subject with one custom label for isolated retrieval fixtures.
+fn labeled_entity(name: impl Into<String>, label: &str) -> EntityInput {
+    EntityInput {
+        kind: "node".into(),
+        iri: None,
+        name: Some(name.into()),
+        labels: vec!["Element".into(), label.into()],
+    }
+}
+
 /// Subject identified by an existing node IRI.
 fn entity_iri(iri: impl Into<String>) -> EntityInput {
     EntityInput {
@@ -110,6 +120,18 @@ fn object(name: impl Into<String>) -> ObjectInput {
         iri: None,
         name: Some(name.into()),
         labels: vec!["Element".into()],
+        value: None,
+        datatype: None,
+    }
+}
+
+/// Element object with one custom label for isolated retrieval fixtures.
+fn labeled_object(name: impl Into<String>, label: &str) -> ObjectInput {
+    ObjectInput {
+        kind: "node".into(),
+        iri: None,
+        name: Some(name.into()),
+        labels: vec!["Element".into(), label.into()],
         value: None,
         datatype: None,
     }
@@ -214,7 +236,7 @@ async fn seed_semantic_activation(
         graph,
         query(
             r#"
-            CREATE (a:SemanticActivation:TTL {resultRefs: $resultRefs})
+            CREATE (a:SemanticActivation:SemanticActivationV4:TTL {resultRefs: $resultRefs})
             WITH a
             CALL db.create.setNodeVectorProperty(a, 'embedding', $embedding)
             WITH a
@@ -266,6 +288,7 @@ async fn search(service: &MemoryService, scope: Vec<String>, text: &str) -> Resu
             hops: None,
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: Some("detailed".into()),
             limit: Some(100),
@@ -526,7 +549,7 @@ async fn run() -> Result<u32> {
         NodeSpec {
             iri: Some(relabeled_iri),
             name: Some(format!("replacement-name-{tag}")),
-            labels: vec!["Knowledge".into()],
+            labels: vec!["Reviewed".into()],
         },
     )
     .await?;
@@ -534,7 +557,7 @@ async fn run() -> Result<u32> {
     let concurrent_spec = NodeSpec {
         iri: Some(concurrent_iri),
         name: Some(format!("apoc-concurrent-{tag}")),
-        labels: vec!["Pattern".into()],
+        labels: vec!["Concurrent".into()],
     };
     let (left, right) = tokio::try_join!(
         merge_node_once(graph.clone(), concurrent_spec.clone()),
@@ -548,7 +571,7 @@ async fn run() -> Result<u32> {
                 .json
                 .get("labels")
                 .and_then(Value::as_array)
-                .is_some_and(|labels| labels.iter().any(|label| label == "Knowledge"))
+                .is_some_and(|labels| labels.iter().any(|label| label == "Reviewed"))
             && relabeled.json.get("name") == initial.json.get("name")
             && left.created as usize + right.created as usize == 1,
         format!("initial={initial:?} relabeled={relabeled:?} concurrent=({left:?}, {right:?})"),
@@ -591,7 +614,9 @@ async fn run() -> Result<u32> {
         format!("write={schema} property={schema_property:?}"),
     );
 
-    let visibility_token = format!("visibility-{tag}");
+    // Keep this one alphanumeric token so keyword fallback cannot match fixtures
+    // from earlier persistent smoke runs through a generic "visibility" term.
+    let visibility_token = format!("visibility{tag}");
     let global = service
         .write(write_args(
             entity(format!("{visibility_token}-global-subject")),
@@ -753,7 +778,17 @@ async fn run() -> Result<u32> {
     report.check(
         "exact semantic fact unions memberships under one stable relationship IRI",
         relationship_iri(&merged_b)? == merged_rel
-            && merged_state == Some((vec![layer_a.clone(), layer_b.clone()], true, 0)),
+            && merged_state == Some((vec![layer_a.clone(), layer_b.clone()], true, 0))
+            && merged_b
+                .pointer("/facts/0/scope")
+                .and_then(Value::as_array)
+                .is_some_and(|scope| {
+                    scope
+                        == &vec![
+                            Value::String(layer_a.clone()),
+                            Value::String(layer_b.clone()),
+                        ]
+                }),
         format!("first={merged_a} second={merged_b} state={merged_state:?}"),
     );
 
@@ -866,6 +901,46 @@ async fn run() -> Result<u32> {
             relation_state(&graph, &merged_rel).await?,
             relation_state(&graph, &replacement_rel).await?
         ),
+    );
+    let revision_history = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone(), layer_b.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            direction: None,
+            history: Some(replacement_rel.clone()),
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    report.check(
+        "history exposes exact non-pasteable SUPERSEDES revision events",
+        revision_history
+            .pointer("/revisions/0/replacement/iri")
+            .and_then(Value::as_str)
+            == Some(replacement_rel.as_str())
+            && revision_history
+                .pointer("/revisions/0/previous/iri")
+                .and_then(Value::as_str)
+                == Some(merged_rel.as_str())
+            && revision_history
+                .pointer("/revisions/0/supersedes/iri")
+                .and_then(Value::as_str)
+                .is_some()
+            && revision_history
+                .pointer("/revisions/0/scope/0")
+                .and_then(Value::as_str)
+                == Some(layer_a.as_str())
+            && revision_history
+                .pointer("/lookups/0/facts")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+        &revision_history,
     );
 
     let withdrawn = service
@@ -1401,6 +1476,7 @@ async fn run() -> Result<u32> {
             hops: Some(1),
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
@@ -1435,6 +1511,7 @@ async fn run() -> Result<u32> {
             hops: Some(1),
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: None,
             limit: Some(1),
@@ -1462,6 +1539,7 @@ async fn run() -> Result<u32> {
             hops: None,
             p: Some(vec![format!("not-{property}")]),
             depth: Some(1),
+            direction: None,
             history: None,
             detail: None,
             limit: Some(1),
@@ -1477,11 +1555,124 @@ async fn run() -> Result<u32> {
             hops: None,
             p: Some(vec![property.clone()]),
             depth: Some(1),
+            direction: None,
             history: None,
             detail: None,
             limit: Some(1),
         })
         .await?;
+    let route_property = format!("route-{tag}");
+    let detour_property = format!("detour-{tag}");
+    let route_a = format!("route-{tag}-a");
+    let route_b = format!("route-{tag}-b");
+    let route_c = format!("route-{tag}-c");
+    let route_d = format!("route-{tag}-d");
+    let route_e = format!("route-{tag}-e");
+    for (subject, predicate, target) in [
+        (&route_a, &route_property, &route_b),
+        (&route_b, &route_property, &route_c),
+        (&route_b, &detour_property, &route_d),
+        (&route_d, &route_property, &route_e),
+    ] {
+        service
+            .write(write_args(
+                entity(subject.clone()),
+                predicate,
+                object(target.clone()),
+                vec![layer_a.clone()],
+            ))
+            .await?;
+    }
+    let route_a_iri = format!("mindreader:element/{route_a}");
+    let route_c_iri = format!("mindreader:element/{route_c}");
+    let route_outgoing = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: Some(route_a_iri),
+            hops: None,
+            p: Some(vec![route_property.clone()]),
+            depth: Some(3),
+            direction: Some("outgoing".into()),
+            history: None,
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let route_incoming = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: Some(route_c_iri.clone()),
+            hops: None,
+            p: Some(vec![route_property.clone()]),
+            depth: Some(3),
+            direction: Some("incoming".into()),
+            history: None,
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let route_wrong_direction = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: Some(route_c_iri),
+            hops: None,
+            p: Some(vec![route_property.clone()]),
+            depth: Some(3),
+            direction: Some("outgoing".into()),
+            history: None,
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let route_property_iri = format!("mindreader:property/{route_property}");
+    let route_paths_are_filtered = |value: &Value| {
+        value
+            .get("paths")
+            .and_then(Value::as_array)
+            .is_some_and(|paths| {
+                paths.len() == 2
+                    && paths.iter().all(|path| {
+                        path.get("edges")
+                            .and_then(Value::as_array)
+                            .is_some_and(|edges| {
+                                !edges.is_empty()
+                                    && edges.iter().all(|edge| {
+                                        edge.get("p").and_then(Value::as_str)
+                                            == Some(route_property_iri.as_str())
+                                    })
+                            })
+                    })
+            })
+    };
+    report.check(
+        "around constrains every witness edge by predicate and direction",
+        route_outgoing
+            .get("facts")
+            .and_then(Value::as_array)
+            .is_some_and(|facts| facts.len() == 2)
+            && route_paths_are_filtered(&route_outgoing)
+            && route_incoming
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| facts.len() == 2)
+            && route_paths_are_filtered(&route_incoming)
+            && route_wrong_direction
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(Vec::is_empty),
+        format!(
+            "outgoing={route_outgoing} incoming={route_incoming} wrong={route_wrong_direction}"
+        ),
+    );
     let catalog_before = service
         .recall(RecallArgs {
             scope: Vec::new(),
@@ -1492,6 +1683,7 @@ async fn run() -> Result<u32> {
             hops: None,
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: None,
             limit: Some(100),
@@ -1530,6 +1722,7 @@ async fn run() -> Result<u32> {
             hops: None,
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: None,
             limit: Some(100),
@@ -1636,6 +1829,7 @@ async fn run() -> Result<u32> {
             hops: Some(0),
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: Some("concise".into()),
             limit: Some(20),
@@ -1652,6 +1846,7 @@ async fn run() -> Result<u32> {
             hops: None,
             p: None,
             depth: None,
+            direction: None,
             history: Some(history_iri.clone()),
             detail: None,
             limit: Some(20),
@@ -1719,14 +1914,86 @@ async fn run() -> Result<u32> {
         })
         .await?;
     let spiked_iri = subject_iri(&spiked)?;
+    let spiked_relationship = relationship_iri(&spiked)?;
+    let implicit_about_count = fetch_one(
+        &graph,
+        query(
+            "MATCH (:Entity {iri: $iri})-[a:ABOUT]->(:Entity) \
+             WHERE a.validTo IS NULL RETURN count(a) AS count",
+        )
+        .param("iri", spiked_iri.clone()),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("implicit ABOUT count returned no row"))?
+    .get::<i64>("count")?;
     report.check(
-        "name-only Knowledge spike mints an Element IRI and keeps the extra label",
+        "Knowledge classifies only the exact fact and creates no implicit ABOUT",
         spiked_iri == format!("mindreader:element/spike-id-{tag}")
-            && spiked
-                .pointer("/facts/0/s/labels")
-                .and_then(Value::as_array)
-                .is_some_and(|labels| labels.iter().any(|label| label == "Knowledge")),
+            && spiked.pointer("/facts/0/spike").and_then(Value::as_str) == Some("Knowledge")
+            && implicit_about_count == 0,
         format!("iri={spiked_iri} spiked={spiked}"),
+    );
+
+    let explicit_about = service
+        .write(WriteArgs {
+            facts: vec![WriteFact {
+                s: entity(format!("explicit-context-{tag}")),
+                p: "ABOUT".into(),
+                o: ObjectInput {
+                    kind: "node".into(),
+                    iri: Some(spiked_iri.clone()),
+                    name: None,
+                    labels: Vec::new(),
+                    value: None,
+                    datatype: None,
+                },
+                spike: Some("Insight".into()),
+                contradicts: false,
+            }],
+            scope: vec![layer_a.clone()],
+        })
+        .await?;
+    let explicit_about_iri = relationship_iri(&explicit_about)?;
+    let spiked_recall = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: Some(spike_name),
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            direction: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+        })
+        .await?;
+    report.check(
+        "explicit ABOUT appears only as ranked context, never as an ordinary fact",
+        spiked_recall
+            .get("facts")
+            .and_then(Value::as_array)
+            .is_some_and(|facts| {
+                facts.iter().any(|fact| {
+                    fact.pointer("/target/iri").and_then(Value::as_str)
+                        == Some(spiked_relationship.as_str())
+                }) && facts
+                    .iter()
+                    .all(|fact| fact.get("p").and_then(Value::as_str) != Some("ABOUT"))
+            })
+            && spiked_recall
+                .get("about")
+                .and_then(Value::as_array)
+                .is_some_and(|about| {
+                    about.iter().any(|context| {
+                        context.pointer("/relationship/iri").and_then(Value::as_str)
+                            == Some(explicit_about_iri.as_str())
+                            && context.get("rank").and_then(Value::as_str) == Some("Insight")
+                    })
+                }),
+        format!("write={explicit_about} recall={spiked_recall}"),
     );
 
     let fanout_subject = format!("fanout-{tag}");
@@ -1773,6 +2040,7 @@ async fn run() -> Result<u32> {
             hops: Some(0),
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
@@ -1788,6 +2056,7 @@ async fn run() -> Result<u32> {
             hops: Some(1),
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
@@ -1823,6 +2092,7 @@ async fn run() -> Result<u32> {
             hops: None,
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: Some("concise".into()),
             limit: Some(20),
@@ -1843,6 +2113,245 @@ async fn run() -> Result<u32> {
                 })
             }),
         &camel_recall,
+    );
+
+    let cold_subject = format!("cold-keyword-{tag}");
+    let cold_write = service
+        .write(write_args(
+            entity(cold_subject),
+            "coldStartBehavior",
+            object(format!(
+                "resilient server startup without database availability {tag}"
+            )),
+            vec![layer_a.clone()],
+        ))
+        .await?;
+    let cold_target = relationship_iri(&cold_write)?;
+    let cold_query = "can this server start while its database is unavailable".to_string();
+    let cold_lexical = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: Some(cold_query.clone()),
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            direction: None,
+            history: None,
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let cold_semantic = service
+        .recall_semantic(SemanticSearchArgs {
+            scope: vec![layer_a.clone()],
+            text: cold_query,
+            labels: None,
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    report.check(
+        "cold text and semantic recall use keyword candidates when the full phrase is absent",
+        fact_relationships(&cold_lexical)?.contains(&cold_target)
+            && fact_relationships(&cold_semantic)?.contains(&cold_target),
+        format!("lexical={cold_lexical} semantic={cold_semantic}"),
+    );
+
+    let semantic_fanout_label = format!("SemanticFanout{tag}");
+    let semantic_fanout_subject = format!("semantic-fanout-{tag}");
+    let semantic_fanout = service
+        .write(WriteArgs {
+            facts: vec![
+                WriteFact {
+                    s: labeled_entity(semantic_fanout_subject.clone(), &semantic_fanout_label),
+                    p: "contains".into(),
+                    o: labeled_object(format!("generic-alpha-{tag}"), &semantic_fanout_label),
+                    spike: None,
+                    contradicts: false,
+                },
+                WriteFact {
+                    s: labeled_entity(semantic_fanout_subject.clone(), &semantic_fanout_label),
+                    p: "contains".into(),
+                    o: labeled_object(format!("generic-beta-{tag}"), &semantic_fanout_label),
+                    spike: None,
+                    contradicts: false,
+                },
+                WriteFact {
+                    s: labeled_entity(semantic_fanout_subject.clone(), &semantic_fanout_label),
+                    p: "contains".into(),
+                    o: labeled_object(format!("generic-gamma-{tag}"), &semantic_fanout_label),
+                    spike: None,
+                    contradicts: false,
+                },
+                WriteFact {
+                    s: labeled_entity(semantic_fanout_subject.clone(), &semantic_fanout_label),
+                    p: "reducesTargetTo".into(),
+                    o: labeled_object(format!("answer-skeleton-{tag}"), &semantic_fanout_label),
+                    spike: None,
+                    contradicts: false,
+                },
+            ],
+            scope: vec![layer_a.clone()],
+        })
+        .await?;
+    let semantic_fanout_subject_iri = subject_iri(&semantic_fanout)?;
+    let semantic_fanout_generic = semantic_fanout
+        .pointer("/facts/0/target/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            operation_error!("semantic fanout write has no generic fact: {semantic_fanout}")
+        })?
+        .to_string();
+    let semantic_fanout_specific = semantic_fanout
+        .pointer("/facts/3/target/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            operation_error!("semantic fanout write has no specific fact: {semantic_fanout}")
+        })?
+        .to_string();
+    let semantic_fanout_seed = service
+        .recall_semantic(SemanticSearchArgs {
+            scope: vec![layer_a.clone()],
+            text: format!("{semantic_fanout_subject} reduces target skeleton"),
+            labels: Some(vec![semantic_fanout_label.clone()]),
+            detail: Some("detailed".into()),
+            limit: Some(5),
+        })
+        .await?;
+    let semantic_fanout_activation = fetch_one(
+        &graph,
+        query(
+            r#"
+            MATCH (a:SemanticActivationV4)
+            WHERE $specific IN a.resultRefs
+            UNWIND a.resultRefs AS ref
+            MATCH (s:Entity)-[r]->(:Entity) WHERE r.iri = ref
+            RETURN size(a.resultRefs) AS refs,
+                   count(CASE WHEN s.iri = $subject AND r.propertyIri = $generic THEN 1 END)
+                     AS repeatedGroup
+            "#,
+        )
+        .param("specific", semantic_fanout_specific.clone())
+        .param("subject", semantic_fanout_subject_iri)
+        .param("generic", "mindreader:property/contains"),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("semantic fanout activation was not persisted"))?;
+    let semantic_fanout_warm = service
+        .recall_semantic(SemanticSearchArgs {
+            scope: vec![layer_a.clone()],
+            text: "what remains after the devouring is complete".into(),
+            labels: Some(vec![semantic_fanout_label]),
+            detail: Some("detailed".into()),
+            limit: Some(5),
+        })
+        .await?;
+    report.check(
+        "relationship evidence defeats endpoint fanout and only fully grounded facts teach",
+        semantic_fanout_seed
+            .pointer("/facts/0/target/iri")
+            .and_then(Value::as_str)
+            == Some(semantic_fanout_specific.as_str())
+            && semantic_fanout_activation.get::<i64>("refs").unwrap_or_default() == 1
+            && semantic_fanout_activation
+                .get::<i64>("repeatedGroup")
+                .unwrap_or(i64::MAX)
+                == 0
+            && fact_relationships(&semantic_fanout_warm)?
+                .contains(&semantic_fanout_specific)
+            && fact_relationships(&semantic_fanout_warm)?.contains(&semantic_fanout_generic),
+        format!(
+            "seed={semantic_fanout_seed} activation={semantic_fanout_activation:?} warm={semantic_fanout_warm}"
+        ),
+    );
+
+    let activation_only_label = format!("ActivationOnly{tag}");
+    let activation_only_write = service
+        .write(write_args(
+            labeled_entity(format!("activation-source-{tag}"), &activation_only_label),
+            "recalls",
+            labeled_object(format!("activation-answer-{tag}"), &activation_only_label),
+            vec![layer_a.clone()],
+        ))
+        .await?;
+    let activation_only_ref = relationship_iri(&activation_only_write)?;
+    let activation_only_text = format!("groundlessparaphrase{tag}");
+    let activation_only_embedding = SmokeEmbedding.embed(&activation_only_text).await?;
+    seed_semantic_activation(
+        &graph,
+        &activation_only_embedding,
+        std::slice::from_ref(&activation_only_ref),
+        600_000,
+    )
+    .await?;
+    let activation_only_count_before = fetch_one(
+        &graph,
+        query("MATCH (a:SemanticActivationV4) RETURN count(a) AS count"),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("activation-only count returned no row"))?
+    .get::<i64>("count")?;
+    let activation_only_recall = service
+        .recall_semantic(SemanticSearchArgs {
+            scope: vec![layer_a.clone()],
+            text: activation_only_text,
+            labels: Some(vec![activation_only_label]),
+            detail: Some("detailed".into()),
+            limit: Some(5),
+        })
+        .await?;
+    let activation_only_count_after = fetch_one(
+        &graph,
+        query("MATCH (a:SemanticActivationV4) RETURN count(a) AS count"),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("activation-only count returned no row"))?
+    .get::<i64>("count")?;
+    report.check(
+        "activation-only recall returns learned facts without spawning another bundle",
+        fact_relationships(&activation_only_recall)?.contains(&activation_only_ref)
+            && activation_only_count_after == activation_only_count_before,
+        format!(
+            "result={activation_only_recall} activations={activation_only_count_before}->{activation_only_count_after}"
+        ),
+    );
+
+    let activation_count_before_empty = fetch_one(
+        &graph,
+        query("MATCH (a:SemanticActivation) RETURN count(a) AS count"),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("semantic activation count returned no row"))?
+    .get::<i64>("count")?;
+    let empty_semantic = service
+        .recall_semantic(SemanticSearchArgs {
+            scope: vec![layer_a.clone()],
+            text: format!("no-match-{tag}"),
+            labels: Some(vec![format!("NoSuchSemanticLabel{tag}")]),
+            detail: Some("concise".into()),
+            limit: Some(20),
+        })
+        .await?;
+    let activation_count_after_empty = fetch_one(
+        &graph,
+        query("MATCH (a:SemanticActivation) RETURN count(a) AS count"),
+    )
+    .await?
+    .ok_or_else(|| operation_error!("semantic activation count returned no row"))?
+    .get::<i64>("count")?;
+    report.check(
+        "semantic misses return empty without persisting empty activations",
+        empty_semantic
+            .get("facts")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+            && activation_count_after_empty == activation_count_before_empty,
+        format!(
+            "result={empty_semantic} activations={activation_count_before_empty}->{activation_count_after_empty}"
+        ),
     );
 
     let merge_short = service
@@ -1900,6 +2409,7 @@ async fn run() -> Result<u32> {
             hops: Some(0),
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
@@ -2042,8 +2552,9 @@ async fn run() -> Result<u32> {
     let activation_after_first = fetch_one(
         &graph,
         query(
-            "MATCH (a:SemanticActivation:TTL) \
-             RETURN count(a) AS count, max(a.ttl) > timestamp() AS live",
+            "MATCH (a:SemanticActivationV4:TTL) \
+             RETURN count(a) AS count, max(a.ttl) > timestamp() AS live, \
+                    max(size(a.resultRefs)) AS maxRefs",
         ),
     )
     .await?
@@ -2052,8 +2563,9 @@ async fn run() -> Result<u32> {
     let activation = fetch_one(
         &graph,
         query(
-            "MATCH (a:SemanticActivation:TTL) \
-             RETURN count(a) AS count, max(a.ttl) > timestamp() AS live",
+            "MATCH (a:SemanticActivationV4:TTL) \
+             RETURN count(a) AS count, max(a.ttl) > timestamp() AS live, \
+                    max(size(a.resultRefs)) AS maxRefs",
         ),
     )
     .await?
@@ -2075,6 +2587,7 @@ async fn run() -> Result<u32> {
                 == activation_after_first.get::<i64>("count").unwrap_or(-1)
             && activation.get::<i64>("count").unwrap_or(0) >= 1
             && activation.get::<bool>("live").unwrap_or(false)
+            && activation.get::<i64>("maxRefs").unwrap_or(i64::MAX) <= 3
             && contributing_ttl_after.is_some_and(|ttl| ttl > contributing_ttl_before)
             && unresolved_ttl_after == Some(unresolved_ttl_before),
         format!(

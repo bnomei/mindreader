@@ -283,9 +283,36 @@ fn relationship_schema() -> Value {
             "scope": scope_schema(),
             "weight": { "type": "integer" },
             "episodeId": { "type": "string" },
-            "reason": { "type": "string" }
+            "reason": { "type": "string" },
+            "spike": { "type": ["string", "null"], "enum": ["Signal", "Pattern", "Insight", "Knowledge", null] }
         },
         "required": ["kind", "type", "iri", "from", "to", "propertyIri", "scope", "weight"]
+    })
+}
+
+/// Compact path witnesses returned by recall surfaces.
+fn compact_witness_path_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "nodes": { "type": "array", "items": { "type": "string" } },
+            "edges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "iri": { "type": "string" },
+                        "from": { "type": "string" },
+                        "p": { "type": "string" },
+                        "to": { "type": "string" }
+                    },
+                    "required": ["iri", "from", "p", "to"]
+                }
+            }
+        },
+        "required": ["nodes", "edges"]
     })
 }
 
@@ -782,6 +809,12 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
                 "maximum": 3,
                 "default": 1
             },
+            "direction": {
+                "type": "string",
+                "description": "Around mode only: require every traversed edge to follow this direction from the start node.",
+                "enum": ["both", "outgoing", "incoming"],
+                "default": "both"
+            },
             "history": {
                 "type": "string",
                 "minLength": 1,
@@ -944,17 +977,36 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
         "nodes": { "type": "array", "items": node_schema() },
         "paths": {
             "type": "array",
-            "description": "For around recall, paths[i] is the deterministic shortest witness path for facts[i].",
+            "description": "For around recall, paths[i] is the deterministic best compact witness path for facts[i].",
+            "items": compact_witness_path_schema()
+        },
+        "revisions": {
+            "type": "array",
+            "description": "History-only exact correction events, newest first. SUPERSEDES metadata is audit-only and never pasteable.",
             "items": {
                 "type": "object",
                 "additionalProperties": false,
                 "properties": {
-                    "nodes": { "type": "array", "items": { "type": "string" } },
-                    "edges": { "type": "array", "items": relationship_schema() }
+                    "replacement": fact_target_schema(),
+                    "previous": fact_target_schema(),
+                    "scope": scope_schema(),
+                    "episode": episode_schema(),
+                    "supersedes": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "iri": { "type": "string" },
+                            "from": { "type": "string" },
+                            "to": { "type": "string" },
+                            "reason": { "type": ["string", "null"] }
+                        },
+                        "required": ["iri", "from", "to", "reason"]
+                    }
                 },
-                "required": ["nodes", "edges"]
+                "required": ["replacement", "previous", "scope", "episode", "supersedes"]
             }
         },
+        "revisionsTruncated": { "type": "boolean" },
         "about": { "type": "array", "items": about_schema() },
         "lookups": {
             "type": "array",
@@ -965,9 +1017,10 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
                     "iri": { "type": "string" },
                     "found": { "type": "boolean" },
                     "node": node_schema(),
-                    "facts": { "type": "array", "items": fact_schema() }
+                    "facts": { "type": "array", "items": fact_schema() },
+                    "truncated": { "type": "boolean" }
                 },
-                "required": ["iri", "found"]
+                "required": ["iri", "found", "truncated"]
             }
         },
         "from": { "type": "string" },
@@ -986,15 +1039,7 @@ fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
         "nodes": { "type": "array", "items": node_schema() },
         "paths": {
             "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "properties": {
-                    "nodes": { "type": "array", "items": { "type": "string" } },
-                    "edges": { "type": "array", "items": relationship_schema() }
-                },
-                "required": ["nodes", "edges"]
-            }
+            "items": compact_witness_path_schema()
         },
         "about": { "type": "array", "items": about_schema() },
         "lookups": {
@@ -1126,7 +1171,7 @@ impl Mindreader {
     #[tool(
         name = "recall",
         title = "Recall visible memory",
-        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. limit defaults to 20 and is at most 100. hops applies only to iris; p and depth only to around; history accepts one node or fact IRI. detail is concise or detailed. Class or Property labels read the global catalog.",
+        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Text recall safely combines an exact phrase with bounded OR-keyword matching of terms at least four Unicode characters long. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. limit defaults to 20 and is at most 100. hops applies only to iris; p, direction, and depth only to around, where they constrain every traversed edge and compact hub-aware witness paths remain in concise detail. history accepts one node or fact IRI and returns exact revision events plus current/historical facts. detail is concise or detailed. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1142,7 +1187,7 @@ impl Mindreader {
     #[tool(
         name = "recall_semantic",
         title = "Recall by meaning",
-        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. detail is concise or detailed. The call maintains expiring semantic activations, so it is neither read-only nor idempotent.",
+        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. Every call combines exact and bounded keyword candidates with matching semantic activations, so untouched topics can surface lexically before later paraphrases reuse their activation group. Exact evidence outweighs keyword-only evidence, and repeated activations cannot amplify a fact by accumulation. Grounded anchors may surface bounded degree-normalized one-hop ASSERTS context; expanded facts stay weaker than anchors and never teach activations. A query with no results creates no activation. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. detail is concise or detailed. The call may maintain expiring semantic activations, so it is neither read-only nor idempotent.",
         input_schema = schema_memory_recall_semantic(),
         output_schema = schema_out_memory_recall_semantic(),
         annotations(title = "Recall by meaning", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
@@ -1158,7 +1203,7 @@ impl Mindreader {
     #[tool(
         name = "write",
         title = "Write facts",
-        description = "Use proactively whenever discussion, investigation, decision-making, implementation, debugging, review, or handoff establishes knowledge another agent or session should reuse: identities and relationships, preferences and standing instructions, decisions and rationale, requirements and constraints, conventions, durable commitments, stable project facts, or reusable signals, patterns, and insights. The user need not ask. Do not store secrets, chatter, transient status, raw dumps, or unsupported inference. facts contains 1–20 input-ordered items under one call-level scope; the atomic batch records one Episode only when something changes. Exact reassertions merge memberships. Review review.unify and review.alternatives as advisory queues.",
+        description = "Use proactively whenever discussion, investigation, decision-making, implementation, debugging, review, or handoff establishes knowledge another agent or session should reuse: identities and relationships, preferences and standing instructions, decisions and rationale, requirements and constraints, conventions, durable commitments, stable project facts, or reusable signals, patterns, and insights. The user need not ask. Do not store secrets, chatter, transient status, raw dumps, or unsupported inference. facts contains 1–20 input-ordered items under one call-level scope; the atomic batch records one Episode only when something changes. spike classifies only that exact fact and never creates ABOUT context; write ABOUT explicitly when intended. Exact reassertions merge memberships, and an explicit spike reclassifies that fact. Review review.unify and review.alternatives as advisory queues.",
         input_schema = schema_memory_write(),
         output_schema = schema_out_memory_write(),
         annotations(title = "Write facts", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1174,7 +1219,7 @@ impl Mindreader {
     #[tool(
         name = "revise",
         title = "Revise a fact",
-        description = "Use when current work establishes that one exact current fact is wrong and its replacement is known, whether or not the user requested a correction. Recall or reuse its fact-only target, then supply the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement and SUPERSEDES history commit in one transaction, and the response returns both current target and previousTarget.",
+        description = "Use when current work establishes that one exact current fact is wrong and its replacement is known, whether or not the user requested a correction. Recall or reuse its fact-only target, then supply the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement preserves the previous fact's spike classification unless a new spike is supplied. The replacement and SUPERSEDES history commit in one transaction, and the response returns both current target and previousTarget.",
         input_schema = schema_memory_revise(),
         output_schema = schema_out_memory_revise(),
         annotations(title = "Revise a fact", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)

@@ -221,7 +221,7 @@ pub struct EntityRef {
     pub iri: Option<String>,
     /// Display name used to mint an IRI when `iri` is absent.
     pub name: Option<String>,
-    /// Extra Neo4j labels; identity kind still prefers Class/Property/Element/Spike.
+    /// Extra Neo4j labels; identity kind still prefers Class/Property/Element.
     pub labels: Vec<String>,
 }
 
@@ -361,7 +361,7 @@ pub fn literal_iri(value: &str, datatype: &str) -> String {
     format!("mindreader:literal/{slug}-{hex}")
 }
 
-/// Epistemic Spike label used in retrieval ranking (Knowledge highest).
+/// Epistemic fact classification used in retrieval ranking (Knowledge highest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpikeRank {
     Signal,
@@ -386,7 +386,7 @@ impl SpikeRank {
             .transpose()
     }
 
-    /// Neo4j Spike label used in ranking (`Knowledge` highest).
+    /// Stored fact value used in ranking (`Knowledge` highest).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Signal => "Signal",

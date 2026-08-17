@@ -41,7 +41,7 @@ That is a different contract from chat-memory extractors such as [Graphiti](http
 - Set-valued current facts, explicit `SUPERSEDES` corrections, optional `CONTRADICTS` links, and soft withdrawal (`validTo`).
 - Advisory `review.unify` / `review.alternatives` queues. Merges and corrections stay intentional.
 - Shared signed weights changed only by `judge`. Retrieval never updates rank by itself.
-- Spike categories ranked `Knowledge > Insight > Pattern > Signal`, then weight, then text.
+- Per-fact Spike categories ranked `Knowledge > Insight > Pattern > Signal`, then weight, then text.
 - A stdio MCP server that completes the handshake before Neo4j is ready and connects lazily.
 
 ## Architecture and data boundary
@@ -318,7 +318,7 @@ For conceptual recall, use the separate provider-backed tool:
 ```json
 {
   "text": "graph memories about agent coordination",
-  "labels": ["Insight", "Knowledge"],
+  "labels": ["Decision", "Constraint"],
   "limit": 20,
   "scope": ["project:graph-memory"]
 }
@@ -335,12 +335,18 @@ Call `recall` with `around` and optional predicate names:
   "around": "mindreader:element/alice",
   "p": ["worksOn"],
   "depth": 2,
+  "direction": "outgoing",
   "scope": ["project:graph-memory"]
 }
 ```
 
-For `around`, `paths[i]` is the deterministic shortest witness path for
-`facts[i]`; intermediate path edges do not consume the requested fact limit.
+For `around`, `p` constrains every traversed edge and `direction` is `both`
+(the default), `outgoing`, or `incoming` at every hop. `paths[i]` is the
+deterministic best witness path for `facts[i]`; its edges are compact
+`{iri,from,p,to}` records and remain available in concise detail. Intermediate
+path edges do not consume the requested fact limit. Witnesses passing through
+non-start nodes with more than 16 eligible edges receive a bounded hub penalty,
+so specific routes rank ahead of equally short routes through dense hubs.
 
 Reasserting the same current triple merges any missing requested memberships; it returns `"noop": true` only when those memberships are already present. Writing a different object adds another current value. Use `revise` when one exact current value is a correction of another.
 
@@ -389,8 +395,8 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
-| `recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around`, `history` | Selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, paths, history, or the Class/Property catalog. Never calls an embedding provider. `iris` accepts 1–20 node IRIs and preserves input order and misses; `around` aligns each fact with a deterministic shortest witness path; `history` returns current and `validTo` facts for one node or fact IRI. |
-| `recall_semantic` | `scope`, non-empty `text` | `labels[]`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall with expiring semantic activations. Sends only query text to the configured embedding provider. |
+| `recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around`, `history` | Selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `direction` (`both`\|`outgoing`\|`incoming`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, compact witness paths, revision history, or the Class/Property catalog. Text combines an exact phrase with bounded OR-keyword matching and never calls an embedding provider. `iris` accepts 1–20 node IRIs and preserves input order, misses, and per-lookup truncation; `around` constrains every traversed edge by `p`/`direction` and aligns each fact with a deterministic hub-aware witness path; `history` returns current and `validTo` facts plus exact revision events for one node or fact IRI. |
+| `recall_semantic` | `scope`, non-empty `text` | `labels[]`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall that always fuses exact and keyword candidates with expiring semantic activations. Sends only query text to the configured embedding provider and creates no activation when no facts resolve. |
 | `write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships. One Episode if any fact changed. |
 | `revise` | `scope`, fact `target`, `new` | `spike`, `contradicts`, `reason` | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
 | `withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return a `withdrawn` count plus `withdrawnTargets`. |
@@ -400,7 +406,7 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 
 Successful results include a `handles` bag. Fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. `write` and `revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
 
-`recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate filtering and deterministic ordering happen before the result limit. `iris` applies `limit` per requested IRI; `around` still uses one fact budget for the walk.
+`recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate/direction constraints and deterministic hub-aware ordering happen before the result limit. `iris` applies `limit` per requested IRI and reports `lookups[i].truncated`; `around` still uses one fact budget for the walk.
 
 MCP annotations explicitly describe host-facing risk. Ordinary recall is read-only and closed-world. Semantic recall is additive, non-idempotent, and open-world because it contacts the configured provider and maintains activations. Write is additive and idempotent; place is destructive but idempotent; judge is destructive and non-idempotent. Revise, withdraw, and unify use conservative destructive, non-idempotent, closed-world hints. These hints help a host present consent UI, but Mindreader still validates every call.
 
@@ -440,11 +446,13 @@ An exact correction pastes the selected current fact handle and supplies the rep
 
 Withdrawal accepts either one pasteable fact `target`, or a `subject` node IRI with an optional predicate `p`. Subject and predicate slices are intentionally broad. Subject-wide withdrawal still protects structural and system-owned relationships and does not withdraw relationships whose endpoints are Classes or Properties.
 
-`spike` is a commitment level along `Signal → Pattern → Insight → Knowledge`: raw evidence, a recurring observation, an interpretation, then a fact worth relying on. Do not auto-promote. Name-only writes mint `mindreader:element/<slug>` and keep the spike as an extra label. When a Spike-kind subject points to an `Element`, Mindreader also maintains an `ABOUT` relationship. Search ranks the reverse (`Knowledge > Insight > Pattern > Signal`), then uses the sum of subject, relationship, and object weights within the same Spike category, then text relevance.
+`spike` is a commitment level on one exact fact along `Signal → Pattern → Insight → Knowledge`: raw evidence, a recurring observation, an interpretation, then a fact worth relying on. It is stored on the relationship, never labels the subject, and never creates another relationship. Do not auto-promote. Exact reassertion preserves an existing classification when `spike` is omitted and reclassifies only that fact when `spike` is explicit. Revision likewise preserves the retired fact's classification unless the replacement supplies one.
+
+`ABOUT` is explicit context, not a generated duplicate. Write `p:"ABOUT"` only when the relationship genuinely means that one node concerns another. Explicit `ABOUT` edges can contribute Spike context and appear in detailed recall's top-level `about[]`, but they never appear in ordinary `facts[]`, neighborhood/history facts, or semantic activation bundles.
 
 ### Fixed relationship types
 
-Mindreader traverses the following relationship types by default:
+Mindreader stores the following fixed relationship types:
 
 ```text
 INSTANCE_OF, SUBCLASS_OF, SUBPROPERTY_OF, DOMAIN, RANGE,
@@ -452,7 +460,7 @@ ASSERTS, ABOUT, EVIDENCE_FOR, DERIVED_FROM, SUPPORTS,
 CONTRADICTS, SUPERSEDES
 ```
 
-Properties outside the structural set are stored as `ASSERTS` relationships with a `propertyIri`.
+Properties outside the structural set are stored as `ASSERTS` relationships with a `propertyIri`. `ABOUT` is context-only and excluded from ordinary neighborhood traversal.
 
 ## Memory model
 
@@ -495,19 +503,25 @@ Ordinary assertions are set-valued. The same `(subject, property, object)` is id
 
 ### Feedback and ranking
 
-`spike` is a commitment level, not an NLP class: `Knowledge` is worth relying on, `Pattern` is a recurring observation, `Insight` is an interpretation, `Signal` is raw evidence. Do not auto-promote.
+`spike` is a per-fact commitment level, not an NLP class or node label: `Knowledge` is worth relying on, `Pattern` is a recurring observation, `Insight` is an interpretation, `Signal` is raw evidence. Do not auto-promote.
 
 Weight is a shared signed integer, not confidence and not recency. Only `judge` changes it, by exactly `+1` or `-1` per rating. Retrieval never updates weight. There is no decay. Judgment can arrive in a later turn.
 
-Pass 1–20 unique recalled node or current-fact targets with `mode:"strengthen"` or `mode:"weaken"` and the retrieval scope. Search first orders facts by Spike category (`Knowledge > Insight > Pattern > Signal`), then by the combined subject + relationship + object weight *within* a category, then by text relevance. Weaken retrieval quality; correct or withdraw a false fact. A judgment batch is atomic, records one `judge` Episode, and rolls back if any rating is invalid.
+Pass 1–20 unique recalled node or current-fact targets with `mode:"strengthen"` or `mode:"weaken"` and the retrieval scope. Search first orders facts by their own Spike category, falling back to the strongest explicit classified `ABOUT` context on the subject (`Knowledge > Insight > Pattern > Signal`), then by the combined subject + relationship + object weight *within* a category, then by text relevance. Weaken retrieval quality; correct or withdraw a false fact. A judgment batch is atomic, records one `judge` Episode, and rolls back if any rating is invalid.
 
-Search computes that complete ordering in Neo4j before applying the fact limit, so selective and common queries use the same ranking contract. The top-level `about` array contains at most the requested fact limit of ranked `ABOUT` context entries for endpoints in the returned facts; it is not an unbounded summary of facts discarded by the limit.
+Search computes that complete ordering in Neo4j before applying the fact limit, so selective and common queries use the same ranking contract. The top-level `about` array contains at most the requested fact limit of explicit classified `ABOUT` context entries for endpoints in the returned ordinary facts; it is not an unbounded summary or another copy of `facts[]`.
+
+Text retrieval runs two safe full-text channels over nodes and facts: the escaped whole query as an exact phrase and up to 16 unique Unicode-alphanumeric keyword tokens joined by application-generated `OR`. Tokens are lowercased, preserve first occurrence, require at least four Unicode characters, and skip terms over 64 UTF-8 bytes. This language-agnostic length floor removes most grammatical glue without maintaining language-specific stopword lists; shorter technical terms still use the exact-phrase channel. The exact phrase is weighted twice as strongly as the keyword channel. A fact's own indexed text is the primary lexical score; matching endpoint nodes are a fallback only when that relationship has no direct text evidence, so one popular endpoint cannot give every incident edge the same relevance. Queries over 512 bytes skip the exact phrase but retain bounded keyword retrieval. User text remains a parameter and cannot supply raw Lucene operators.
 
 ### Semantic recall
 
-`recall_semantic` embeds the query with one external provider, runs the ordinary direct search, retrieves nearby semantic activations from Neo4j's cosine vector index, resolves their relationship IRIs against the current graph and requested scope, and combines the rankings with weighted reciprocal-rank fusion. Direct matches have weight `2.0` by default; recalled bundles are weighted by vector similarity. Recalled facts must still be current, match optional `labels`, and satisfy relationship-and-endpoint visibility in `scope`.
+`recall_semantic` embeds the query with one external provider, runs the exact-plus-keyword direct search, retrieves nearby semantic activations from Neo4j's cosine vector index, resolves their relationship IRIs against the current graph and requested scope, and combines the rankings with weighted reciprocal-rank fusion. Exact relationship matches have weight `2.0` by default. Keyword relationship evidence has weight `0.5 × c`, where `c` is the fraction of the bounded unique query tokens present in that fact's indexed text. Endpoint-only lexical fallback remains useful to ordinary recall but contributes no direct semantic evidence. An admitted activation with cosine similarity `s` and threshold `t` contributes threshold-relative evidence `keyword_weight × clamp((s - t) / (1 - t), 0, 1)`: evidence is zero at the admission floor and cannot exceed the keyword channel. A rank-one activation-only fact therefore cannot outrank a rank-one complete-keyword fact; direct evidence wins an exact score tie. Only the strongest activation contribution per fact is retained, preventing repeated related activations from gaining popularity merely by accumulation.
 
-An activation is an internal `SemanticActivation:TTL` node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. Every recalled activation that contributes at least one currently resolvable fact refreshes its TTL. A sufficiently similar search with overlapping results also converges its vector and result bundle into one winning activation; otherwise the search creates a new activation. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
+Learned bundles retain up to three strongly grounded direct facts instead of caching an entire response page: an exact relationship match or complete keyword coverage may teach a bundle, while partial keyword coverage may rank proportionally but cannot teach. Selection preserves fused order but admits at most two facts from one exact `(subject IRI, property IRI)` group when another group is available; a single available group can still fill all three slots. Activation-only recall can return and refresh an existing learned bundle, but it cannot create or rewrite one. This prevents recalled results from recursively becoming new semantic evidence. The default RRF `k` of `15` preserves useful differences within these short bundles, while the default activation recall threshold is `0.65`. Semantic result `score` is the final fused score. This gives untouched topics a lexical cold-start path while later paraphrases can reuse the learned activation bundle. Recalled facts must still be current, match optional `labels`, and satisfy relationship-and-endpoint visibility in `scope`.
+
+After direct and activation evidence identifies grounded anchor facts, semantic recall may add their visible one-hop `ASSERTS` neighbors as ephemeral structural context. It expands at most 16 anchors and 16 facts per anchor endpoint. For anchor evidence `A`, visible endpoint degree `d`, and the number `g` of bounded adjacent candidates sharing the same anchor and property, structural evidence is `A × 0.25 / √(d × g)`. This caps an unpenalized structural route at the strongest standalone keyword or activation contribution; any graph penalty makes it weaker. Only the strongest route to a structural fact is retained; structural evidence never boosts a fact that already has direct or activation evidence and cannot outrank its anchor. Expanded facts are returned normally but never enter activation bundles, refresh activations, or teach later queries. Scope, optional labels, current-fact checks, and endpoint closure apply during expansion; `ABOUT` remains excluded.
+
+An activation is an internal `SemanticActivation:TTL` node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. A query that resolves no facts returns an empty result without creating an activation. Every recalled activation that contributes at least one currently resolvable fact refreshes its TTL. A query with direct evidence converges into a sufficiently similar overlapping activation or creates a new one; an activation-only query does neither. Ranking revisions use a versioned activation label and index, so bundles learned under incompatible ranking behavior stop contributing without touching durable facts. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
 
 The embedding provider, model, and dimensions define one vector space for the database. If that selection changes, Mindreader discards only the ephemeral activations and recreates their vector index; durable graph memory remains intact. Semantic search requires an embedding key, but all other tools remain usable without one.
 
@@ -515,7 +529,7 @@ The embedding provider, model, and dimensions define one vector space for the da
 
 Each state-changing mutation creates one `Episode` with its canonical tool name (`write`, `revise`, `withdraw`, `judge`, `place`, or `unify`) and timestamp; no-op mutations create none. Internal semantic-activation maintenance is excluded. Relationships carry the episode identifier. Withdrawal sets `validTo` and optionally records a reason; it does not delete graph nodes. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be written, revised, or withdrawn directly.
 
-`revise` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction. Its result exposes the replacement as `target` and the retired handle as `previousTarget`. `recall` with `history` walks the current and `validTo` facts for one node or fact IRI.
+`revise` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction. Its Episode records the exact previous fact, replacement fact, selected scope, and non-actionable system edge. Its result exposes the replacement as `target` and the retired handle as `previousTarget`. `recall` with `history` returns current and `validTo` facts plus newest-first `revisions[]` entries containing pasteable previous/replacement fact handles and audit-only `SUPERSEDES` metadata. Revision history is a directed event graph and may branch.
 
 Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because their outcome may be ambiguous.
 
@@ -533,7 +547,6 @@ Mindreader accepts explicit IRIs or deterministically derives the following IRIs
 | Property | `mindreader:property/<slug>` | Preserved |
 | Element | `mindreader:element/<slug>` | Lowercase |
 | Literal | `mindreader:literal/<slug>-<hash>` | Lowercase |
-| Signal, Pattern, Insight, Knowledge | existing `mindreader:<kind>/<slug>` IRIs | Lowercase |
 
 Slug normalization keeps ASCII letters, numbers, `.`, `_`, and `-`; replaces other runs with `-`; trims surrounding dashes; and falls back to `unnamed`. Literal identity includes its datatype and value.
 
@@ -569,11 +582,12 @@ dimensions = 1536
 [semantic]
 ttl_days = 30
 neighbor_limit = 10
-recall_similarity_threshold = 0.70
+recall_similarity_threshold = 0.65
 convergence_similarity_threshold = 0.90
 convergence_result_overlap_threshold = 0.60
-rrf_k = 60.0
+rrf_k = 15.0
 direct_weight = 2.0
+keyword_weight = 0.5
 ```
 
 ### Non-secret settings
@@ -588,11 +602,12 @@ direct_weight = 2.0
 | `embeddings.xai.dimensions` | integer | `1536` | Must be `1..4096` for the selected provider and match returned vectors. |
 | `semantic.ttl_days` | integer | `30` | Must be positive; controls semantic activation expiry. |
 | `semantic.neighbor_limit` | integer | `10` | Must be `1..100`; bounds vector neighbors considered for recall. |
-| `semantic.recall_similarity_threshold` | number | `0.70` | Finite value in `0..1`. |
+| `semantic.recall_similarity_threshold` | number | `0.65` | Finite value in `[0, 1)`; activation evidence is normalized above this floor. |
 | `semantic.convergence_similarity_threshold` | number | `0.90` | Finite value in `0..1`. |
 | `semantic.convergence_result_overlap_threshold` | number | `0.60` | Finite value in `0..1`. |
-| `semantic.rrf_k` | number | `60.0` | Must be finite and positive. |
-| `semantic.direct_weight` | number | `2.0` | Must be finite and positive. |
+| `semantic.rrf_k` | number | `15.0` | Must be finite and positive. |
+| `semantic.direct_weight` | number | `2.0` | Must be finite and greater than `keyword_weight`; weights exact direct matches. |
+| `semantic.keyword_weight` | number | `0.5` | Must be finite and positive; weights keyword-only direct matches. |
 
 The TOML parser rejects unknown fields. See [`src/config.rs`](src/config.rs) for the defaults, validation, and provider-selection contract.
 
@@ -616,9 +631,9 @@ A non-empty process environment secret takes precedence over the colocated `.env
 
 ### Database bootstrap
 
-At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 6, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. The merge-candidate index uses a synchronous keyword-analyzed lowercase whole-name property so APOC can rerank a small indexed candidate set without scanning every entity. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
+At first database use, Mindreader requires matching APOC Core and APOC Extended installations, verifies the text-similarity, node-merge, and TTL functions and procedures, then marks model version 8, creates required uniqueness, full-text, and optional vector indexes, seeds base schema entities, and waits for indexes. The merge-candidate index uses a synchronous keyword-analyzed lowercase whole-name property so APOC can rerank a small indexed candidate set without scanning every entity. APOC TTL must be enabled. The included Docker Compose configuration installs both plugins and grants only the required APOC surface.
 
-Initializing model version 6 requires an empty database. Subsequent starts accept a compatible model-v6 database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
+Initializing model version 8 requires an empty database. Subsequent starts accept a compatible model-v8 database. There is no migration path: an unversioned non-empty or incompatible database is rejected with instructions to recreate the Neo4j database or volume.
 
 ## Run entirely with Docker
 
@@ -665,7 +680,7 @@ Run the release-mode graph benchmark against a disposable database before changi
 cargo run --release --features developer-tools --bin mindreader-bench -- --config-dir packaging/tools-config --entities 10000 --samples 30
 ```
 
-The benchmark refuses any database that is not pristine after model-v6 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions at 1/4/20 newly created entities. Never point it at production or a database whose contents must be preserved.
+The benchmark refuses any database that is not pristine after model-v8 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions at 1/4/20 newly created entities. Never point it at production or a database whose contents must be preserved.
 
 Use Divan for graph-free CPU regressions:
 

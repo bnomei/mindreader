@@ -435,6 +435,7 @@ fn thin_node(node: &Value) -> Result<Value> {
 }
 
 /// Stamp `detail` and, for `concise`, thin facts/nodes and clear `about`.
+/// Compact witness paths are useful in both detail modes and remain intact.
 fn apply_detail(result: &mut Value, detail: Detail) -> Result<()> {
     result["detail"] = json!(detail.as_str());
     if detail != Detail::Concise {
@@ -465,7 +466,6 @@ fn apply_detail(result: &mut Value, detail: Detail) -> Result<()> {
         }
     }
     result["about"] = json!([]);
-    result["paths"] = json!([]);
     Ok(())
 }
 
@@ -617,7 +617,15 @@ mod tests {
                     "current": true
                 }],
                 "nodes": [],
-                "paths": [],
+                "paths": [{
+                    "nodes": ["mindreader:element/alice", "mindreader:element/mr"],
+                    "edges": [{
+                        "iri": "mindreader:relationship/a",
+                        "from": "mindreader:element/alice",
+                        "p": "worksOn",
+                        "to": "mindreader:element/mr"
+                    }]
+                }],
                 "about": [{"about":"noise"}],
                 "lookups": [],
                 "scope": ["project:x"]
@@ -633,7 +641,7 @@ mod tests {
         );
         assert_eq!(result["detail"], "concise");
         assert!(result["about"].as_array().unwrap().is_empty());
-        assert!(result["paths"].as_array().unwrap().is_empty());
+        assert_eq!(result["paths"][0]["edges"][0]["p"], "worksOn");
         assert_eq!(result["facts"][0]["mutable"], true);
         assert_eq!(result["facts"][0]["rateable"], true);
         assert!(result["facts"][0].get("score").is_none());

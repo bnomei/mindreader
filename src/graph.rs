@@ -53,9 +53,6 @@ pub const STRUCTURAL: &[&str] = &[
     "SUPERSEDES",
 ];
 
-/// Spike labels ordered for ranking elsewhere (not priority order here).
-pub const SPIKE: &[&str] = &["Signal", "Pattern", "Insight", "Knowledge"];
-
 /// Relationship types included in the wakeup full-text fact index.
 pub const WAKEUP_RELS: &[&str] = &[
     "ASSERTS",
@@ -75,9 +72,9 @@ const LABEL_OK: &str = "label";
 /// Property key on the singleton model marker node.
 pub const MODEL_MARKER_KEY: &str = "model";
 /// Current graph model version; incompatible databases must be recreated.
-pub const MODEL_VERSION: i64 = 6;
+pub const MODEL_VERSION: i64 = 8;
 /// Vector index name for expiring semantic activations.
-pub const SEMANTIC_INDEX: &str = "semantic_activation_embeddings";
+pub const SEMANTIC_INDEX: &str = "semantic_activation_v4_embeddings";
 /// Keyword full-text index used for advisory merge candidate names.
 pub const MERGE_CANDIDATE_INDEX: &str = "merge_candidate_names";
 const EMBEDDING_MARKER_KEY: &str = "embedding";
@@ -423,7 +420,7 @@ async fn ensure_semantic_index(
     }
     let create = format!(
         "CREATE VECTOR INDEX {SEMANTIC_INDEX} IF NOT EXISTS \
-         FOR (a:SemanticActivation) ON (a.embedding) \
+         FOR (a:SemanticActivationV4) ON (a.embedding) \
          OPTIONS {{indexConfig: {{`vector.dimensions`: {}, \
          `vector.similarity_function`: 'cosine'}}}}",
         embedding.dimensions
@@ -435,7 +432,7 @@ async fn ensure_semantic_index(
     Ok(())
 }
 
-/// Fail closed unless the activation vector index is online on `SemanticActivation.embedding`.
+/// Fail closed unless the current activation vector index is online.
 async fn verify_semantic_index(graph: &Graph) -> Result<()> {
     let row = fetch_one(
         graph,
@@ -456,7 +453,7 @@ async fn verify_semantic_index(graph: &Graph) -> Result<()> {
     let properties = row.get::<Vec<String>>("properties")?;
     if state != "ONLINE"
         || entity_type != "NODE"
-        || !same_string_members(&labels, &["SemanticActivation"])
+        || !same_string_members(&labels, &["SemanticActivationV4"])
         || !same_string_members(&properties, &["embedding"])
     {
         return Err(graph_error!(
@@ -733,11 +730,6 @@ pub fn structural_rel_for(property: &str) -> Option<String> {
     None
 }
 
-/// Whether a label is one of the Spike ranks (Signal through Knowledge).
-pub fn is_spike(label: &str) -> bool {
-    SPIKE.contains(&label)
-}
-
 /// Run a graph-level query and return its first row.
 pub async fn fetch_one(graph: &Graph, q: neo4rs::Query) -> Result<Option<Row>> {
     let mut stream = graph.execute(q).await?;
@@ -780,11 +772,6 @@ fn node_weight(node: &Node) -> Result<i64> {
 
 /// Signed judgment weight on a bounded current fact.
 fn relation_weight(rel: &Relation) -> Result<i64> {
-    Ok(rel.get::<i64>("weight")?)
-}
-
-/// Signed judgment weight on a path edge (unbounded relationship).
-fn unbounded_relation_weight(rel: &UnboundedRelation) -> Result<i64> {
     Ok(rel.get::<i64>("weight")?)
 }
 
@@ -847,33 +834,25 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Result<Value> {
     if let Ok(v) = rel.get::<String>("reason") {
         obj["reason"] = json!(v);
     }
+    if let Ok(v) = rel.get::<String>("spike") {
+        obj["spike"] = json!(v);
+    }
     obj["scope"] = json!(rel.get::<Vec<String>>("layers")?);
     obj["weight"] = json!(relation_weight(rel)?);
     Ok(obj)
 }
 
-/// Serialize a path edge as a fact envelope (`kind=fact`) with directed endpoint IRIs.
-fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Result<Value> {
+/// Serialize only the fields exposed by a compact directed witness edge.
+fn compact_path_edge_json(rel: &UnboundedRelation, from: &str, to: &str) -> Result<Value> {
     if from.is_empty() || to.is_empty() {
         return Err(graph_error!("path edge endpoints must have non-empty IRIs"));
     }
-    let mut obj = json!({
-        "type": rel.typ(),
-        "from": from,
-        "to": to,
+    Ok(json!({
         "iri": rel.get::<String>("iri")?,
-        "propertyIri": rel.get::<String>("propertyIri")?,
-    });
-    obj["kind"] = json!("fact");
-    if let Ok(v) = rel.get::<String>("episodeId") {
-        obj["episodeId"] = json!(v);
-    }
-    if let Ok(v) = rel.get::<String>("reason") {
-        obj["reason"] = json!(v);
-    }
-    obj["scope"] = json!(rel.get::<Vec<String>>("layers")?);
-    obj["weight"] = json!(unbounded_relation_weight(rel)?);
-    Ok(obj)
+        "from": from,
+        "p": rel.get::<String>("propertyIri")?,
+        "to": to,
+    }))
 }
 
 /// Require a stored node IRI; missing identity fails serialization.
@@ -881,7 +860,7 @@ fn node_iri(node: &Node) -> Result<String> {
     Ok(node.get::<String>("iri")?)
 }
 
-/// Expand a Neo4j path into node JSON, edge JSON, and ordered node IRIs.
+/// Expand a Neo4j path into node JSON, compact witness edges, and ordered node IRIs.
 pub fn path_to_json(path: &Path) -> Result<(Vec<Value>, Vec<Value>, Vec<String>)> {
     let nodes = path.nodes_as::<Node>()?;
     let rels = path.relationships_as::<UnboundedRelation>()?;
@@ -914,7 +893,7 @@ pub fn path_to_json(path: &Path) -> Result<(Vec<Value>, Vec<Value>, Vec<String>)
         } else {
             (next, cursor)
         };
-        edges.push(unbounded_rel_json(
+        edges.push(compact_path_edge_json(
             &rels[abs - 1],
             &iris[from_i],
             &iris[to_i],
@@ -1362,7 +1341,6 @@ pub fn fact_envelope(
     object: Value,
     relationship: &Value,
     scope: &[String],
-    spike: Option<Value>,
 ) -> Result<Value> {
     let iri = relationship
         .get("iri")
@@ -1379,20 +1357,10 @@ pub fn fact_envelope(
         "p": local_predicate_name(property),
         "o": object,
         "scope": scope,
-        "spike": spike,
+        "spike": relationship.get("spike").cloned().unwrap_or(Value::Null),
         "weight": weight,
         "current": true,
     }))
-}
-
-/// Highest Spike label present on a label set, or `None` if unranked.
-pub fn spike_label(labels: &[String]) -> Option<String> {
-    for rank in ["Knowledge", "Insight", "Pattern", "Signal"] {
-        if labels.iter().any(|l| l == rank) {
-            return Some(rank.to_string());
-        }
-    }
-    None
 }
 
 /// Numeric Spike priority for ranking (Knowledge = 4 … unranked = 0).
@@ -1474,12 +1442,12 @@ mod tests {
     }
 
     #[test]
-    fn model_v6_requires_recreating_older_databases() {
-        assert_eq!(MODEL_VERSION, 6);
-        assert!(validate_model_version(6).is_ok());
+    fn model_v8_requires_recreating_older_databases() {
+        assert_eq!(MODEL_VERSION, 8);
+        assert!(validate_model_version(8).is_ok());
         assert_eq!(
-            validate_model_version(5).unwrap_err().to_string(),
-            "Mindreader database model version 5 is incompatible with required version 6; recreate the Neo4j database or volume before starting Mindreader"
+            validate_model_version(7).unwrap_err().to_string(),
+            "Mindreader database model version 7 is incompatible with required version 8; recreate the Neo4j database or volume before starting Mindreader"
         );
     }
 
@@ -1512,11 +1480,12 @@ mod tests {
             ),
             ("layers", BoltType::List(BoltList::new())),
             ("weight", BoltType::Integer(BoltInteger::new(-4))),
+            ("spike", BoltType::String(BoltString::from("Insight"))),
         ]);
-        assert_eq!(
-            rel_json(&relation, "mindreader:element/a", "mindreader:element/b").unwrap()["weight"],
-            -4
-        );
+        let serialized =
+            rel_json(&relation, "mindreader:element/a", "mindreader:element/b").unwrap();
+        assert_eq!(serialized["weight"], -4);
+        assert_eq!(serialized["spike"], "Insight");
     }
 
     #[test]

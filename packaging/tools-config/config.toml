@@ -13,8 +13,9 @@ dimensions = 1536
 [semantic]
 ttl_days = 30
 neighbor_limit = 10
-recall_similarity_threshold = 0.7
+recall_similarity_threshold = 0.65
 convergence_similarity_threshold = 0.9
 convergence_result_overlap_threshold = 0.6
-rrf_k = 60.0
+rrf_k = 15.0
 direct_weight = 2.0
+keyword_weight = 0.5

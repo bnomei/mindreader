@@ -11,7 +11,7 @@ use crate::{
     error::{Context, Error, Result},
 };
 use async_trait::async_trait;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, CONTENT_TYPE};
 use reqwest::{Client, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::json;
@@ -97,6 +97,9 @@ impl HttpEmbeddingProvider {
         dimensions: usize,
         policy: RetryPolicy,
     ) -> Result<Self> {
+        // `rustls-no-provider` avoids a second crypto backend beside neo4rs's ring.
+        // An embedding client can also coexist with a provider installed by its host.
+        let _ = rustls::crypto::ring::default_provider().install_default();
         Ok(Self {
             client: Client::builder()
                 .connect_timeout(policy.connect_timeout)
@@ -115,19 +118,21 @@ impl HttpEmbeddingProvider {
 
     /// POST one embedding request, honoring Retry-After and the operation deadline.
     async fn embed_inner(&self, text: &str) -> Result<Vec<f64>> {
-        let body = json!({
+        let body = serde_json::to_string(&json!({
             "input": text,
             "model": self.model,
             "dimensions": self.dimensions,
             "encoding_format": "float",
-        });
+        }))
+        .context("encode embedding request")?;
         let deadline = Instant::now() + self.policy.operation_timeout;
         for attempt in 0..self.policy.max_attempts {
             let response = self
                 .client
                 .post(&self.endpoint)
                 .bearer_auth(&self.api_key)
-                .json(&body)
+                .header(CONTENT_TYPE, "application/json")
+                .body(body.clone())
                 .send()
                 .await;
             let (error, retry, retry_after) = match response {

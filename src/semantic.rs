@@ -1,7 +1,7 @@
 //! Semantic recall: embed a query and fuse it with remembered activations.
 //!
 //! Exposed separately from closed-world `recall`. Combines ranked
-//! direct `ASSERTS`/`ABOUT` hits with TTL activation bundles via reciprocal
+//! direct ordinary `ASSERTS` hits with TTL activation bundles via reciprocal
 //! rank fusion, still under the request `scope`. Query text is sent to the
 //! configured embedding provider; without a key this path fails as
 //! `missing_embedding`. Activations expire and may converge, so this operation
@@ -12,10 +12,10 @@ use crate::domain::DomainError;
 use crate::embeddings::{build_provider, normalize_vector, EmbeddingProvider};
 use crate::graph::{
     endpoint_json, fact_envelope, fetch_all, fetch_one, rel_json, require_embedding_space,
-    spike_label, SEMANTIC_INDEX,
+    SEMANTIC_INDEX,
 };
 use crate::layers::validate_layer_ids;
-use crate::search::{memory_search, SearchArgs};
+use crate::search::{memory_search_with_matches, FactGroup, SearchArgs, SearchResult, TextMatch};
 use crate::{
     embedding_error,
     error::{Context, Result},
@@ -25,12 +25,21 @@ use neo4rs::{query, Graph, Node, Relation};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Maximum UTF-8 byte length accepted for semantic query text.
 pub const MAX_SEMANTIC_TEXT_BYTES: usize = 32 * 1024;
+/// Keep learned activation bundles focused instead of caching an entire response page.
+const MAX_ACTIVATION_RESULT_REFS: usize = 3;
+/// Bound ephemeral graph expansion independently of the caller's result limit.
+const MAX_STRUCTURAL_ANCHORS: usize = 16;
+/// Bound each anchor endpoint's visible one-hop candidates.
+const MAX_STRUCTURAL_FACTS_PER_ENDPOINT: i64 = 16;
+/// Structural context must remain weaker than the evidence for its anchor.
+const STRUCTURAL_EVIDENCE_SCALE: f64 = 0.25;
 
 /// Arguments for the side-effectful `recall_semantic` operation.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -97,6 +106,15 @@ struct Activation {
     element_id: String,
     result_refs: Vec<String>,
     similarity: f64,
+}
+
+/// One visible one-hop fact reached from a grounded semantic anchor.
+struct StructuralCandidate {
+    anchor_iri: String,
+    fact_iri: String,
+    property_iri: String,
+    degree: usize,
+    fact: Value,
 }
 
 /// Trim query text and reject empty or oversized UTF-8 payloads before any HTTP call.
@@ -178,15 +196,17 @@ pub async fn memory_semantic_search(
         labels: Some(labels.clone()),
         limit: Some(100),
     };
-    let (activations, direct) = tokio::try_join!(
+    let (activations, direct_result) = tokio::try_join!(
         query_activations(graph, runtime, &embedding),
-        memory_search(graph, direct_args),
+        memory_search_with_matches(graph, direct_args),
     )?;
-    let direct_facts = direct
-        .get("facts")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let SearchResult {
+        facts: direct_facts,
+        about: direct_about,
+        text_matches: direct_matches,
+        mut fact_groups,
+        ..
+    } = direct_result;
     let mut facts_by_iri = HashMap::new();
     let mut direct_order = Vec::new();
     for fact in direct_facts {
@@ -203,48 +223,85 @@ pub async fn memory_semantic_search(
         .into_iter()
         .filter(|iri| !facts_by_iri.contains_key(iri))
         .collect::<Vec<_>>();
-    for (iri, fact) in resolve_facts(graph, &layers, &labels, missing).await? {
+    for (iri, fact, group) in resolve_facts(graph, &layers, &labels, missing).await? {
+        fact_groups.insert(iri.clone(), group);
         facts_by_iri.insert(iri, fact);
     }
     let contributing_activation_ids = contributing_activation_ids(&activations, &facts_by_iri);
 
     let mut fused = HashMap::<String, f64>::new();
-    add_ranked(
+    add_direct_ranked(
         &mut fused,
         &direct_order,
         runtime.config.direct_weight,
+        runtime.config.keyword_weight,
         runtime.config.rrf_k,
         &facts_by_iri,
+        &direct_matches,
     );
+    let mut structural_anchor_scores = direct_order
+        .iter()
+        .filter(|iri| {
+            direct_matches
+                .get(*iri)
+                .is_some_and(|evidence| evidence.bundle_eligible)
+        })
+        .filter_map(|iri| fused.get(iri).map(|score| (iri.clone(), *score)))
+        .collect::<HashMap<_, _>>();
+    let mut activation_scores = HashMap::<String, f64>::new();
     for activation in &activations {
-        add_ranked(
-            &mut fused,
+        add_ranked_max(
+            &mut activation_scores,
             &activation.result_refs,
-            activation.similarity,
+            activation_evidence(
+                activation.similarity,
+                runtime.config.recall_similarity_threshold,
+                runtime.config.keyword_weight,
+            ),
             runtime.config.rrf_k,
             &facts_by_iri,
         );
     }
+    for (iri, score) in activation_scores {
+        structural_anchor_scores
+            .entry(iri.clone())
+            .and_modify(|current| *current = current.max(score))
+            .or_insert(score);
+        *fused.entry(iri).or_default() += score;
+    }
+    let structural_anchors = top_structural_anchors(&structural_anchor_scores);
+    let structural_candidates = resolve_structural_facts(
+        graph,
+        &layers,
+        &labels,
+        structural_anchors
+            .iter()
+            .map(|(iri, _)| iri.clone())
+            .collect(),
+    )
+    .await?;
+    add_structural_ranked(
+        &mut fused,
+        &mut facts_by_iri,
+        &structural_anchor_scores,
+        structural_candidates,
+        STRUCTURAL_EVIDENCE_SCALE,
+    );
     let mut ranked = fused.into_iter().collect::<Vec<_>>();
-    ranked.sort_by(|left, right| {
-        right
-            .1
-            .partial_cmp(&left.1)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| left.0.cmp(&right.0))
-    });
-    let truncated = ranked.len() > limit;
-    ranked.truncate(limit);
-    let result_refs = ranked
+    ranked.sort_by(|left, right| compare_fused(left, right, &direct_matches));
+    let ranked_refs = ranked
         .iter()
         .map(|(iri, _)| iri.clone())
         .collect::<Vec<_>>();
+    let truncated = ranked.len() > limit;
+    ranked.truncate(limit);
     let facts = ranked
         .into_iter()
         .enumerate()
-        .filter_map(|(index, (iri, _))| {
+        .filter_map(|(index, (iri, fused_score))| {
             facts_by_iri.remove(&iri).map(|mut fact| {
                 fact["rank"] = json!(index + 1);
+                fact["score"] = json!(fused_score);
                 fact
             })
         })
@@ -259,11 +316,8 @@ pub async fn memory_semantic_search(
         })
         .flatten()
         .collect::<HashSet<_>>();
-    let about = direct
-        .get("about")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
+    let about = direct_about
+        .iter()
         .filter(|item| {
             item.get("about")
                 .and_then(Value::as_str)
@@ -273,15 +327,26 @@ pub async fn memory_semantic_search(
         .cloned()
         .collect::<Vec<_>>();
 
-    persist_activation(
-        graph,
-        runtime,
-        &embedding,
-        &result_refs,
-        &activations,
-        &contributing_activation_ids,
-    )
-    .await?;
+    if !ranked_refs.is_empty() {
+        let direct_ranked_refs = ranked_refs
+            .into_iter()
+            .filter(|iri| {
+                direct_matches
+                    .get(iri)
+                    .is_some_and(|evidence| evidence.bundle_eligible)
+            })
+            .collect::<Vec<_>>();
+        let activation_result_refs = select_activation_refs(&direct_ranked_refs, &fact_groups);
+        persist_activation(
+            graph,
+            runtime,
+            &embedding,
+            &activation_result_refs,
+            &activations,
+            &contributing_activation_ids,
+        )
+        .await?;
+    }
 
     crate::payload::finish_recall(
         json!({
@@ -300,8 +365,167 @@ pub async fn memory_semantic_search(
     )
 }
 
-/// Reciprocal-rank contribution from one ordered list, gated to resolved facts.
-fn add_ranked(
+/// Convert admitted cosine similarity into bounded evidence above its threshold floor.
+fn activation_evidence(similarity: f64, threshold: f64, keyword_weight: f64) -> f64 {
+    keyword_weight * ((similarity - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
+}
+
+/// Sort fused evidence descending, preferring direct evidence on exact score ties.
+fn compare_fused(
+    left: &(String, f64),
+    right: &(String, f64),
+    direct_matches: &HashMap<String, TextMatch>,
+) -> Ordering {
+    right
+        .1
+        .partial_cmp(&left.1)
+        .unwrap_or(Ordering::Equal)
+        .then_with(|| {
+            direct_matches
+                .contains_key(&right.0)
+                .cmp(&direct_matches.contains_key(&left.0))
+        })
+        .then_with(|| left.0.cmp(&right.0))
+}
+
+/// Keep a three-fact bundle representative without discarding set-valued groups entirely.
+fn select_activation_refs(
+    ranked_iris: &[String],
+    groups: &HashMap<String, FactGroup>,
+) -> Vec<String> {
+    let mut selected = Vec::with_capacity(MAX_ACTIVATION_RESULT_REFS);
+    let mut selected_iris = HashSet::new();
+    let mut group_counts = HashMap::<&FactGroup, usize>::new();
+    for iri in ranked_iris {
+        if selected.len() == MAX_ACTIVATION_RESULT_REFS || selected_iris.contains(iri) {
+            continue;
+        }
+        if let Some(group) = groups.get(iri) {
+            let count = group_counts.entry(group).or_default();
+            if *count >= 2 {
+                continue;
+            }
+            *count += 1;
+        }
+        selected_iris.insert(iri.clone());
+        selected.push(iri.clone());
+    }
+    if selected.len() < MAX_ACTIVATION_RESULT_REFS {
+        for iri in ranked_iris {
+            if selected.len() == MAX_ACTIVATION_RESULT_REFS {
+                break;
+            }
+            if selected_iris.insert(iri.clone()) {
+                selected.push(iri.clone());
+            }
+        }
+    }
+    selected
+}
+
+/// Direct reciprocal-rank contribution with stronger exact than fallback keyword evidence.
+fn add_direct_ranked(
+    fused: &mut HashMap<String, f64>,
+    iris: &[String],
+    exact_weight: f64,
+    keyword_weight: f64,
+    rrf_k: f64,
+    facts: &HashMap<String, Value>,
+    matches: &HashMap<String, TextMatch>,
+) {
+    let mut direct_rank = 0;
+    for iri in iris {
+        if facts.contains_key(iri) {
+            let Some(evidence) = matches.get(iri) else {
+                continue;
+            };
+            let weight = if evidence.exact {
+                exact_weight
+            } else {
+                keyword_weight * evidence.keyword_confidence
+            };
+            if weight <= 0.0 {
+                continue;
+            }
+            *fused.entry(iri.clone()).or_default() += weight / (rrf_k + direct_rank as f64 + 1.0);
+            direct_rank += 1;
+        }
+    }
+}
+
+/// Keep the strongest bounded anchor set for ephemeral one-hop graph expansion.
+fn top_structural_anchors(scores: &HashMap<String, f64>) -> Vec<(String, f64)> {
+    let mut ranked = scores
+        .iter()
+        .map(|(iri, score)| (iri.clone(), *score))
+        .collect::<Vec<_>>();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    ranked.truncate(MAX_STRUCTURAL_ANCHORS);
+    ranked
+}
+
+/// Add non-learning structural context without boosting facts that already have evidence.
+fn add_structural_ranked(
+    fused: &mut HashMap<String, f64>,
+    facts: &mut HashMap<String, Value>,
+    anchor_scores: &HashMap<String, f64>,
+    candidates: Vec<StructuralCandidate>,
+    scale: f64,
+) {
+    let mut unique = HashMap::<(String, String), StructuralCandidate>::new();
+    for candidate in candidates {
+        let key = (candidate.anchor_iri.clone(), candidate.fact_iri.clone());
+        unique
+            .entry(key)
+            .and_modify(|current| {
+                if candidate.degree < current.degree {
+                    current.degree = candidate.degree;
+                }
+            })
+            .or_insert(candidate);
+    }
+    let mut group_sizes = HashMap::<(String, String), usize>::new();
+    for candidate in unique.values() {
+        *group_sizes
+            .entry((candidate.anchor_iri.clone(), candidate.property_iri.clone()))
+            .or_default() += 1;
+    }
+    let mut structural_scores = HashMap::<String, f64>::new();
+    for (_, candidate) in unique {
+        let Some(anchor_score) = anchor_scores.get(&candidate.anchor_iri) else {
+            continue;
+        };
+        facts
+            .entry(candidate.fact_iri.clone())
+            .or_insert(candidate.fact);
+        if fused.contains_key(&candidate.fact_iri) {
+            continue;
+        }
+        let group_size = group_sizes
+            .get(&(candidate.anchor_iri, candidate.property_iri))
+            .copied()
+            .unwrap_or(1);
+        let score = anchor_score * scale
+            / (candidate.degree.max(1) as f64).sqrt()
+            / (group_size as f64).sqrt();
+        structural_scores
+            .entry(candidate.fact_iri)
+            .and_modify(|current| *current = current.max(score))
+            .or_insert(score);
+    }
+    for (iri, score) in structural_scores {
+        fused.entry(iri).or_insert(score);
+    }
+}
+
+/// Keep only the strongest activation contribution per fact to avoid popularity amplification.
+fn add_ranked_max(
     fused: &mut HashMap<String, f64>,
     iris: &[String],
     weight: f64,
@@ -310,7 +534,11 @@ fn add_ranked(
 ) {
     for (index, iri) in iris.iter().enumerate() {
         if facts.contains_key(iri) {
-            *fused.entry(iri.clone()).or_default() += weight / (rrf_k + index as f64 + 1.0);
+            let contribution = weight / (rrf_k + index as f64 + 1.0);
+            fused
+                .entry(iri.clone())
+                .and_modify(|current| *current = current.max(contribution))
+                .or_insert(contribution);
         }
     }
 }
@@ -373,13 +601,13 @@ async fn query_activations(
         .collect()
 }
 
-/// Load current visible `ASSERTS`/`ABOUT` envelopes for activation result IRIs.
+/// Load current visible ordinary fact envelopes for activation result IRIs.
 async fn resolve_facts(
     graph: &Graph,
     layers: &[String],
     labels: &[String],
     relationship_iris: Vec<String>,
-) -> Result<Vec<(String, Value)>> {
+) -> Result<Vec<(String, Value, FactGroup)>> {
     if relationship_iris.is_empty() {
         return Ok(Vec::new());
     }
@@ -389,7 +617,7 @@ async fn resolve_facts(
             r#"
             MATCH (s:Entity)-[r]->(o:Entity)
             WHERE r.iri IN $iris AND r.validTo IS NULL
-              AND (type(r) = 'ASSERTS' OR type(r) = 'ABOUT')
+              AND type(r) = 'ASSERTS'
               AND (size(s.layers) = 0
                    OR any(layer IN s.layers WHERE layer IN $layers))
               AND (size(r.layers) = 0
@@ -409,48 +637,131 @@ async fn resolve_facts(
     .await?;
     let mut facts = Vec::new();
     for row in rows {
-        let s: Node = row.get("s")?;
-        let r: Relation = row.get("r")?;
-        let o: Node = row.get("o")?;
-        let iri = r.get::<String>("iri")?;
-        let s_json = endpoint_json(&s)?;
-        let o_json = endpoint_json(&o)?;
-        let s_iri = s.get::<String>("iri")?;
-        let o_iri = o.get::<String>("iri")?;
-        let relation = rel_json(&r, &s_iri, &o_iri)?;
-        let p = r.get::<String>("propertyIri")?;
-        let subject_labels = s
-            .labels()
-            .into_iter()
-            .filter(|label| *label != "Entity")
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let effective_weight =
-            s_json["weight"]
-                .as_i64()
-                .ok_or_else(|| operation_error!("serialized subject weight is not an integer"))?
-                .saturating_add(
-                    relation["weight"].as_i64().ok_or_else(|| {
-                        operation_error!("serialized fact weight is not an integer")
-                    })?,
-                )
-                .saturating_add(o_json["weight"].as_i64().ok_or_else(|| {
-                    operation_error!("serialized object weight is not an integer")
-                })?);
-        let scope = r.get::<Vec<String>>("layers")?;
-        let mut fact = fact_envelope(
-            s_json,
-            &p,
-            o_json,
-            &relation,
-            &scope,
-            spike_label(&subject_labels).map(Value::String),
-        )?;
-        fact["score"] = json!(0.0);
-        fact["effectiveWeight"] = json!(effective_weight);
-        facts.push((iri, fact));
+        facts.push(resolved_fact(row.get("s")?, row.get("r")?, row.get("o")?)?);
     }
     Ok(facts)
+}
+
+/// Load bounded current visible one-hop facts around grounded semantic anchors.
+async fn resolve_structural_facts(
+    graph: &Graph,
+    layers: &[String],
+    labels: &[String],
+    anchor_iris: Vec<String>,
+) -> Result<Vec<StructuralCandidate>> {
+    if anchor_iris.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = fetch_all(
+        graph,
+        query(
+            r#"
+            UNWIND $anchorIris AS anchorIri
+            MATCH (anchorS:Entity)-[anchor:ASSERTS]->(anchorO:Entity)
+            WHERE anchor.iri = anchorIri AND anchor.validTo IS NULL
+              AND (size(anchorS.layers) = 0
+                   OR any(layer IN anchorS.layers WHERE layer IN $layers))
+              AND (size(anchor.layers) = 0
+                   OR any(layer IN anchor.layers WHERE layer IN $layers))
+              AND (size(anchorO.layers) = 0
+                   OR any(layer IN anchorO.layers WHERE layer IN $layers))
+              AND ($labelCount = 0
+                   OR any(label IN $labels
+                          WHERE label IN labels(anchorS) OR label IN labels(anchorO)))
+            UNWIND [anchorS, anchorO] AS shared
+            CALL {
+              WITH anchor, shared
+              MATCH (shared)-[degreeRelationship:ASSERTS]-(degreeOther:Entity)
+              WHERE degreeRelationship <> anchor AND degreeRelationship.validTo IS NULL
+                AND (size(shared.layers) = 0
+                     OR any(layer IN shared.layers WHERE layer IN $layers))
+                AND (size(degreeRelationship.layers) = 0
+                     OR any(layer IN degreeRelationship.layers WHERE layer IN $layers))
+                AND (size(degreeOther.layers) = 0
+                     OR any(layer IN degreeOther.layers WHERE layer IN $layers))
+                AND ($labelCount = 0
+                     OR any(label IN $labels
+                            WHERE label IN labels(shared) OR label IN labels(degreeOther)))
+              RETURN count(degreeRelationship) AS degree
+            }
+            CALL {
+              WITH anchor, shared
+              MATCH (shared)-[candidate:ASSERTS]-(other:Entity)
+              WHERE candidate <> anchor AND candidate.validTo IS NULL
+                AND (size(shared.layers) = 0
+                     OR any(layer IN shared.layers WHERE layer IN $layers))
+                AND (size(candidate.layers) = 0
+                     OR any(layer IN candidate.layers WHERE layer IN $layers))
+                AND (size(other.layers) = 0
+                     OR any(layer IN other.layers WHERE layer IN $layers))
+                AND ($labelCount = 0
+                     OR any(label IN $labels
+                            WHERE label IN labels(shared) OR label IN labels(other)))
+              WITH candidate ORDER BY candidate.iri ASC
+              LIMIT $perEndpoint
+              RETURN startNode(candidate) AS s, candidate AS r, endNode(candidate) AS o
+            }
+            RETURN anchorIri, s, r, o, degree
+            "#,
+        )
+        .param("anchorIris", anchor_iris)
+        .param("layers", layers.to_vec())
+        .param("labels", labels.to_vec())
+        .param("labelCount", labels.len() as i64)
+        .param("perEndpoint", MAX_STRUCTURAL_FACTS_PER_ENDPOINT),
+    )
+    .await?;
+    let mut candidates = Vec::new();
+    for row in rows {
+        let anchor_iri = row.get::<String>("anchorIri")?;
+        let degree = usize::try_from(row.get::<i64>("degree")?)
+            .map_err(|_| operation_error!("structural endpoint degree is negative"))?;
+        let (fact_iri, fact, group) = resolved_fact(row.get("s")?, row.get("r")?, row.get("o")?)?;
+        candidates.push(StructuralCandidate {
+            anchor_iri,
+            fact_iri,
+            property_iri: group.property_iri,
+            degree,
+            fact,
+        });
+    }
+    Ok(candidates)
+}
+
+/// Serialize one current ordinary relationship exactly as semantic recall returns it.
+fn resolved_fact(s: Node, r: Relation, o: Node) -> Result<(String, Value, FactGroup)> {
+    let iri = r.get::<String>("iri")?;
+    let s_json = endpoint_json(&s)?;
+    let o_json = endpoint_json(&o)?;
+    let s_iri = s.get::<String>("iri")?;
+    let o_iri = o.get::<String>("iri")?;
+    let relation = rel_json(&r, &s_iri, &o_iri)?;
+    let property_iri = r.get::<String>("propertyIri")?;
+    let effective_weight = s_json["weight"]
+        .as_i64()
+        .ok_or_else(|| operation_error!("serialized subject weight is not an integer"))?
+        .saturating_add(
+            relation["weight"]
+                .as_i64()
+                .ok_or_else(|| operation_error!("serialized fact weight is not an integer"))?,
+        )
+        .saturating_add(
+            o_json["weight"]
+                .as_i64()
+                .ok_or_else(|| operation_error!("serialized object weight is not an integer"))?,
+        );
+    let scope = r.get::<Vec<String>>("layers")?;
+    let mut fact = fact_envelope(s_json, &property_iri, o_json, &relation, &scope)?;
+    fact["score"] = json!(0.0);
+    fact["effectiveWeight"] = json!(effective_weight);
+    Ok((
+        iri,
+        fact,
+        FactGroup {
+            subject_iri: s_iri,
+            property_iri,
+        },
+    ))
 }
 
 /// Refresh recalled TTLs, then either converge into a neighbor or mint a new activation.
@@ -477,7 +788,11 @@ async fn persist_activation(
         .checked_mul(86_400_000)
         .and_then(|milliseconds| i64::try_from(milliseconds).ok())
         .ok_or_else(|| operation_error!("semantic TTL is too large"))?;
-    let convergence = select_convergence(neighbors, result_refs, &runtime.config);
+    let convergence = if result_refs.is_empty() {
+        None
+    } else {
+        select_convergence(neighbors, result_refs, &runtime.config)
+    };
     let mut refreshed_activation_ids = contributing_activation_ids.to_vec();
     if let Some(existing) = convergence {
         refreshed_activation_ids.push(existing.element_id.clone());
@@ -485,6 +800,9 @@ async fn persist_activation(
     refreshed_activation_ids.sort();
     refreshed_activation_ids.dedup();
     refresh_recalled_activations(graph, &refreshed_activation_ids, ttl_ms).await?;
+    if result_refs.is_empty() {
+        return Ok(());
+    }
     if let Some(existing) = convergence {
         let Some(existing_embedding) =
             load_activation_embedding(graph, &existing.element_id).await?
@@ -501,7 +819,7 @@ async fn persist_activation(
             graph,
             query(
                 r#"
-                MATCH (a:SemanticActivation)
+                MATCH (a:SemanticActivationV4)
                 WHERE elementId(a) = $elementId AND a.ttl >= timestamp()
                 SET a.resultRefs = $resultRefs
                 WITH a
@@ -555,7 +873,7 @@ async fn refresh_recalled_activations(
         query(
             r#"
             UNWIND $elementIds AS activationId
-            MATCH (a:SemanticActivation:TTL)
+            MATCH (a:SemanticActivationV4:TTL)
             WHERE elementId(a) = activationId AND a.ttl >= timestamp()
             WITH DISTINCT a
             CALL apoc.ttl.expireIn(a, $ttl, 'ms')
@@ -575,7 +893,7 @@ async fn load_activation_embedding(graph: &Graph, element_id: &str) -> Result<Op
     fetch_one(
         graph,
         query(
-            "MATCH (a:SemanticActivation) \
+            "MATCH (a:SemanticActivationV4) \
              WHERE elementId(a) = $elementId AND a.ttl >= timestamp() \
              RETURN a.embedding AS embedding",
         )
@@ -597,7 +915,7 @@ async fn create_activation(
         graph,
         query(
             r#"
-            CREATE (a:SemanticActivation:TTL {resultRefs: $resultRefs})
+            CREATE (a:SemanticActivation:SemanticActivationV4:TTL {resultRefs: $resultRefs})
             WITH a
             CALL db.create.setNodeVectorProperty(a, 'embedding', $embedding)
             WITH a
@@ -679,7 +997,7 @@ mod tests {
         let mut facts = HashMap::new();
         facts.insert("a".into(), json!({}));
         let mut fused = HashMap::new();
-        add_ranked(
+        add_ranked_max(
             &mut fused,
             &["missing".into(), "a".into()],
             2.0,
@@ -688,6 +1006,229 @@ mod tests {
         );
         assert!(!fused.contains_key("missing"));
         assert!(fused["a"] > 0.0);
+    }
+
+    #[test]
+    fn activation_fusion_uses_the_strongest_bundle_per_fact() {
+        let facts = HashMap::from([("fact".into(), json!({}))]);
+        let mut fused = HashMap::new();
+        add_ranked_max(&mut fused, &["fact".into()], 0.9, 15.0, &facts);
+        add_ranked_max(&mut fused, &["fact".into()], 0.8, 15.0, &facts);
+        assert_eq!(fused["fact"], 0.9 / 16.0);
+    }
+
+    #[test]
+    fn activation_evidence_is_zero_at_admission_and_bounded_by_keywords() {
+        let threshold = 0.65;
+        let keyword_weight = 0.5;
+        assert_eq!(
+            activation_evidence(threshold, threshold, keyword_weight),
+            0.0
+        );
+        assert_eq!(activation_evidence(1.0, threshold, keyword_weight), 0.5);
+        assert!(activation_evidence(0.9, threshold, keyword_weight) < keyword_weight);
+    }
+
+    #[test]
+    fn fused_score_ties_prefer_direct_evidence() {
+        let direct_matches = HashMap::from([(
+            "direct".into(),
+            TextMatch {
+                keyword_confidence: 1.0,
+                ..TextMatch::default()
+            },
+        )]);
+        let mut ranked = [("activation".into(), 0.5), ("direct".into(), 0.5)];
+        ranked.sort_by(|left, right| compare_fused(left, right, &direct_matches));
+        assert_eq!(ranked[0].0, "direct");
+    }
+
+    #[test]
+    fn direct_fusion_weights_exact_evidence_above_keywords() {
+        let facts = HashMap::from([
+            ("endpoint-only".into(), json!({})),
+            ("exact".into(), json!({})),
+            ("keyword".into(), json!({})),
+        ]);
+        let matches = HashMap::from([
+            (
+                "exact".into(),
+                TextMatch {
+                    exact: true,
+                    ..TextMatch::default()
+                },
+            ),
+            (
+                "keyword".into(),
+                TextMatch {
+                    keyword_confidence: 0.5,
+                    ..TextMatch::default()
+                },
+            ),
+        ]);
+        let mut fused = HashMap::new();
+        add_direct_ranked(
+            &mut fused,
+            &["endpoint-only".into(), "exact".into(), "keyword".into()],
+            2.0,
+            0.5,
+            15.0,
+            &facts,
+            &matches,
+        );
+        assert!(!fused.contains_key("endpoint-only"));
+        assert_eq!(fused["exact"], 2.0 / 16.0);
+        assert!(fused["exact"] > fused["keyword"]);
+        assert_eq!(fused["keyword"], (0.5 * 0.5) / 17.0);
+    }
+
+    #[test]
+    fn structural_context_is_bounded_penalized_and_does_not_boost_evidence() {
+        let anchors = HashMap::from([("anchor".into(), 0.1)]);
+        let mut fused = HashMap::from([("existing".into(), 0.2)]);
+        let mut facts = HashMap::new();
+        let candidate = |fact: &str, property: &str, degree: usize| StructuralCandidate {
+            anchor_iri: "anchor".into(),
+            fact_iri: fact.into(),
+            property_iri: property.into(),
+            degree,
+            fact: json!({"target": fact}),
+        };
+        add_structural_ranked(
+            &mut fused,
+            &mut facts,
+            &anchors,
+            vec![
+                candidate("group-a", "shared-property", 4),
+                candidate("group-b", "shared-property", 4),
+                candidate("diverse", "other-property", 1),
+                candidate("existing", "other-property", 1),
+                candidate("group-a", "shared-property", 9),
+            ],
+            0.5,
+        );
+
+        assert_eq!(fused["existing"], 0.2);
+        assert_eq!(fused["diverse"], 0.05 / 2.0_f64.sqrt());
+        assert_eq!(fused["group-a"], 0.05 / 2.0 / 2.0_f64.sqrt());
+        assert_eq!(fused["group-a"], fused["group-b"]);
+        assert!(facts
+            .keys()
+            .all(|iri| { ["group-a", "group-b", "diverse", "existing"].contains(&iri.as_str()) }));
+    }
+
+    #[test]
+    fn penalized_structural_context_stays_below_strong_partial_direct_evidence() {
+        let mut facts = HashMap::from([
+            ("anchor".into(), json!({})),
+            ("partial-direct".into(), json!({})),
+        ]);
+        let matches = HashMap::from([
+            (
+                "anchor".into(),
+                TextMatch {
+                    exact: true,
+                    bundle_eligible: true,
+                    ..TextMatch::default()
+                },
+            ),
+            (
+                "partial-direct".into(),
+                TextMatch {
+                    keyword_confidence: 2.0 / 3.0,
+                    ..TextMatch::default()
+                },
+            ),
+        ]);
+        let mut fused = HashMap::new();
+        add_direct_ranked(
+            &mut fused,
+            &["anchor".into(), "partial-direct".into()],
+            2.0,
+            0.5,
+            15.0,
+            &facts,
+            &matches,
+        );
+        let anchors = HashMap::from([("anchor".into(), fused["anchor"])]);
+        add_structural_ranked(
+            &mut fused,
+            &mut facts,
+            &anchors,
+            vec![StructuralCandidate {
+                anchor_iri: "anchor".into(),
+                fact_iri: "structural".into(),
+                property_iri: "other-property".into(),
+                degree: 4,
+                fact: json!({}),
+            }],
+            STRUCTURAL_EVIDENCE_SCALE,
+        );
+
+        assert!(fused["partial-direct"] > fused["structural"]);
+        assert!(fused["anchor"] > fused["structural"]);
+    }
+
+    #[test]
+    fn structural_anchor_selection_is_strongest_then_stable_and_bounded() {
+        let mut scores = (0..=MAX_STRUCTURAL_ANCHORS)
+            .map(|index| (format!("anchor-{index:02}"), index as f64))
+            .collect::<HashMap<_, _>>();
+        scores.insert("anchor-tie-b".into(), 100.0);
+        scores.insert("anchor-tie-a".into(), 100.0);
+        let ranked = top_structural_anchors(&scores);
+
+        assert_eq!(ranked.len(), MAX_STRUCTURAL_ANCHORS);
+        assert_eq!(ranked[0].0, "anchor-tie-a");
+        assert_eq!(ranked[1].0, "anchor-tie-b");
+        assert!(!ranked.iter().any(|(iri, _)| iri == "anchor-00"));
+    }
+
+    #[test]
+    fn activation_selection_preserves_rank_while_limiting_group_monopoly() {
+        let ranked = ["a1", "a2", "a3", "b1"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let group_a = FactGroup {
+            subject_iri: "subject:a".into(),
+            property_iri: "property:a".into(),
+        };
+        let group_b = FactGroup {
+            subject_iri: "subject:b".into(),
+            property_iri: "property:b".into(),
+        };
+        let groups = HashMap::from([
+            ("a1".into(), group_a.clone()),
+            ("a2".into(), group_a.clone()),
+            ("a3".into(), group_a),
+            ("b1".into(), group_b),
+        ]);
+        assert_eq!(
+            select_activation_refs(&ranked, &groups),
+            vec!["a1", "a2", "b1"]
+        );
+    }
+
+    #[test]
+    fn activation_selection_fills_one_group_and_deduplicates_refs() {
+        let ranked = ["a1", "a1", "a2", "a3"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let group = FactGroup {
+            subject_iri: "subject:a".into(),
+            property_iri: "property:a".into(),
+        };
+        let groups = HashMap::from([
+            ("a1".into(), group.clone()),
+            ("a2".into(), group.clone()),
+            ("a3".into(), group),
+        ]);
+        assert_eq!(
+            select_activation_refs(&ranked, &groups),
+            vec!["a1", "a2", "a3"]
+        );
     }
 
     #[test]

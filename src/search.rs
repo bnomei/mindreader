@@ -1,6 +1,6 @@
 //! Ranked fact retrieval and the graph-free `recall` input contract.
 //!
-//! Text and non-schema label queries rank current `ASSERTS`/`ABOUT` facts:
+//! Text and non-schema label queries rank current ordinary `ASSERTS` facts:
 //! Spike category first, then subject+fact+object weight, then text score.
 //! `validate_recall_args` enforces exactly one selector (`text`, `iris`,
 //! `labels`, `around`, or `history`) without advertising schema unions. Catalog labels
@@ -9,16 +9,26 @@
 
 use crate::domain::DomainError;
 use crate::error::{Error, Result};
-use crate::graph::{
-    endpoint_json, fact_envelope, fetch_all, node_json, rel_json, spike_label, spike_rank,
-};
+use crate::graph::{endpoint_json, fact_envelope, fetch_all, node_json, rel_json, spike_rank};
 use crate::iri::{is_iri, property_iri, split_camel_case};
 use crate::layers::validate_layer_ids;
 use neo4rs::{query, Graph, Node, Relation};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+/// Maximum unique terms admitted to the keyword fallback query.
+const MAX_KEYWORD_TOKENS: usize = 16;
+/// Short tokens are usually grammatical glue across supported natural languages.
+const MIN_KEYWORD_TOKEN_CHARS: usize = 4;
+/// Oversized terms are skipped rather than truncated into a different token.
+const MAX_KEYWORD_TOKEN_BYTES: usize = 64;
+/// Very long text skips the effectively-unmatchable exact phrase channel.
+const MAX_EXACT_PHRASE_BYTES: usize = 512;
+const NO_MATCH_QUERY: &str = "\"mindreadernokeywordmatch9f86d081884c\"";
+const EXACT_TEXT_WEIGHT: f64 = 2.0;
+const KEYWORD_TEXT_WEIGHT: f64 = 1.0;
 
 /// In-process ranked search (`layers` here is the request visibility union).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -31,6 +41,48 @@ pub struct SearchArgs {
     pub labels: Option<Vec<String>>,
     #[serde(default)]
     pub limit: Option<u32>,
+}
+
+/// Internal direct-search evidence used by semantic rank fusion.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct TextMatch {
+    pub exact: bool,
+    pub keyword_confidence: f64,
+    pub bundle_eligible: bool,
+}
+
+/// Private graph identity used to diversify learned semantic bundles.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FactGroup {
+    pub subject_iri: String,
+    pub property_iri: String,
+}
+
+/// Internal ranked search result plus channel evidence that must not leak onto the MCP wire.
+pub(crate) struct SearchResult {
+    pub facts: Vec<Value>,
+    pub about: Vec<Value>,
+    pub scope: Vec<String>,
+    pub mode: &'static str,
+    pub truncated: bool,
+    pub text_matches: HashMap<String, TextMatch>,
+    pub fact_groups: HashMap<String, FactGroup>,
+}
+
+impl SearchResult {
+    fn into_payload(self) -> Value {
+        json!({
+            "ok": true,
+            "mode": self.mode,
+            "facts": self.facts,
+            "nodes": [],
+            "paths": [],
+            "about": self.about,
+            "lookups": [],
+            "scope": self.scope,
+            "truncated": self.truncated,
+        })
+    }
 }
 
 /// MCP `recall` arguments. Runtime accepts exactly one selector.
@@ -60,6 +112,9 @@ pub struct RecallArgs {
     /// Around mode only: traversal depth 1..=3.
     #[serde(default)]
     pub depth: Option<u32>,
+    /// Around mode only: `both`, `outgoing`, or `incoming` at every hop.
+    #[serde(default)]
+    pub direction: Option<String>,
     /// Node or fact IRI whose current and `validTo` facts are returned.
     #[serde(default)]
     pub history: Option<String>,
@@ -137,6 +192,12 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
         ))
         .into());
     }
+    if selector != "around" && args.direction.is_some() {
+        return Err(DomainError::InvalidInput(format!(
+            "recall direction applies only to the around selector, not {selector}"
+        ))
+        .into());
+    }
     if selector != "history" && args.history.is_some() {
         return Err(DomainError::InvalidInput(format!(
             "recall history applies only to the history selector, not {selector}"
@@ -209,6 +270,14 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
             return Err(DomainError::InvalidInput("recall depth must be 1..=3".into()).into());
         }
     }
+    if let Some(direction) = args.direction.as_deref() {
+        if !matches!(direction, "both" | "outgoing" | "incoming") {
+            return Err(DomainError::InvalidInput(
+                "recall direction must be both, outgoing, or incoming".into(),
+            )
+            .into());
+        }
+    }
     if let Some(limit) = args.limit {
         if limit == 0 || limit > 100 {
             return Err(Error::from(DomainError::InvalidInput(
@@ -255,6 +324,75 @@ fn lucene_query(text: &str) -> String {
     }
 }
 
+/// Extract unique Unicode-alphanumeric terms with the search channel's length bounds.
+fn keyword_tokens(text: &str, limit: usize) -> Vec<String> {
+    let split = split_camel_case(text);
+    let mut tokens = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = String::new();
+    let push_token =
+        |current: &mut String, tokens: &mut Vec<String>, seen: &mut HashSet<String>| {
+            if current.is_empty() || tokens.len() >= limit {
+                current.clear();
+                return;
+            }
+            let token = current.to_lowercase();
+            current.clear();
+            if token.chars().count() >= MIN_KEYWORD_TOKEN_CHARS
+                && token.len() <= MAX_KEYWORD_TOKEN_BYTES
+                && seen.insert(token.clone())
+            {
+                tokens.push(token);
+            }
+        };
+    for character in split.chars() {
+        if character.is_alphanumeric() {
+            current.push(character);
+        } else {
+            push_token(&mut current, &mut tokens, &mut seen);
+        }
+    }
+    push_token(&mut current, &mut tokens, &mut seen);
+    tokens
+}
+
+/// Build a bounded OR query from unique Unicode-alphanumeric terms.
+fn lucene_keyword_query(text: &str) -> String {
+    let tokens = keyword_tokens(text, MAX_KEYWORD_TOKENS);
+    if tokens.is_empty() {
+        return NO_MATCH_QUERY.into();
+    }
+    tokens
+        .iter()
+        .map(|token| lucene_escape(token))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
+/// Fraction of bounded query terms present anywhere in a relationship's indexed text.
+fn keyword_coverage(query_tokens: &[String], fact_text: &str) -> f64 {
+    if query_tokens.is_empty() {
+        return 0.0;
+    }
+    let fact_tokens = keyword_tokens(fact_text, usize::MAX)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let matched = query_tokens
+        .iter()
+        .filter(|token| fact_tokens.contains(*token))
+        .count();
+    matched as f64 / query_tokens.len() as f64
+}
+
+/// Exact phrase query, bounded so long natural-language input uses keywords only.
+fn lucene_exact_query(text: &str) -> String {
+    if text.len() > MAX_EXACT_PHRASE_BYTES {
+        NO_MATCH_QUERY.into()
+    } else {
+        lucene_query(text)
+    }
+}
+
 /// Phrase-quote user text and escape Lucene operators so they stay literals.
 fn lucene_escape(text: &str) -> String {
     let mut out = String::from("\"");
@@ -268,29 +406,36 @@ fn lucene_escape(text: &str) -> String {
     out
 }
 
-/// Invert the Cypher Spike rank integer back to a label for the fact envelope.
-fn spike_from_rank(rank: i64) -> Option<String> {
-    match rank {
-        4 => Some("Knowledge".into()),
-        3 => Some("Insight".into()),
-        2 => Some("Pattern".into()),
-        1 => Some("Signal".into()),
-        _ => None,
-    }
-}
-
 /// Full-text node, fact, and exact-property candidates for ranked text recall.
 const TEXT_CANDIDATES: &str = r#"
 CALL {
-  CALL db.index.fulltext.queryNodes('wakeup_nodes', $q) YIELD node, score
+  CALL db.index.fulltext.queryNodes('wakeup_nodes', $qExact) YIELD node, score
   MATCH (node)-[relationship]-(other:Entity)
   RETURN startNode(relationship) AS s, relationship AS r,
-         endNode(relationship) AS o, score AS indexScore
+         endNode(relationship) AS o,
+         0.0 AS factScore, 0 AS factExact,
+         score * $exactTextWeight AS endpointScore
   UNION ALL
-  CALL db.index.fulltext.queryRelationships('wakeup_facts', $q)
+  CALL db.index.fulltext.queryRelationships('wakeup_facts', $qExact)
   YIELD relationship, score
   RETURN startNode(relationship) AS s, relationship AS r,
-         endNode(relationship) AS o, score AS indexScore
+         endNode(relationship) AS o,
+         score * $exactTextWeight AS factScore, 1 AS factExact,
+         0.0 AS endpointScore
+  UNION ALL
+  CALL db.index.fulltext.queryNodes('wakeup_nodes', $qKeywords) YIELD node, score
+  MATCH (node)-[relationship]-(other:Entity)
+  RETURN startNode(relationship) AS s, relationship AS r,
+         endNode(relationship) AS o,
+         0.0 AS factScore, 0 AS factExact,
+         score * $keywordTextWeight AS endpointScore
+  UNION ALL
+  CALL db.index.fulltext.queryRelationships('wakeup_facts', $qKeywords)
+  YIELD relationship, score
+  RETURN startNode(relationship) AS s, relationship AS r,
+         endNode(relationship) AS o,
+         score * $keywordTextWeight AS factScore, 0 AS factExact,
+         0.0 AS endpointScore
   UNION ALL
   MATCH (p:Entity:Property)
   WHERE toLower(coalesce(p.name, '')) = toLower($predicateName)
@@ -298,21 +443,31 @@ CALL {
      OR p.iri ENDS WITH ('/' + $predicateName)
   MATCH (s:Entity)-[r:ASSERTS]->(o:Entity)
   WHERE r.validTo IS NULL AND r.propertyIri = p.iri
-  RETURN s, r, o, 1.0 AS indexScore
+  RETURN s, r, o,
+         1.0 AS factScore, 1 AS factExact,
+         0.0 AS endpointScore
 }
-WITH s, r, o, max(indexScore) AS indexScore
+WITH s, r, o,
+     max(factScore) AS factScore, max(factExact) AS factExact,
+     max(endpointScore) AS endpointScore
+WITH s, r, o,
+     CASE WHEN factScore > 0.0 THEN factScore ELSE endpointScore END AS indexScore,
+     factExact AS relationshipExact,
+     CASE WHEN factScore > 0.0 THEN 1 ELSE 0 END AS relationshipMatched,
+     coalesce(r.factText, '') AS factText
 "#;
 
 /// Unfiltered current-edge scan used when ranking by labels only.
 const LABEL_CANDIDATES: &str = r#"
 MATCH (s:Entity)-[r]->(o:Entity)
-WITH s, r, o, 1.0 AS indexScore
+WITH s, r, o, 1.0 AS indexScore,
+     0 AS relationshipExact, 0 AS relationshipMatched, '' AS factText
 "#;
 
-/// Shared rank tail: current `ASSERTS`/`ABOUT`, endpoint closure, Spike then weight then score.
+/// Shared rank tail: current ordinary assertions, endpoint closure, Spike then weight then score.
 const RANK_AND_LIMIT: &str = r#"
 WHERE r.validTo IS NULL
-  AND (type(r) = 'ASSERTS' OR type(r) = 'ABOUT')
+  AND type(r) = 'ASSERTS'
   AND (size(s.layers) = 0
        OR any(layer IN s.layers WHERE layer IN $layers))
   AND (size(r.layers) = 0
@@ -321,35 +476,36 @@ WHERE r.validTo IS NULL
        OR any(layer IN o.layers WHERE layer IN $layers))
   AND ($labelCount = 0
        OR any(label IN $labels WHERE label IN labels(s) OR label IN labels(o)))
-WITH s, r, o, indexScore,
+WITH s, r, o, indexScore, relationshipExact, relationshipMatched, factText,
      CASE
-       WHEN s:Knowledge THEN 4
-       WHEN s:Insight THEN 3
-       WHEN s:Pattern THEN 2
-       WHEN s:Signal THEN 1
+       WHEN r.spike = 'Knowledge' THEN 4
+       WHEN r.spike = 'Insight' THEN 3
+       WHEN r.spike = 'Pattern' THEN 2
+       WHEN r.spike = 'Signal' THEN 1
        ELSE 0
      END AS ownSpikeRank
 OPTIONAL MATCH (sp:Entity)-[a:ABOUT]->(s)
 WHERE a.validTo IS NULL
-  AND (sp:Knowledge OR sp:Insight OR sp:Pattern OR sp:Signal)
+  AND a.spike IS NOT NULL
   AND (size(sp.layers) = 0
        OR any(layer IN sp.layers WHERE layer IN $layers))
   AND (size(a.layers) = 0
        OR any(layer IN a.layers WHERE layer IN $layers))
   AND (size(s.layers) = 0
        OR any(layer IN s.layers WHERE layer IN $layers))
-WITH s, r, o, indexScore, ownSpikeRank,
+WITH s, r, o, indexScore, relationshipExact, relationshipMatched, factText,
+     ownSpikeRank,
      max(CASE
-       WHEN sp:Knowledge THEN 4
-       WHEN sp:Insight THEN 3
-       WHEN sp:Pattern THEN 2
-       WHEN sp:Signal THEN 1
+       WHEN a.spike = 'Knowledge' THEN 4
+       WHEN a.spike = 'Insight' THEN 3
+       WHEN a.spike = 'Pattern' THEN 2
+       WHEN a.spike = 'Signal' THEN 1
        ELSE 0
      END) AS attachedSpikeRank,
      s.weight AS subjectWeight,
      r.weight AS relationshipWeight,
      o.weight AS objectWeight
-WITH s, r, o, indexScore,
+WITH s, r, o, indexScore, relationshipExact, relationshipMatched, factText,
      CASE WHEN ownSpikeRank > 0 THEN ownSpikeRank ELSE attachedSpikeRank END AS spikeRank,
      CASE
        WHEN subjectWeight > 0 AND relationshipWeight > $maxWeight - subjectWeight THEN $maxWeight
@@ -357,18 +513,19 @@ WITH s, r, o, indexScore,
        ELSE subjectWeight + relationshipWeight
      END AS subjectRelationshipWeight,
      objectWeight
-WITH s, r, o, spikeRank,
+WITH s, r, o, relationshipExact, relationshipMatched, factText, spikeRank,
      CASE
        WHEN subjectRelationshipWeight > 0 AND objectWeight > $maxWeight - subjectRelationshipWeight THEN $maxWeight
        WHEN subjectRelationshipWeight < 0 AND objectWeight < $minWeight - subjectRelationshipWeight THEN $minWeight
        ELSE subjectRelationshipWeight + objectWeight
      END AS effectiveWeight,
-     CASE WHEN indexScore > 1.0 THEN indexScore ELSE 1.0 END AS score,
+     indexScore AS score,
      r.propertyIri AS property
 ORDER BY spikeRank DESC, effectiveWeight DESC, score DESC,
          s.iri ASC, property ASC, o.iri ASC, r.iri ASC
 LIMIT $limit
-RETURN s, r, o, property, spikeRank, effectiveWeight, score
+RETURN s, r, o, property, spikeRank, effectiveWeight, score,
+       relationshipExact, relationshipMatched, factText
 "#;
 
 /// Assemble the closed-world rank query: text index or label filter, then Spike/weight/score.
@@ -381,7 +538,7 @@ fn ranked_query(text_mode: bool) -> String {
     format!("{candidates}{RANK_AND_LIMIT}")
 }
 
-/// Neighbor `ABOUT` facts that give Spike context around ranked subjects.
+/// Explicit `ABOUT` facts that give Spike context around ranked subjects.
 async fn spike_context(
     graph: &Graph,
     layers: &[String],
@@ -399,7 +556,7 @@ async fn spike_context(
             r#"
             MATCH (sp:Entity)-[a:ABOUT]->(el:Entity)
             WHERE a.validTo IS NULL AND el.iri IN $iris
-              AND (sp:Knowledge OR sp:Insight OR sp:Pattern OR sp:Signal)
+              AND a.spike IS NOT NULL
               AND (size(sp.layers) = 0
                    OR any(layer IN sp.layers WHERE layer IN $layers))
               AND (size(a.layers) = 0
@@ -408,10 +565,10 @@ async fn spike_context(
                    OR any(layer IN el.layers WHERE layer IN $layers))
             WITH sp, a, el,
                  CASE
-                   WHEN sp:Knowledge THEN 4
-                   WHEN sp:Insight THEN 3
-                   WHEN sp:Pattern THEN 2
-                   WHEN sp:Signal THEN 1
+                   WHEN a.spike = 'Knowledge' THEN 4
+                   WHEN a.spike = 'Insight' THEN 3
+                   WHEN a.spike = 'Pattern' THEN 2
+                   WHEN a.spike = 'Signal' THEN 1
                    ELSE 0
                  END AS spikeRank,
                  sp.weight AS spikeWeight,
@@ -447,13 +604,7 @@ async fn spike_context(
         let sp = row.get::<Node>("sp")?;
         let about_rel = row.get::<Relation>("a")?;
         let element = row.get::<Node>("el")?;
-        let labels = sp
-            .labels()
-            .into_iter()
-            .filter(|label| *label != "Entity")
-            .map(str::to_string)
-            .collect::<Vec<_>>();
-        let Some(rank) = spike_label(&labels) else {
+        let Some(rank) = about_rel.get::<String>("spike").ok() else {
             continue;
         };
         let about = element.get::<String>("iri")?;
@@ -494,27 +645,36 @@ async fn spike_context(
     Ok(spike_list)
 }
 
-/// Rank current visible `ASSERTS`/`ABOUT` facts for text and/or non-schema labels.
+/// Rank current visible ordinary facts for text and/or non-schema labels.
 pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
+    Ok(memory_search_with_matches(graph, args)
+        .await?
+        .into_payload())
+}
+
+/// Execute ranked search while retaining private exact-vs-keyword evidence for semantic fusion.
+pub(crate) async fn memory_search_with_matches(
+    graph: &Graph,
+    args: SearchArgs,
+) -> Result<SearchResult> {
     let layers = normalize_layers(args.layers)?;
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as i64;
     let labels = args.labels.unwrap_or_default();
     let trimmed = args.text.unwrap_or_default().trim().to_string();
     if trimmed.is_empty() && labels.is_empty() {
-        return Ok(json!({
-            "ok": true,
-            "mode": "labels",
-            "facts": [],
-            "nodes": [],
-            "paths": [],
-            "about": [],
-            "lookups": [],
-            "scope": layers,
-            "truncated": false,
-        }));
+        return Ok(SearchResult {
+            facts: Vec::new(),
+            about: Vec::new(),
+            scope: layers,
+            mode: "labels",
+            truncated: false,
+            text_matches: HashMap::new(),
+            fact_groups: HashMap::new(),
+        });
     }
 
     let text_mode = !trimmed.is_empty();
+    let query_tokens = keyword_tokens(&trimmed, MAX_KEYWORD_TOKENS);
     let query_limit = limit.saturating_add(1);
     let mut ranked = query(&ranked_query(text_mode))
         .param("layers", layers.clone())
@@ -525,18 +685,24 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
         .param("maxWeight", i64::MAX);
     if text_mode {
         ranked = ranked
-            .param("q", lucene_query(&trimmed))
+            .param("qExact", lucene_exact_query(&trimmed))
+            .param("qKeywords", lucene_keyword_query(&trimmed))
+            .param("exactTextWeight", EXACT_TEXT_WEIGHT)
+            .param("keywordTextWeight", KEYWORD_TEXT_WEIGHT)
             .param("predicateName", trimmed.clone())
             .param("predicateIri", property_iri(&trimmed));
     }
 
     let mut facts = Vec::new();
+    let mut text_matches = HashMap::new();
+    let mut fact_groups = HashMap::new();
     for row in fetch_all(graph, ranked).await? {
         let subject = row.get::<Node>("s")?;
         let relationship = row.get::<Relation>("r")?;
         let object = row.get::<Node>("o")?;
         let subject_iri = subject.get::<String>("iri")?;
         let object_iri = object.get::<String>("iri")?;
+        let fact_iri = relationship.get::<String>("iri")?;
         let effective_weight = row.get::<i64>("effectiveWeight")?;
         let property = row.get::<String>("property")?;
         let scope_vec = relationship.get::<Vec<String>>("layers")?;
@@ -547,10 +713,32 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
             endpoint_json(&object)?,
             &relationship,
             &scope_vec,
-            spike_from_rank(row.get::<i64>("spikeRank")?).map(Value::String),
         )?;
         fact["score"] = json!(row.get::<f64>("score")?);
         fact["effectiveWeight"] = json!(effective_weight);
+        if row.get::<i64>("relationshipMatched")? != 0 {
+            let exact = row.get::<i64>("relationshipExact")? != 0;
+            let keyword_confidence = if exact {
+                1.0
+            } else {
+                keyword_coverage(&query_tokens, &row.get::<String>("factText")?)
+            };
+            text_matches.insert(
+                fact_iri.clone(),
+                TextMatch {
+                    exact,
+                    keyword_confidence,
+                    bundle_eligible: exact || keyword_confidence == 1.0,
+                },
+            );
+        }
+        fact_groups.insert(
+            fact_iri,
+            FactGroup {
+                subject_iri,
+                property_iri: property,
+            },
+        );
         facts.push(fact);
     }
     let truncated = facts.len() > limit as usize;
@@ -577,24 +765,23 @@ pub async fn memory_search(graph: &Graph, args: SearchArgs) -> Result<Value> {
         limit,
     )
     .await?;
-    Ok(json!({
-        "ok": true,
-        "mode": if text_mode { "text" } else { "labels" },
-        "facts": facts,
-        "nodes": [],
-        "paths": [],
-        "about": spike,
-        "lookups": [],
-        "scope": layers,
-        "truncated": truncated,
-    }))
+    Ok(SearchResult {
+        facts,
+        about: spike,
+        scope: layers,
+        mode: if text_mode { "text" } else { "labels" },
+        truncated,
+        text_matches,
+        fact_groups,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        fact_handle_iri, lucene_escape, lucene_query, ranked_query, spike_from_rank,
-        validate_recall_args, RecallArgs,
+        fact_handle_iri, keyword_coverage, keyword_tokens, lucene_escape, lucene_exact_query,
+        lucene_keyword_query, lucene_query, ranked_query, validate_recall_args, RecallArgs,
+        MAX_EXACT_PHRASE_BYTES, MAX_KEYWORD_TOKENS,
     };
     use serde_json::json;
 
@@ -605,13 +792,44 @@ mod tests {
             lucene_query("graphModel"),
             "(\"graphModel\" OR \"graph Model\")"
         );
+        assert_eq!(
+            lucene_keyword_query("Graph graphModel / C++ 2026"),
+            "\"graph\" OR \"model\" OR \"2026\""
+        );
+        assert_eq!(
+            lucene_keyword_query("the und per con"),
+            super::NO_MATCH_QUERY
+        );
+        assert_eq!(lucene_keyword_query("!!!"), super::NO_MATCH_QUERY);
+        assert_eq!(
+            lucene_exact_query(&"x".repeat(MAX_EXACT_PHRASE_BYTES + 1)),
+            super::NO_MATCH_QUERY
+        );
         assert!(ranked_query(true).contains("r.propertyIri = p.iri"));
-        assert_eq!(spike_from_rank(4).as_deref(), Some("Knowledge"));
-        assert_eq!(spike_from_rank(0), None);
+        assert!(ranked_query(true).contains("$qExact"));
+        assert!(ranked_query(true).contains("$qKeywords"));
+        assert!(ranked_query(true).contains(
+            "CASE WHEN factScore > 0.0 THEN factScore ELSE endpointScore END AS indexScore"
+        ));
         let query = ranked_query(true);
+        assert!(query.contains("AND type(r) = 'ASSERTS'"));
+        assert!(query.contains("WHEN r.spike = 'Knowledge'"));
+        assert!(query.contains("WHEN a.spike = 'Knowledge'"));
+        assert!(!query.contains("WHEN s:Knowledge"));
         assert!(query.contains("ORDER BY spikeRank DESC, effectiveWeight DESC, score DESC"));
         assert!(query.contains("LIMIT $limit"));
         assert!(!query.contains("collect("));
+    }
+
+    #[test]
+    fn keyword_coverage_measures_unique_query_term_overlap() {
+        let query = keyword_tokens("marlin circles beneath the boat", MAX_KEYWORD_TOKENS);
+        assert_eq!(query, ["marlin", "circles", "beneath", "boat"]);
+        assert_eq!(
+            keyword_coverage(&query, "The marlin circles beneath Santiago's skiff"),
+            0.75
+        );
+        assert_eq!(keyword_coverage(&query, "The fisherman returns"), 0.0);
     }
 
     #[test]
@@ -634,6 +852,7 @@ mod tests {
             hops: None,
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: None,
             limit: None,
@@ -671,6 +890,7 @@ mod tests {
             hops: None,
             p: None,
             depth: None,
+            direction: None,
             history: None,
             detail: None,
             limit: Some(20),
@@ -683,6 +903,20 @@ mod tests {
         .is_err());
         assert!(validate_recall_args(&RecallArgs {
             limit: Some(101),
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate_recall_args(&RecallArgs {
+            text: None,
+            around: Some("mindreader:element/alice".into()),
+            direction: Some("outgoing".into()),
+            ..base.clone()
+        })
+        .is_ok());
+        assert!(validate_recall_args(&RecallArgs {
+            text: None,
+            around: Some("mindreader:element/alice".into()),
+            direction: Some("sideways".into()),
             ..base.clone()
         })
         .is_err());

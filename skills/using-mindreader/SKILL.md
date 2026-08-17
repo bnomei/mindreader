@@ -67,6 +67,8 @@ Every tool except `mindreader:unify` requires `scope`.
 
 Facts are set-valued. A different object for the same subject and predicate is another current value unless evidence establishes that the old value is wrong. Add a valid parallel value with `mindreader:write`; correct a wrong value with `mindreader:revise`; remove a stale value without replacement with `mindreader:withdraw`.
 
+`spike` classifies one exact fact; it never labels an endpoint or creates `ABOUT`. Write `ABOUT` explicitly only for genuine context. Explicit ABOUT can appear in detailed recall's `about[]`, but never as an ordinary recalled fact or semantic activation result.
+
 Set `contradicts: true` only when a visible current alternative for the same subject and predicate is directly incompatible and both claims should remain current. It links the new object to the conflicting visible current objects. Do not recall solely to populate this flag. Never assert, revise, or withdraw the system-owned `CONTRADICTS` or `SUPERSEDES` relationships directly.
 
 For exact recall selectors, semantic disclosure, detail modes, and limits, read [references/recall.md](references/recall.md). Always read [references/mutations.md](references/mutations.md) before revise, withdraw, place, judge, or unify; also read it before using contradiction or review-queue features on a write.

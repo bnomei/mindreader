@@ -2,8 +2,8 @@
 //!
 //! Entity and property IRIs use the `mindreader:{kind}/{slug}` shape unless a
 //! full IRI is already supplied. Kind and Neo4j label tables stay aligned so
-//! MERGE and schema tools can round-trip Class, Property, Element, Spike, and
-//! Episode nodes.
+//! MERGE and schema tools can round-trip Class, Property, Element, Literal,
+//! and Episode nodes. Spike classifications belong to facts, not node kinds.
 
 /// True when `value` looks like a scheme-qualified IRI (`scheme:rest`).
 pub fn is_iri(value: &str) -> bool {
@@ -100,10 +100,7 @@ pub fn class_iri(name_or_iri: &str) -> String {
 
 /// Whether minting for this kind lowercases the slug by default.
 pub fn default_lower_for_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "element" | "literal" | "episode" | "signal" | "pattern" | "insight" | "knowledge"
-    )
+    matches!(kind, "element" | "literal" | "episode")
 }
 
 /// Map a lowercase kind string to its Neo4j entity label, if known.
@@ -112,18 +109,13 @@ pub fn label_for_kind(kind: &str) -> Option<&'static str> {
         "class" => "Class",
         "property" => "Property",
         "element" => "Element",
-        "signal" => "Signal",
-        "pattern" => "Pattern",
-        "insight" => "Insight",
-        "knowledge" => "Knowledge",
         "literal" => "Literal",
         "episode" => "Episode",
         _ => return None,
     })
 }
 
-/// Identity kind from Neo4j labels: Class, Property, or Element wins; otherwise
-/// exactly one Spike label. Used for IRI minting and same-kind unify.
+/// Identity kind from Neo4j labels. Used for IRI minting and same-kind unify.
 pub fn identity_kind_from_labels<I, S>(labels: I) -> Option<&'static str>
 where
     I: IntoIterator<Item = S>,
@@ -142,21 +134,7 @@ where
     if labels.iter().any(|label| label == "Element") {
         return Some("Element");
     }
-    let spikes: Vec<&'static str> = labels
-        .iter()
-        .filter_map(|label| match label.as_str() {
-            "Signal" => Some("Signal"),
-            "Pattern" => Some("Pattern"),
-            "Insight" => Some("Insight"),
-            "Knowledge" => Some("Knowledge"),
-            _ => None,
-        })
-        .collect();
-    if spikes.len() == 1 {
-        Some(spikes[0])
-    } else {
-        None
-    }
+    None
 }
 
 /// Insert spaces before internal ASCII capitals (`graphModel` → `graph Model`).
@@ -178,10 +156,6 @@ pub fn kind_for_label(label: &str) -> Option<&'static str> {
         "Class" => "class",
         "Property" => "property",
         "Element" => "element",
-        "Signal" => "signal",
-        "Pattern" => "pattern",
-        "Insight" => "insight",
-        "Knowledge" => "knowledge",
         "Literal" => "literal",
         "Episode" => "episode",
         _ => return None,
@@ -193,14 +167,11 @@ mod tests {
     use super::{identity_kind_from_labels, split_camel_case};
 
     #[test]
-    fn identity_kind_from_labels_prefers_element_over_spike() {
-        assert_eq!(
-            identity_kind_from_labels(["Knowledge", "Element"]),
-            Some("Element")
-        );
+    fn identity_kind_from_labels_recognizes_only_node_kinds() {
+        assert_eq!(identity_kind_from_labels(["Element"]), Some("Element"));
         assert_eq!(identity_kind_from_labels(["Class"]), Some("Class"));
         assert_eq!(identity_kind_from_labels(["Property"]), Some("Property"));
-        assert_eq!(identity_kind_from_labels(["Knowledge"]), Some("Knowledge"));
+        assert_eq!(identity_kind_from_labels(["Knowledge"]), None);
         assert_eq!(identity_kind_from_labels(["Insight", "Pattern"]), None);
         assert_eq!(identity_kind_from_labels(["Literal"]), None);
     }
