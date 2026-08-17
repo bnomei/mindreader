@@ -23,6 +23,7 @@ use std::collections::HashSet;
 /// In-process ranked search (`layers` here is the request visibility union).
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SearchArgs {
+    /// Request visibility union (named `layers` here; MCP wire field is `scope`).
     pub layers: Vec<String>,
     #[serde(default)]
     pub text: Option<String>,
@@ -36,25 +37,36 @@ pub struct SearchArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecallArgs {
+    /// Request visibility union; empty is global-only.
     pub scope: Vec<String>,
+    /// Lexical selector; mutually exclusive with the other four selectors.
     #[serde(default)]
     pub text: Option<String>,
+    /// 1–20 node IRIs; hops applies only here.
     #[serde(default)]
     pub iris: Option<Vec<String>>,
+    /// Catalog (`Class`/`Property`) or ranked non-schema label filter.
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// Starting node IRI for bounded graph walk; `p` and `depth` apply only here.
     #[serde(default)]
     pub around: Option<String>,
+    /// IRI mode only: `0` lookup facts, `1` also fill top-level `facts[]`.
     #[serde(default)]
     pub hops: Option<u32>,
+    /// Around mode only: predicate names or IRIs applied before the fact limit.
     #[serde(default)]
     pub p: Option<Vec<String>>,
+    /// Around mode only: traversal depth 1..=3.
     #[serde(default)]
     pub depth: Option<u32>,
+    /// Node or fact IRI whose current and `validTo` facts are returned.
     #[serde(default)]
     pub history: Option<String>,
+    /// `concise` or `detailed`; omitted defaults to detailed.
     #[serde(default)]
     pub detail: Option<String>,
+    /// Maximum facts; default 20, at most 100.
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -228,6 +240,7 @@ pub fn is_schema_catalog_labels(labels: &[String]) -> bool {
         })
 }
 
+/// Validate, sort, and stringify the request `scope` used as Cypher `$layers`.
 fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
     Ok(validate_layer_ids(raw)?
         .into_iter()
@@ -246,6 +259,7 @@ fn lucene_query(text: &str) -> String {
     }
 }
 
+/// Phrase-quote user text and escape Lucene operators so they stay literals.
 fn lucene_escape(text: &str) -> String {
     let mut out = String::from("\"");
     for ch in text.chars() {
@@ -258,6 +272,7 @@ fn lucene_escape(text: &str) -> String {
     out
 }
 
+/// Invert the Cypher Spike rank integer back to a label for the fact envelope.
 fn spike_from_rank(rank: i64) -> Option<String> {
     match rank {
         4 => Some("Knowledge".into()),
@@ -268,6 +283,7 @@ fn spike_from_rank(rank: i64) -> Option<String> {
     }
 }
 
+/// Full-text node, fact, and exact-property candidates for ranked text recall.
 const TEXT_CANDIDATES: &str = r#"
 CALL {
   CALL db.index.fulltext.queryNodes('wakeup_nodes', $q) YIELD node, score
@@ -291,11 +307,13 @@ CALL {
 WITH s, r, o, max(indexScore) AS indexScore
 "#;
 
+/// Unfiltered current-edge scan used when ranking by labels only.
 const LABEL_CANDIDATES: &str = r#"
 MATCH (s:Entity)-[r]->(o:Entity)
 WITH s, r, o, 1.0 AS indexScore
 "#;
 
+/// Shared rank tail: current `ASSERTS`/`ABOUT`, endpoint closure, Spike then weight then score.
 const RANK_AND_LIMIT: &str = r#"
 WHERE r.validTo IS NULL
   AND (type(r) = 'ASSERTS' OR type(r) = 'ABOUT')

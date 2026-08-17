@@ -35,11 +35,16 @@ use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 use tokio::time::timeout;
 
+/// Per-invoke ceiling applied only to MCP `#[tool]` handlers via [`Mindreader::invoke`].
 const INVOKE_TIMEOUT: Duration = Duration::from_secs(45);
+/// Sustained token refill for the process-local MCP invoke limiter.
 const RATE_LIMIT_PER_MINUTE: f64 = 120.0;
+/// Burst capacity of the same limiter (20 tokens).
 const RATE_LIMIT_BURST: f64 = 20.0;
+/// Protocol versions this process will negotiate; initialize rejects anything else.
 const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
 
+/// Reject initialize requests that are not in [`SUPPORTED_PROTOCOL_VERSIONS`].
 fn require_supported_protocol(requested: ProtocolVersion) -> Result<(), McpError> {
     if SUPPORTED_PROTOCOL_VERSIONS.contains(&requested) {
         Ok(())
@@ -51,10 +56,12 @@ fn require_supported_protocol(requested: ProtocolVersion) -> Result<(), McpError
     }
 }
 
+/// Wrap a plain object schema; callers must not introduce `anyOf`/`oneOf`/`allOf`.
 fn object_schema(value: serde_json::Value) -> Arc<rmcp::model::JsonObject> {
     Arc::new(rmcp::model::object(value))
 }
 
+/// `scope` array: empty is global-only; named ids are an OR union of kebab-case layers.
 fn scope_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "array",
@@ -67,12 +74,14 @@ fn scope_schema() -> serde_json::Value {
     })
 }
 
+/// Membership add/remove list using the same layer-id grammar as `scope`.
 fn layer_list_schema(description: &str) -> serde_json::Value {
     let mut schema = scope_schema();
     schema["description"] = Value::String(description.to_string());
     schema
 }
 
+/// Closed `{kind, iri}` handle schema; `kind` is an enum so hosts never see a union.
 fn target_schema_with_kinds(kinds: &[&str], description: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -86,6 +95,7 @@ fn target_schema_with_kinds(kinds: &[&str], description: &str) -> serde_json::Va
     })
 }
 
+/// Pasteable node-or-fact handle advertised to judge and place.
 fn target_schema() -> serde_json::Value {
     target_schema_with_kinds(
         &["node", "fact"],
@@ -93,10 +103,12 @@ fn target_schema() -> serde_json::Value {
     )
 }
 
+/// Pasteable node handle (`kind=node`) used by unify review and unify inputs.
 fn node_target_schema(description: &str) -> serde_json::Value {
     target_schema_with_kinds(&["node"], description)
 }
 
+/// Pasteable current fact handle (`kind=fact`) used by revise, withdraw, and results.
 fn fact_target_schema() -> serde_json::Value {
     target_schema_with_kinds(
         &["fact"],
@@ -104,6 +116,7 @@ fn fact_target_schema() -> serde_json::Value {
     )
 }
 
+/// ASCII Neo4j label token; interpolated labels are still allowlisted at runtime.
 fn label_schema() -> serde_json::Value {
     json!({
         "type": "string",
@@ -112,6 +125,7 @@ fn label_schema() -> serde_json::Value {
     })
 }
 
+/// Non-empty unique predicate names or IRIs (around-mode `p`).
 fn predicate_list_schema(description: &str) -> serde_json::Value {
     json!({
         "type": "array",
@@ -122,6 +136,7 @@ fn predicate_list_schema(description: &str) -> serde_json::Value {
     })
 }
 
+/// Tagged `kind=node` subject bag; runtime requires `iri` or `name`.
 fn entity_input_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -137,6 +152,7 @@ fn entity_input_schema() -> serde_json::Value {
     })
 }
 
+/// Tagged `node` or `literal` bag without schema unions; mixed fields fail at runtime.
 fn object_input_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
@@ -154,6 +170,7 @@ fn object_input_schema() -> serde_json::Value {
     })
 }
 
+/// Host-compatible `memory_write` input: `facts[]` plus call-level `scope`.
 fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
     // Host wrappers drop the whole server if any inputSchema uses anyOf.
     object_schema(serde_json::json!({
@@ -187,6 +204,7 @@ fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Shared `isError` fields merged into every advertised output schema.
 fn error_envelope_properties() -> serde_json::Map<String, Value> {
     let Value::Object(map) = json!({
         "ok": { "type": "boolean" },
@@ -201,6 +219,7 @@ fn error_envelope_properties() -> serde_json::Map<String, Value> {
     map
 }
 
+/// Successful tool fields plus the recoverable-error envelope; `ok` is required.
 fn schema_out(mut properties: serde_json::Map<String, Value>) -> Arc<rmcp::model::JsonObject> {
     for (key, value) in error_envelope_properties() {
         properties.entry(key).or_insert(value);
@@ -213,6 +232,7 @@ fn schema_out(mut properties: serde_json::Map<String, Value>) -> Arc<rmcp::model
     }))
 }
 
+/// Object-map helper so output schemas stay literal JSON without extra cloning.
 fn props(value: Value) -> serde_json::Map<String, Value> {
     match value {
         Value::Object(map) => map,
@@ -220,6 +240,7 @@ fn props(value: Value) -> serde_json::Map<String, Value> {
     }
 }
 
+/// Agent-facing node or literal envelope, including mutability and pasteable target.
 fn node_schema() -> Value {
     json!({
         "type": "object",
@@ -243,6 +264,7 @@ fn node_schema() -> Value {
     })
 }
 
+/// Serialized fact relationship used in paths, conflicts, and `about` rows.
 fn relationship_schema() -> Value {
     json!({
         "type": "object",
@@ -263,6 +285,7 @@ fn relationship_schema() -> Value {
     })
 }
 
+/// One set-valued alternative shown in `review.alternatives` (not a contradiction until asked).
 fn conflict_schema() -> Value {
     json!({
         "type": "object",
@@ -276,6 +299,7 @@ fn conflict_schema() -> Value {
     })
 }
 
+/// Agent-facing fact envelope: pasteable target, endpoints, memberships, and judgment flags.
 fn fact_schema() -> Value {
     json!({
         "type": "object",
@@ -302,12 +326,14 @@ fn fact_schema() -> Value {
     })
 }
 
+/// Fact envelope or null, used when a no-op revise returns no replacement body.
 fn nullable_fact_schema() -> Value {
     let mut schema = fact_schema();
     schema["type"] = json!(["object", "null"]);
     schema
 }
 
+/// Neighbor Spike context attached to ranked recall (`about[]`).
 fn about_schema() -> Value {
     json!({
         "type": "object",
@@ -323,6 +349,7 @@ fn about_schema() -> Value {
     })
 }
 
+/// Provenance Episode for a state-changing mutation; null on no-op.
 fn episode_schema() -> Value {
     json!({
         "type": ["object", "null"],
@@ -342,10 +369,12 @@ fn episode_schema() -> Value {
     })
 }
 
+/// `{kind: node, iri}` handle used in unify inputs and the paste bag.
 fn node_handle_schema(description: &str) -> Value {
     target_schema_with_kinds(&["node"], description)
 }
 
+/// Neutral paste bag; empty arrays and nulls are unused roles, not commands.
 fn handles_schema() -> Value {
     json!({
         "type": "object",
@@ -387,6 +416,7 @@ fn handles_schema() -> Value {
     })
 }
 
+/// Recall verbosity: `concise` thins endpoints and drops `about`; `detailed` is the full envelope.
 fn detail_schema() -> Value {
     json!({
         "type": "string",
@@ -396,6 +426,7 @@ fn detail_schema() -> Value {
     })
 }
 
+/// Advisory unify suggestions and set-valued alternatives attached to write/revise.
 fn review_schema() -> Value {
     json!({
         "type": "object",
@@ -433,6 +464,7 @@ fn review_schema() -> Value {
     })
 }
 
+/// Batch counts for judge and place (`requested` / `changed` / `noop`).
 fn summary_schema() -> Value {
     json!({
         "type": "object",
@@ -451,12 +483,14 @@ struct TokenBucket {
     inner: Mutex<TokenBucketState>,
 }
 
+/// Token balance and last refill instant for the process-local limiter.
 struct TokenBucketState {
     tokens: f64,
     last: Instant,
 }
 
 impl TokenBucket {
+    /// Start full (burst 20) so the first 20 invokes do not wait on refill.
     fn new() -> Self {
         Self {
             inner: Mutex::new(TokenBucketState {
@@ -493,13 +527,17 @@ impl TokenBucket {
 /// Stdio MCP server: eight-tool router, lazy Neo4j service, and invoke limiter.
 #[derive(Clone)]
 pub struct Mindreader {
+    /// RMCP router for the eight `memory_*` tools.
     pub tool_router: ToolRouter<Self>,
+    /// Filled on first invoke or warmup; initialize/`tools/list` leave it empty.
     service: Arc<OnceCell<MemoryService>>,
     cfg: Config,
+    /// Process-local 120/min burst-20 bucket; never wraps in-process `tools::*`.
     limiter: Arc<TokenBucket>,
 }
 
 impl Mindreader {
+    /// Construct the eight-tool router without connecting to Neo4j.
     fn from_config(cfg: Config) -> Self {
         Self {
             tool_router: Self::tool_router(),
@@ -593,6 +631,7 @@ fn structured_error(reason: &str, message: impl std::fmt::Display) -> CallToolRe
     }))
 }
 
+/// Rate-limit `isError` that includes `retryAfterMs` from the token bucket.
 fn structured_error_with_retry_after(
     reason: &str,
     message: impl std::fmt::Display,
@@ -609,6 +648,7 @@ fn structured_error_with_retry_after(
     }))
 }
 
+/// Classify whether MCP may retry and whether the mutation is known not-applied.
 fn error_retry_metadata(reason: &str) -> (bool, &'static str) {
     match reason {
         "connect_failed" | "rate_limited" | "concurrent_mutation" => (true, "not_applied"),
@@ -624,10 +664,12 @@ fn error_retry_metadata(reason: &str) -> (bool, &'static str) {
     }
 }
 
+/// Lazy Neo4j connect/bootstrap failure advertised as retryable `connect_failed`.
 fn map_connect_error(error: Error) -> CallToolResult {
     structured_error("connect_failed", error)
 }
 
+/// Stamp `ok:true` on success objects, or map application errors to structured `isError`.
 fn map_tool_result(result: AppResult<Value>) -> CallToolResult {
     match result {
         Ok(Value::Object(mut value)) => {
@@ -660,6 +702,7 @@ fn classify_tool_error(error: &Error) -> &'static str {
     }
 }
 
+/// Walk a boxed source chain so `Error::Context` still yields a stable MCP `reason`.
 fn classify_boxed_source(source: &(dyn StdError + Send + Sync + 'static)) -> &'static str {
     if let Some(error) = source.downcast_ref::<Error>() {
         return classify_tool_error(error);
@@ -690,6 +733,7 @@ fn classify_boxed_source(source: &(dyn StdError + Send + Sync + 'static)) -> &'s
     "operation"
 }
 
+/// Host-compatible `memory_recall` input: `scope` plus exactly one runtime selector.
 fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -753,6 +797,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Host-compatible `memory_recall_semantic` input; `text` is required and embedded remotely.
 fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -784,6 +829,7 @@ fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Host-compatible `memory_revise` input: fact handle plus replacement object.
 fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -800,6 +846,7 @@ fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Host-compatible `memory_withdraw` input; runtime requires exactly one of `target` or `subject`.
 fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -815,6 +862,7 @@ fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Host-compatible `memory_judge` input: 1–20 unique `strengthen`/`weaken` ratings.
 fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -841,6 +889,7 @@ fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Host-compatible `memory_place` input: visibility `scope` plus membership `edits`.
 fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -868,6 +917,7 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Host-compatible `memory_unify` input; no `scope` because unify is database-wide.
 fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -880,6 +930,7 @@ fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
+/// Closed-world recall output: facts, lookups, catalog nodes, and the paste bag.
 fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "mode": { "type": "string", "enum": ["text", "iris", "labels", "catalog", "around", "history"] },
@@ -921,6 +972,7 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
     })))
 }
 
+/// Semantic recall output; `mode` is always `semantic` and activations may have been updated.
 fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "mode": { "type": "string", "enum": ["semantic"] },
@@ -961,6 +1013,7 @@ fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
     })))
 }
 
+/// Write output: one Episode when changed, written facts, and advisory review.
 fn schema_out_memory_write() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "scope": scope_schema(),
@@ -972,6 +1025,7 @@ fn schema_out_memory_write() -> Arc<rmcp::model::JsonObject> {
     })))
 }
 
+/// Revise output: current and previous fact handles plus optional replacement body.
 fn schema_out_memory_revise() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "scope": scope_schema(),
@@ -985,6 +1039,7 @@ fn schema_out_memory_revise() -> Arc<rmcp::model::JsonObject> {
     })))
 }
 
+/// Withdraw output: soft-retired fact handles; Episode is null when nothing changed.
 fn schema_out_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "scope": scope_schema(),
@@ -997,6 +1052,7 @@ fn schema_out_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     })))
 }
 
+/// Judge output: per-rating before/after weights and a single Episode.
 fn schema_out_memory_judge() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "scope": scope_schema(),
@@ -1024,6 +1080,7 @@ fn schema_out_memory_judge() -> Arc<rmcp::model::JsonObject> {
     })))
 }
 
+/// Place output: per-edit before/after memberships and a single Episode if any changed.
 fn schema_out_memory_place() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "scope": scope_schema(),
@@ -1051,6 +1108,7 @@ fn schema_out_memory_place() -> Arc<rmcp::model::JsonObject> {
     })))
 }
 
+/// Unify output: surviving node after a permanent same-kind merge.
 fn schema_out_memory_unify() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
         "noop": { "type": "boolean" },
@@ -1193,6 +1251,7 @@ impl Mindreader {
 
 #[tool_handler]
 impl ServerHandler for Mindreader {
+    /// Advertise tools-only capabilities, protocol 2026-07-28, and the eight-tool instructions.
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
@@ -1205,10 +1264,12 @@ impl ServerHandler for Mindreader {
             )
     }
 
+    /// Negotiate only [`SUPPORTED_PROTOCOL_VERSIONS`]; unknown versions fail initialize.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
+    /// Handshake without Neo4j: version check, then return [`get_info`].
     async fn initialize(
         &self,
         request: InitializeRequestParams,

@@ -54,6 +54,7 @@ const BOOTSTRAP_SEEDED_IRIS: &[&str] = &[
     "mindreader:property/SUPERSEDES",
 ];
 
+/// Escape a display name and append `~2` for the keyword merge-candidate index.
 fn lucene_fuzzy_term(name: &str) -> String {
     let mut query = String::with_capacity(name.len() + 3);
     for character in name.to_lowercase().chars() {
@@ -70,7 +71,9 @@ fn lucene_fuzzy_term(name: &str) -> String {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnifyArgs {
+    /// Same-kind node permanently absorbed; bootstrap-seeded IRIs cannot be sources.
     pub source: NodeHandle,
+    /// Surviving node whose IRI and name remain.
     pub target: NodeHandle,
 }
 
@@ -97,6 +100,7 @@ pub async fn memory_unify(graph: &Graph, args: UnifyArgs) -> Result<Value> {
     unreachable!("bounded retry loop always returns")
 }
 
+/// Retry unify on Neo4j transients and lock-set drift (`ConcurrentMutation`).
 fn is_transient(error: &Error) -> bool {
     error.is_transient_neo4j() || matches!(error, Error::ConcurrentMutation(_))
 }
@@ -138,6 +142,7 @@ async fn memory_unify_once(graph: &Graph, args: &UnifyArgs) -> Result<Value> {
     }
 }
 
+/// Subject/predicate guards for every current edge that names `source` or `target`.
 async fn affected_fact_locks_in_txn(
     txn: &mut Txn,
     source_iri: &str,
@@ -175,6 +180,7 @@ async fn affected_fact_locks_in_txn(
     Ok(locks)
 }
 
+/// Absorb `source` into `target` in one transaction: lock, merge nodes, rewrite predicates, consolidate dupes.
 async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Result<Value> {
     let initial_affected = affected_fact_locks_in_txn(txn, source_iri, target_iri).await?;
     let mut locks = vec![
@@ -427,6 +433,7 @@ fn require_compatible_property_merge(source_iri: &str, target_iri: &str) -> Resu
     Ok(())
 }
 
+/// True for Class/Property IRIs seeded at bootstrap; they may only be unify targets.
 fn is_bootstrap_seeded(iri: &str) -> bool {
     BOOTSTRAP_SEEDED_IRIS.contains(&iri)
 }
@@ -446,10 +453,12 @@ fn reject_internal_node(node: &Node, field: &str) -> Result<()> {
     Ok(())
 }
 
+/// Signed judgment weight stored on the node (saturating-added onto the survivor).
 fn node_weight(node: &Node) -> Result<i64> {
     Ok(node.get::<i64>("weight")?)
 }
 
+/// Signed judgment weight stored on a current fact (saturating-added during dupe collapse).
 fn relation_weight(relation: &Relation) -> Result<i64> {
     Ok(relation.get::<i64>("weight")?)
 }
@@ -467,6 +476,7 @@ fn merge_memberships(left: &[String], right: &[String]) -> Vec<String> {
         .collect()
 }
 
+/// Current fact that collided with another `(s, type, property, o)` after unify.
 #[derive(Clone)]
 struct DuplicateFact {
     iri: String,
@@ -475,6 +485,7 @@ struct DuplicateFact {
     episodes: Vec<String>,
 }
 
+/// Membership, weight, and provenance written onto the surviving duplicate fact.
 #[derive(Debug, PartialEq)]
 struct SurvivorUpdate {
     iri: String,
@@ -483,12 +494,14 @@ struct SurvivorUpdate {
     provenance: Vec<String>,
 }
 
+/// Soft-retired duplicate fact (`validTo`) pointing at the surviving IRI.
 #[derive(Debug, PartialEq)]
 struct DuplicateRetirement {
     iri: String,
     survivor: String,
 }
 
+/// Keep the lowest IRI in each exact-triple group; merge memberships, weights, and provenance.
 fn duplicate_consolidation_plan(
     groups: &mut BTreeMap<(String, String, String, String), Vec<DuplicateFact>>,
 ) -> (Vec<SurvivorUpdate>, Vec<DuplicateRetirement>) {
@@ -519,6 +532,7 @@ fn duplicate_consolidation_plan(
     (updates, retirements)
 }
 
+/// Bolt maps for the batched survivor `SET` after duplicate collapse.
 fn survivor_update_params(updates: &[SurvivorUpdate]) -> Vec<HashMap<String, BoltType>> {
     updates
         .iter()
@@ -533,6 +547,7 @@ fn survivor_update_params(updates: &[SurvivorUpdate]) -> Vec<HashMap<String, Bol
         .collect()
 }
 
+/// Bolt maps that soft-retire absorbed duplicate facts (`validTo` + `mergedInto`).
 fn duplicate_retirement_params(
     retirements: &[DuplicateRetirement],
 ) -> Vec<HashMap<String, String>> {
@@ -547,6 +562,7 @@ fn duplicate_retirement_params(
         .collect()
 }
 
+/// Collapse exact current triples that became duplicates after the node merge.
 async fn consolidate_current_duplicates(
     txn: &mut Txn,
     target_iri: &str,

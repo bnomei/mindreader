@@ -36,12 +36,17 @@ pub const MAX_SEMANTIC_TEXT_BYTES: usize = 32 * 1024;
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticSearchArgs {
+    /// Request visibility union; empty is global-only.
     pub scope: Vec<String>,
+    /// Query text sent to the embedding provider (trimmed, byte-bounded).
     pub text: String,
+    /// Optional labels used to filter fused facts; catalog labels are not special here.
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// `concise` or `detailed`; omitted defaults to detailed.
     #[serde(default)]
     pub detail: Option<String>,
+    /// Maximum fused facts; default 20, at most 100.
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -86,6 +91,7 @@ impl SemanticRuntime {
     }
 }
 
+/// One live activation neighbor: Neo4j element id, remembered fact IRIs, and cosine score.
 #[derive(Debug, Clone)]
 struct Activation {
     element_id: String,
@@ -93,6 +99,7 @@ struct Activation {
     similarity: f64,
 }
 
+/// Trim query text and reject empty or oversized UTF-8 payloads before any HTTP call.
 fn validate_semantic_text(text: &str) -> Result<String> {
     let text = text.trim();
     if text.is_empty() {
@@ -310,6 +317,7 @@ fn add_ranked(
     }
 }
 
+/// Activation element ids whose remembered fact IRIs resolved under this `scope`.
 fn contributing_activation_ids(
     activations: &[Activation],
     facts: &HashMap<String, Value>,
@@ -564,6 +572,7 @@ async fn refresh_recalled_activations(
     Ok(())
 }
 
+/// Load a still-live activation vector so convergence can average embeddings.
 async fn load_activation_embedding(graph: &Graph, element_id: &str) -> Result<Option<Vec<f64>>> {
     fetch_one(
         graph,

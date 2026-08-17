@@ -75,6 +75,7 @@ fn parse_options() -> Result<Options> {
     })
 }
 
+/// Min / p50 / p95 / max of millisecond samples; used as a ranking-regression oracle input.
 fn summary(mut timings_ms: Vec<f64>) -> Value {
     timings_ms.sort_by(|left, right| left.total_cmp(right));
     let percentile = |numerator: usize, denominator: usize| {
@@ -189,6 +190,7 @@ async fn seed(
         .collect())
 }
 
+/// Sample ranked `memory_recall` text search and fail if fact order leaves the weight oracle.
 async fn benchmark_search(
     service: &MemoryService,
     layer: &str,
@@ -261,6 +263,7 @@ async fn benchmark_search(
     Ok((summary(timings), reference))
 }
 
+/// Sample in-transaction fact-lock acquire latency for 1/4/16 triples (rolled back).
 async fn benchmark_locks(graph: &Graph, layer: &str, samples: usize) -> Result<Value> {
     let mut results = serde_json::Map::new();
     for fact_count in [1_usize, 4, 16] {
@@ -286,6 +289,7 @@ async fn benchmark_locks(graph: &Graph, layer: &str, samples: usize) -> Result<V
     Ok(Value::Object(results))
 }
 
+/// Sample advisory unify suggestions and require the seeded plural/singular pairs.
 async fn benchmark_suggestions(
     graph: &Graph,
     pairs: &[(String, String)],

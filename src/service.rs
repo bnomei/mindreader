@@ -25,8 +25,11 @@ use std::path::PathBuf;
 /// Shared graph handle plus optional embedding runtime for memory tools.
 #[derive(Clone)]
 pub struct MemoryService {
+    /// Connected Neo4j handle; MCP constructs this only after lazy bootstrap.
     graph: Graph,
+    /// Present when embedding credentials were loaded; otherwise semantic recall fails closed.
     semantic: Option<SemanticRuntime>,
+    /// Colocated `.env` path used in `missing_embedding` diagnostics (never logged as contents).
     secrets_path: PathBuf,
 }
 

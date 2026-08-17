@@ -19,10 +19,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Application error with preserved sources and retry-relevant variants.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// Wire or graph-precondition failure from [`crate::domain::DomainError`].
     #[error(transparent)]
     Domain(#[from] DomainError),
+    /// Driver-level Neo4j failure; transient kinds may be retried.
     #[error(transparent)]
     Neo4j(#[from] Neo4jError),
+    /// A returned row could not be decoded into the expected Bolt types.
     #[error("Neo4j row decoding failed: {0}")]
     Neo4jDecode(#[from] neo4rs::DeError),
     #[error(transparent)]
@@ -37,6 +40,7 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Http(#[from] reqwest::Error),
+    /// Remote embedding HTTP status with a truncated body; 429 maps to MCP `rate_limited`.
     #[error(
         "{provider} embedding request failed with HTTP {status}: {body} (request_id={request_id:?})"
     )]
@@ -46,14 +50,19 @@ pub enum Error {
         request_id: Option<String>,
         body: String,
     },
+    /// Missing or invalid native configuration (including required `NEO4J_PASSWORD`).
     #[error("{0}")]
     Configuration(String),
+    /// Embedding provider setup or request failure (MCP `missing_embedding` when no key).
     #[error("{0}")]
     Embedding(String),
+    /// Stored activation index space does not match this process.
     #[error("{0}")]
     EmbeddingSpace(String),
+    /// Bootstrap, Cypher identifier, or persistence invariant failure.
     #[error("{0}")]
     Graph(String),
+    /// Tool or adapter failure that is not a domain validation.
     #[error("{0}")]
     Operation(String),
     /// A concurrent writer invalidated a precondition; MCP may retry.
@@ -66,6 +75,7 @@ pub enum Error {
         #[source]
         source: Neo4jError,
     },
+    /// Operational wrapper that keeps the typed source for retry classification.
     #[error("{message}: {source}")]
     Context {
         message: String,
@@ -110,6 +120,7 @@ impl Error {
     }
 }
 
+/// Only typed Neo4j `Transient` kinds are retryable; untyped driver strings are not.
 fn neo4j_is_transient(error: &Neo4jError) -> bool {
     matches!(error, Neo4jError::Neo4j(error) if error.kind() == Neo4jErrorKind::Transient)
 }

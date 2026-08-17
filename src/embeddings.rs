@@ -19,9 +19,12 @@ use std::time::{Duration, SystemTime};
 use tokio::time::{sleep, timeout, Instant};
 use uuid::Uuid;
 
+/// Upper bound on a success body so a huge payload cannot be held in memory.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+/// Truncated error-body budget kept for `EmbeddingHttp` diagnostics.
 const MAX_ERROR_BYTES: usize = 512;
 
+/// Bounded retry and timeout budget for one embedding `embed` call.
 #[derive(Debug, Clone, Copy)]
 struct RetryPolicy {
     max_attempts: u32,
@@ -85,6 +88,7 @@ struct HttpEmbeddingProvider {
 }
 
 impl HttpEmbeddingProvider {
+    /// Build a reqwest client with provider timeouts and no library-level retry.
     fn new(
         provider: &'static str,
         endpoint: impl Into<String>,
@@ -109,6 +113,7 @@ impl HttpEmbeddingProvider {
         })
     }
 
+    /// POST one embedding request, honoring Retry-After and the operation deadline.
     async fn embed_inner(&self, text: &str) -> Result<Vec<f64>> {
         let body = json!({
             "input": text,
@@ -264,6 +269,7 @@ impl EmbeddingProvider for HttpEmbeddingProvider {
     }
 }
 
+/// Read a header as UTF-8 text; invalid values are ignored rather than failing the call.
 fn header_text(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
@@ -286,6 +292,7 @@ fn should_retry_response(provider: &str, status: StatusCode, headers: &HeaderMap
     ) || status.is_server_error()
 }
 
+/// Retry transport timeouts, connect, request, and body errors; never retry builder or redirect bugs.
 fn retryable_reqwest_error(error: &reqwest::Error) -> bool {
     !error.is_builder()
         && !error.is_redirect()
@@ -309,6 +316,7 @@ fn retry_after(headers: &HeaderMap, now: SystemTime) -> Option<Duration> {
         .map(|date| date.duration_since(now).unwrap_or_default())
 }
 
+/// Uniform jitter in `[0, max_jitter]` so concurrent retries do not stampede.
 fn sampled_jitter(policy: RetryPolicy) -> Duration {
     let maximum = policy.max_jitter.as_millis() as u64;
     if maximum == 0 {
@@ -319,6 +327,7 @@ fn sampled_jitter(policy: RetryPolicy) -> Duration {
     Duration::from_millis(sample % (maximum + 1))
 }
 
+/// Server Retry-After wins; otherwise exponential backoff from `base_delay`, plus jitter.
 fn retry_delay(
     policy: RetryPolicy,
     attempt: u32,

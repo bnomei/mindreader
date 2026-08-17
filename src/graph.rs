@@ -85,7 +85,9 @@ const EMBEDDING_MARKER_KEY: &str = "embedding";
 /// Whether bootstrap may replace an incompatible semantic embedding space.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpaceReplace {
+    /// Drop the activation index and stored activations, then rebuild for this process.
     Allow,
+    /// Fail closed when the stored provider/model/dimension triple does not match.
     Refuse,
 }
 
@@ -279,6 +281,7 @@ async fn verify_required_apoc(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Read the stored provider/model/dimension triple from the embedding-space marker.
 fn read_embedding_marker(row: &Row) -> Result<(String, String, i64)> {
     Ok((
         row.get::<String>("provider")?,
@@ -287,6 +290,7 @@ fn read_embedding_marker(row: &Row) -> Result<(String, String, i64)> {
     ))
 }
 
+/// True when the stored activation space is exactly the incoming provider/model/dimension.
 fn marker_matches_space(
     provider: &str,
     model: &str,
@@ -431,6 +435,7 @@ async fn ensure_semantic_index(
     Ok(())
 }
 
+/// Fail closed unless the activation vector index is online on `SemanticActivation.embedding`.
 async fn verify_semantic_index(graph: &Graph) -> Result<()> {
     let row = fetch_one(
         graph,
@@ -461,6 +466,7 @@ async fn verify_semantic_index(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Require uniqueness constraints on meta keys, entity IRIs, and fact-lock keys.
 async fn verify_required_constraints(graph: &Graph) -> Result<()> {
     let rows = fetch_all(
         graph,
@@ -587,6 +593,7 @@ fn validate_model_version(version: i64) -> Result<()> {
     ))
 }
 
+/// Create the singleton-key uniqueness constraint used by the model marker node.
 async fn ensure_model_marker_constraint(graph: &Graph) -> Result<()> {
     graph
         .run(query(
@@ -597,6 +604,7 @@ async fn ensure_model_marker_constraint(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Require wakeup and merge-candidate full-text indexes to be online with the expected definition.
 async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
     let rows = fetch_all(
         graph,
@@ -671,6 +679,7 @@ async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
     Ok(())
 }
 
+/// Order-independent exact set equality for Neo4j index/constraint member lists.
 fn same_string_members(actual: &[String], expected: &[&str]) -> bool {
     actual.len() == expected.len()
         && expected
@@ -764,14 +773,17 @@ pub async fn fetch_all_txn(txn: &mut Txn, q: neo4rs::Query) -> Result<Vec<Row>> 
     Ok(rows)
 }
 
+/// Signed judgment weight on a node; missing values fail closed.
 fn node_weight(node: &Node) -> Result<i64> {
     Ok(node.get::<i64>("weight")?)
 }
 
+/// Signed judgment weight on a bounded current fact.
 fn relation_weight(rel: &Relation) -> Result<i64> {
     Ok(rel.get::<i64>("weight")?)
 }
 
+/// Signed judgment weight on a path edge (unbounded relationship).
 fn unbounded_relation_weight(rel: &UnboundedRelation) -> Result<i64> {
     Ok(rel.get::<i64>("weight")?)
 }
@@ -840,6 +852,7 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Result<Value> {
     Ok(obj)
 }
 
+/// Serialize a path edge as a fact envelope (`kind=fact`) with directed endpoint IRIs.
 fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Result<Value> {
     if from.is_empty() || to.is_empty() {
         return Err(graph_error!("path edge endpoints must have non-empty IRIs"));
@@ -863,6 +876,7 @@ fn unbounded_rel_json(rel: &UnboundedRelation, from: &str, to: &str) -> Result<V
     Ok(obj)
 }
 
+/// Require a stored node IRI; missing identity fails serialization.
 fn node_iri(node: &Node) -> Result<String> {
     Ok(node.get::<String>("iri")?)
 }
@@ -916,13 +930,16 @@ pub struct MergedNode {
     pub iri: String,
     pub name: String,
     pub labels: Vec<String>,
+    /// True when this MERGE created the node in the current transaction.
     pub created: bool,
+    /// Agent-facing node JSON including memberships and weight.
     pub json: Value,
 }
 
 /// Input for resolving or creating an entity node (IRI and/or name plus labels).
 #[derive(Debug, Clone, Default)]
 pub struct NodeSpec {
+    /// Existing IRI when known; otherwise a name is required to mint one.
     pub iri: Option<String>,
     pub name: Option<String>,
     pub labels: Vec<String>,
@@ -952,6 +969,7 @@ pub fn infer_kind(spec: &NodeSpec, fallback: &str) -> String {
     fallback.to_string()
 }
 
+/// Resolve IRI, display name, and allowlisted labels before MERGE; never mint an unnamed node.
 fn resolved_node_parts(
     spec: &NodeSpec,
     default_kind: &str,
@@ -997,6 +1015,7 @@ pub async fn merge_node_in_txn(
 ) -> Result<MergedNode> {
     let (iri, name, labels) = resolved_node_parts(spec, default_kind, extra_labels)?;
     let creation_marker = Uuid::new_v4().to_string();
+    // Class/Property MERGE always forces stub=false and layers=[] so catalog nodes stay global.
     let row = fetch_one_txn(
         txn,
         query(
@@ -1146,6 +1165,7 @@ pub(crate) fn fact_lock_specs(facts: &[(String, String, String)]) -> Vec<FactLoc
     locks
 }
 
+/// Parameter maps for the ordered `MERGE` of `FactLock` nodes.
 fn fact_lock_params(locks: &[FactLockSpec]) -> Vec<HashMap<String, String>> {
     locks
         .iter()
@@ -1206,11 +1226,15 @@ pub async fn acquire_fact_locks_in_txn(
 /// Provenance episode created for a state-changing mutation (none for no-ops).
 #[derive(Debug, Clone)]
 pub struct Episode {
+    /// `mindreader:episode/…` identity recorded on changed facts.
     pub iri: String,
+    /// Timestamp string returned by Neo4j for the Episode node.
     pub at: String,
+    /// MCP tool name that created this Episode (`memory_write`, …).
     pub tool: String,
 }
 
+/// Create a global Episode node (`layers=[]`) attributed to one MCP mutation tool.
 fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
     query(
         r#"
@@ -1232,6 +1256,7 @@ fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
     .param("note", note.map(|s| s.to_string()))
 }
 
+/// Decode the Episode identity returned by [`episode_query`].
 fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
     Ok(Episode {
         iri: row.get::<String>("iri")?,

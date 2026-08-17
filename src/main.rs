@@ -10,6 +10,7 @@ use mindreader::Mindreader;
 use rmcp::{transport::io::stdio, ServiceExt};
 use serde_json::json;
 
+/// Stdout-legal `--help` text; only printed on the explicit CLI exit.
 const HELP: &str = "mindreader - deterministic Neo4j-backed memory MCP server
 
 Usage: mindreader [OPTIONS]

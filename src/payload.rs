@@ -30,6 +30,7 @@ impl Detail {
         }
     }
 
+    /// Wire token stamped on recall results (`detailed` or `concise`).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Detailed => "detailed",
@@ -52,6 +53,7 @@ pub fn record_mutable(memberships: &[String], request_scope: &[String]) -> bool 
     }
 }
 
+/// Read the agent-facing `scope` array (graph storage still uses `layers`).
 fn memberships_of(value: &Value) -> Result<Vec<String>> {
     let scope = value
         .get("scope")
@@ -101,6 +103,7 @@ pub fn decorate_node(node: &mut Value, request_scope: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Fail closed on a node or literal endpoint that is missing identity, memberships, or weight.
 fn validate_endpoint(value: &Value) -> Result<()> {
     match value.get("kind").and_then(Value::as_str) {
         Some("literal") => {
@@ -144,6 +147,7 @@ fn validate_endpoint(value: &Value) -> Result<()> {
     Ok(())
 }
 
+/// Require a non-empty string field; used to keep handle envelopes pasteable.
 fn nonempty_string<'a>(value: &'a Value, field: &str, context: &str) -> Result<&'a str> {
     value
         .get(field)
@@ -152,6 +156,7 @@ fn nonempty_string<'a>(value: &'a Value, field: &str, context: &str) -> Result<&
         .ok_or_else(|| crate::operation_error!("{context} is missing non-empty {field}"))
 }
 
+/// Require an array of strings (labels); mixed types fail closed.
 fn string_array(value: &Value, field: &str, context: &str) -> Result<()> {
     let values = value
         .get(field)
@@ -165,6 +170,7 @@ fn string_array(value: &Value, field: &str, context: &str) -> Result<()> {
     Ok(())
 }
 
+/// Accept only `{kind, iri}` — extra fields make a handle unsafe to paste back.
 fn exact_handle_iri<'a>(value: &'a Value, kind: &str, context: &str) -> Result<&'a str> {
     let object = value
         .as_object()
@@ -221,6 +227,7 @@ pub fn node_target(node: &Value) -> Option<Value> {
     (exact_handle_iri(target, "node", "node target").ok()? == iri).then(|| target.clone())
 }
 
+/// Deduplicate advisory unify pairs while requiring exact pasteable node handles.
 fn unify_pairs(review_unify: &[Value]) -> Result<Vec<Value>> {
     let mut seen = HashSet::new();
     let mut pairs = Vec::new();
@@ -244,6 +251,7 @@ fn unify_pairs(review_unify: &[Value]) -> Result<Vec<Value>> {
     Ok(pairs)
 }
 
+/// Append a handle once per IRI so the paste bag stays first-seen order.
 fn push_unique_handle(handles: &mut Vec<Value>, seen: &mut HashSet<String>, handle: Value) {
     let Some(iri) = handle.get("iri").and_then(Value::as_str) else {
         return;
@@ -334,6 +342,7 @@ fn collect_recall_facts(result: &Value) -> Result<Vec<Value>> {
     Ok(facts)
 }
 
+/// Stamp `current`/`rateable`/`mutable` on every fact in a result or lookup envelope.
 fn decorate_facts_in(value: &mut Value, request_scope: &[String]) -> Result<()> {
     let facts = value
         .get_mut("facts")
@@ -349,6 +358,7 @@ fn decorate_facts_in(value: &mut Value, request_scope: &[String]) -> Result<()> 
     Ok(())
 }
 
+/// Clone a required envelope field; missing keys fail closed rather than thinning.
 fn required_field(value: &Value, field: &str, context: &str) -> Result<Value> {
     value
         .get(field)
@@ -356,6 +366,7 @@ fn required_field(value: &Value, field: &str, context: &str) -> Result<Value> {
         .ok_or_else(|| crate::operation_error!("{context} is missing {field}"))
 }
 
+/// Concise endpoint: keep identity and pasteable target; drop labels, weight, and memberships.
 fn thin_endpoint(value: &Value) -> Result<Value> {
     validate_endpoint(value)?;
     if value.get("kind").and_then(Value::as_str) == Some("literal") {
@@ -380,6 +391,7 @@ fn thin_endpoint(value: &Value) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
+/// Concise fact: keep the handle, `s`/`p`/`o`, mutability flags, and optional Spike/weight/`validTo`.
 fn thin_fact(fact: &Value) -> Result<Value> {
     let mut out = Map::new();
     for key in ["target", "p", "scope", "current", "rateable", "mutable"] {
@@ -401,6 +413,7 @@ fn thin_fact(fact: &Value) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
+/// Concise node: keep the handle, labels, memberships, and mutability flags.
 fn thin_node(node: &Value) -> Result<Value> {
     if node.get("kind").and_then(Value::as_str) == Some("literal") {
         return thin_endpoint(node);

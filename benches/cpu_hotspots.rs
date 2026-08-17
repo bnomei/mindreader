@@ -11,6 +11,7 @@ fn main() {
     divan::main();
 }
 
+/// Non-zero finite vector of `dimension` so L2 normalization stays in the happy path.
 fn input(dimension: usize) -> Vec<f64> {
     (0..dimension)
         .map(|index| (index % 31 + 1) as f64)
@@ -18,6 +19,7 @@ fn input(dimension: usize) -> Vec<f64> {
 }
 
 #[divan::bench(args = DIMENSIONS)]
+/// Production L2-normalize across typical embedding widths (no Neo4j).
 fn normalize_production(bencher: Bencher<'_, '_>, dimension: usize) {
     bencher
         .with_inputs(|| input(dimension))

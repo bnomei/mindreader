@@ -43,15 +43,18 @@ impl LayerId {
         Ok(Self(value))
     }
 
+    /// Borrow the validated kebab-case colon-namespaced id.
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
+    /// Consume the wrapper and return the validated id string.
     pub fn into_string(self) -> String {
         self.0
     }
 }
 
+/// True when every colon-separated segment is lowercase kebab-case (no empty, edge, or double dashes).
 fn is_valid_layer_id(value: &str) -> bool {
     value.split(':').all(|segment| {
         !segment.is_empty()
@@ -134,6 +137,7 @@ impl PredicateRef {
         Ok(Self(iri))
     }
 
+    /// Canonical `mindreader:property/…` IRI (or the caller-supplied qualified IRI).
     pub fn iri(&self) -> &str {
         &self.0
     }
@@ -143,7 +147,9 @@ impl PredicateRef {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeHandle {
+    /// Must be `"node"`; relationship IRIs are rejected by [`Self::iri`].
     pub kind: String,
+    /// Scheme-qualified node IRI (not `mindreader:relationship/…`).
     pub iri: String,
 }
 
@@ -178,6 +184,7 @@ impl NodeHandle {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct EntityInput {
+    /// Must be `"node"`; literals use [`ObjectInput`].
     pub kind: String,
     #[serde(default)]
     pub iri: Option<String>,
@@ -191,6 +198,7 @@ pub struct EntityInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectInput {
+    /// `"node"` or `"literal"`; mixed fields fail at [`ObjectValue::from_input`].
     pub kind: String,
     #[serde(default)]
     pub iri: Option<String>,
@@ -198,8 +206,10 @@ pub struct ObjectInput {
     pub name: Option<String>,
     #[serde(default)]
     pub labels: Vec<String>,
+    /// Literal lexical form; forbidden on `kind=node`.
     #[serde(default)]
     pub value: Option<String>,
+    /// Literal datatype; defaults to `xsd:string` when omitted.
     #[serde(default)]
     pub datatype: Option<String>,
 }
@@ -207,8 +217,11 @@ pub struct ObjectInput {
 /// Validated node reference after `kind=node` and IRI/name checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityRef {
+    /// Explicit scheme-qualified IRI when the caller supplied one.
     pub iri: Option<String>,
+    /// Display name used to mint an IRI when `iri` is absent.
     pub name: Option<String>,
+    /// Extra Neo4j labels; identity kind still prefers Class/Property/Element/Spike.
     pub labels: Vec<String>,
 }
 
@@ -294,6 +307,7 @@ impl ObjectValue {
     }
 }
 
+/// Require a non-empty IRI or name, a scheme-qualified IRI when present, and ASCII label tokens.
 fn validate_entity_parts(
     iri: Option<String>,
     name: Option<String>,
@@ -372,6 +386,7 @@ impl SpikeRank {
             .transpose()
     }
 
+    /// Neo4j Spike label used in ranking (`Knowledge` highest).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Signal => "Signal",

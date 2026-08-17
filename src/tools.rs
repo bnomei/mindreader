@@ -46,6 +46,7 @@ const PREDICATE_USAGE_PROPERTY: &str = "mindreader:property/predicate-usage";
 const CONTRADICTS_PROPERTY: &str = "mindreader:property/CONTRADICTS";
 const MAX_WRITE_FACTS: usize = 20;
 
+/// Subject, predicate-usage, membership, and optional CONTRADICTS guards for one write triple.
 fn write_fact_lock_requests(
     subject_iri: &str,
     prop_iri: &str,
@@ -84,6 +85,7 @@ fn write_fact_lock_requests(
     locks
 }
 
+/// Write locks plus a membership guard on the previous object so revise cannot race withdraw.
 fn revision_fact_lock_requests(
     subject_iri: &str,
     prop_iri: &str,
@@ -100,6 +102,7 @@ fn revision_fact_lock_requests(
     locks
 }
 
+/// Subject-wide (`*`) or predicate-specific lock, plus predicate-usage when a property is named.
 fn withdrawal_fact_lock_requests(
     subject_iri: &str,
     predicate: Option<&str>,
@@ -133,10 +136,12 @@ fn reject_system_owned_predicate(predicate: &str) -> Result<()> {
     Ok(())
 }
 
+/// Retry only typed Neo4j transients; ambiguous commits stay non-retryable.
 fn is_transient_neo4j_error(error: &Error) -> bool {
     error.is_transient_neo4j()
 }
 
+/// Validate, sort, and stringify the request `scope` used as Cypher `$layers`.
 fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
     Ok(validate_layer_ids(raw)?
         .into_iter()
@@ -144,6 +149,7 @@ fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
         .collect())
 }
 
+/// Require 1..=20 facts before the write transaction starts.
 fn validate_write_args(args: &WriteArgs) -> Result<()> {
     if args.facts.is_empty() || args.facts.len() > MAX_WRITE_FACTS {
         return Err(DomainError::InvalidInput(format!(
@@ -154,6 +160,7 @@ fn validate_write_args(args: &WriteArgs) -> Result<()> {
     Ok(())
 }
 
+/// Canonicalize subject, predicate, and object IRIs and reject system-owned predicates.
 fn prepare_write_fact(fact: WriteFact) -> Result<PreparedWriteFact> {
     let predicate = PredicateRef::parse(&fact.p)?;
     reject_system_owned_predicate(predicate.iri())?;
@@ -216,6 +223,7 @@ fn effective_weight(subject: i64, relationship: i64, object: i64) -> i64 {
     subject.saturating_add(relationship).saturating_add(object)
 }
 
+/// Mint a fresh `mindreader:relationship/…` IRI for a newly created fact identity.
 fn relationship_iri() -> String {
     format!("mindreader:relationship/{}", Uuid::new_v4())
 }
@@ -224,11 +232,16 @@ fn relationship_iri() -> String {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteFact {
+    /// Subject node (`kind=node` plus `iri` or `name`).
     pub s: EntityInput,
+    /// Predicate local name or property IRI.
     pub p: String,
+    /// Object node or typed literal.
     pub o: ObjectInput,
+    /// Optional Spike label attached to the subject and, for Element objects, an ABOUT fact.
     #[serde(default)]
     pub spike: Option<String>,
+    /// When true, add current CONTRADICTS edges from this object to other current values.
     #[serde(default)]
     pub contradicts: bool,
 }
@@ -237,10 +250,13 @@ pub struct WriteFact {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteArgs {
+    /// Atomic, input-ordered batch of 1–20 set-valued triples.
     pub facts: Vec<WriteFact>,
+    /// Call-level visibility union written as memberships on new or merged facts.
     pub scope: Vec<String>,
 }
 
+/// Graph-ready write triple after domain validation and IRI minting.
 struct PreparedWriteFact {
     subject_spec: NodeSpec,
     subject_kind: String,
@@ -266,6 +282,7 @@ struct RevisionPlan {
     pub reason: Option<String>,
 }
 
+/// Outcome of one revise attempt, including no-op same-object corrections.
 struct RevisionResult {
     noop: bool,
     scope: Vec<String>,
@@ -287,12 +304,14 @@ struct WithdrawalSelector {
 }
 
 #[derive(Debug, Clone)]
+/// Withdrawal width plus the request `scope` used to select memberships.
 struct WithdrawalPlan {
     pub target: WithdrawalSelector,
     pub layers: Vec<String>,
     pub reason: Option<String>,
 }
 
+/// Soft-withdrawal outcome; `episode` is `None` when every selected fact was a no-op.
 struct WithdrawalResult {
     scope: Vec<String>,
     episode: Option<Episode>,
@@ -304,7 +323,9 @@ struct WithdrawalResult {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetArgs {
+    /// `"node"` or `"fact"` depending on the tool.
     pub kind: String,
+    /// Stable identity pasted from a prior result handle.
     pub iri: String,
 }
 
@@ -312,13 +333,18 @@ pub struct TargetArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReviseArgs {
+    /// Memberships moved off the selected fact handle; empty is global-only.
     pub scope: Vec<String>,
+    /// Pasteable current fact handle (`kind=fact`).
     pub target: TargetArgs,
+    /// Replacement object; the previous object stays as history via SUPERSEDES.
     pub new: ObjectInput,
     #[serde(default)]
     pub spike: Option<String>,
+    /// When true, add CONTRADICTS from the new object to other current values.
     #[serde(default)]
     pub contradicts: bool,
+    /// Optional audit note stored on the Episode and replacement fact.
     #[serde(default)]
     pub reason: Option<String>,
 }
@@ -327,9 +353,12 @@ pub struct ReviseArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WithdrawArgs {
+    /// Visibility union used to select which memberships to remove.
     pub scope: Vec<String>,
+    /// One current fact handle; mutually exclusive with `subject`.
     #[serde(default)]
     pub target: Option<TargetArgs>,
+    /// Subject-wide or predicate-wide withdrawal when `target` is omitted.
     #[serde(default)]
     pub subject: Option<EntityInput>,
     #[serde(default)]
@@ -342,7 +371,9 @@ pub struct WithdrawArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JudgeRating {
+    /// Pasteable node or current fact handle.
     pub target: TargetArgs,
+    /// `strengthen` (+1) or `weaken` (−1).
     pub mode: String,
 }
 
@@ -350,7 +381,9 @@ pub struct JudgeRating {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct JudgeArgs {
+    /// Visibility union; hidden or historical handles fail as a precondition.
     pub scope: Vec<String>,
+    /// Atomic 1–20 unique ratings recorded as one Episode.
     pub ratings: Vec<JudgeRating>,
 }
 
@@ -358,9 +391,12 @@ pub struct JudgeArgs {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlaceEdit {
+    /// Node or current fact handle whose stored `layers` change.
     pub target: TargetArgs,
+    /// Memberships to add; must not overlap `remove`.
     #[serde(default)]
     pub add: Vec<String>,
+    /// Memberships to remove; emptying a named record makes it global.
     #[serde(default)]
     pub remove: Vec<String>,
 }
@@ -369,10 +405,13 @@ pub struct PlaceEdit {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlaceArgs {
+    /// Visibility used to load targets; not the membership change itself.
     pub scope: Vec<String>,
+    /// Atomic 1–20 unique membership edits validated against the batch final state.
     pub edits: Vec<PlaceEdit>,
 }
 
+/// Convert a validated entity reference into a MERGE `NodeSpec`.
 fn node_spec(entity: EntityRef) -> NodeSpec {
     NodeSpec {
         iri: entity.iri,
@@ -381,6 +420,7 @@ fn node_spec(entity: EntityRef) -> NodeSpec {
     }
 }
 
+/// MERGE a literal or entity object; the bool is true when the object is a literal.
 async fn merge_object_in_txn(txn: &mut Txn, value: ObjectValue) -> Result<(MergedNode, bool)> {
     match value {
         ObjectValue::Literal { value, datatype } => {
@@ -393,6 +433,7 @@ async fn merge_object_in_txn(txn: &mut Txn, value: ObjectValue) -> Result<(Merge
     }
 }
 
+/// Union requested memberships onto an existing named node; global and schema nodes stay `[]`.
 async fn apply_node_memberships_txn(
     txn: &mut Txn,
     node: &MergedNode,
@@ -425,6 +466,7 @@ async fn apply_node_memberships_txn(
     Ok(before != after)
 }
 
+/// Current (`validTo` null) fact identity used to plan membership edits.
 #[derive(Debug, Clone)]
 struct CurrentFact {
     rel_id: i64,
@@ -432,6 +474,7 @@ struct CurrentFact {
     layers: Vec<String>,
 }
 
+/// Remaining memberships for one current fact after a revise/withdraw selection.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FactMembershipChange {
     rel_id: i64,
@@ -454,6 +497,7 @@ fn plan_fact_membership_changes(
         .collect()
 }
 
+/// Pick the visible current fact that intersects `selected_layers`, optionally by handle IRI.
 fn select_revision_current(
     currents: &[CurrentFact],
     selected_layers: &[String],
@@ -466,6 +510,7 @@ fn select_revision_current(
         .cloned()
 }
 
+/// Current exact `(s, property, o)` identities, using a structural type when the predicate maps to one.
 async fn find_current_pairs_txn(
     txn: &mut Txn,
     s: &str,
@@ -512,6 +557,7 @@ async fn find_current_pairs_txn(
         .collect()
 }
 
+/// Parameters for creating or membership-merging one current relationship.
 struct RelationWrite<'a> {
     rel_type: &'a str,
     s: &'a str,
@@ -523,6 +569,7 @@ struct RelationWrite<'a> {
     fact_text: &'a str,
 }
 
+/// Reassert an exact triple by merging memberships, or CREATE a new fact identity.
 async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result<(String, bool)> {
     let current = find_current_pairs_txn(
         txn,
@@ -563,6 +610,7 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
 
     let rel_type = safe_rel(write.rel_type)?;
     let iri = relationship_iri();
+    // `rel_type` is allowlisted; interpolating it is the only dynamic Cypher identifier here.
     let cypher = format!(
         r#"
         MATCH (s:Entity {{iri: $s}}), (o:Entity {{iri: $o}})
@@ -596,6 +644,7 @@ async fn ensure_relation_txn(txn: &mut Txn, write: &RelationWrite<'_>) -> Result
     Ok((iri, true))
 }
 
+/// Reload agent-facing node JSON after membership or weight updates in this transaction.
 async fn refreshed_node_json_txn(txn: &mut Txn, iri: &str) -> Result<Value> {
     let row = fetch_one_txn(
         txn,
@@ -606,6 +655,7 @@ async fn refreshed_node_json_txn(txn: &mut Txn, iri: &str) -> Result<Value> {
     node_json(&row.get::<Node>("n")?)
 }
 
+/// Other current values of the same subject+predicate visible in `layers` (set-valued alternatives).
 async fn find_conflicts_txn(
     txn: &mut Txn,
     s: &str,
@@ -797,6 +847,7 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
     )
 }
 
+/// Review bag: advisory unify pairs plus set-valued alternatives (never auto-applied).
 fn review_payloads(merge_suggestions: &[Value], alternatives: &[Value]) -> Value {
     json!({ "unify": merge_suggestions, "alternatives": alternatives })
 }
@@ -818,6 +869,7 @@ mod review_tests {
     }
 }
 
+/// One write item: whether it changed, the fact envelope, created IRIs, and alternatives.
 struct PreparedFactResult {
     noop: bool,
     json: Value,
@@ -825,6 +877,7 @@ struct PreparedFactResult {
     alternatives: Vec<Value>,
 }
 
+/// MERGE endpoints, merge or create the fact, optionally attach ABOUT and CONTRADICTS.
 async fn write_prepared_fact_txn(
     txn: &mut Txn,
     fact: PreparedWriteFact,
@@ -942,6 +995,7 @@ async fn write_prepared_fact_txn(
     })
 }
 
+/// Remove selected memberships; empty remaining memberships set `validTo` (soft withdraw).
 async fn change_fact_memberships_txn(
     txn: &mut Txn,
     current: &CurrentFact,
@@ -981,6 +1035,7 @@ async fn change_fact_memberships_txn(
     Ok(true)
 }
 
+/// Apply planned remaining memberships in one UNWIND; empty remaining lists set `validTo`.
 async fn change_fact_memberships_batch_txn(
     txn: &mut Txn,
     changes: &[FactMembershipChange],
@@ -1036,6 +1091,7 @@ async fn change_fact_memberships_batch_txn(
     Ok(())
 }
 
+/// Retry wrapper around one SUPERSEDES correction.
 async fn apply_revision(
     graph: &Graph,
     args: RevisionPlan,
@@ -1052,6 +1108,7 @@ async fn apply_revision(
     unreachable!("bounded retry loop always returns")
 }
 
+/// Move selected memberships off the old fact, write the replacement, and record SUPERSEDES.
 async fn apply_revision_once(
     graph: &Graph,
     args: RevisionPlan,
@@ -1259,6 +1316,7 @@ async fn apply_revision_once(
     })
 }
 
+/// Retry wrapper around one soft-withdrawal attempt.
 async fn apply_withdrawal(
     graph: &Graph,
     args: WithdrawalPlan,
@@ -1275,6 +1333,7 @@ async fn apply_withdrawal(
     unreachable!("bounded retry loop always returns")
 }
 
+/// Soft-withdraw selected memberships of a fact, predicate, or subject slice.
 async fn apply_withdrawal_once(
     graph: &Graph,
     args: WithdrawalPlan,
@@ -1457,12 +1516,14 @@ async fn apply_withdrawal_once(
     })
 }
 
+/// True when the node is a Class or Property catalog record (always global).
 fn schema_node_labels(labels: &[String]) -> bool {
     labels
         .iter()
         .any(|label| label == "Class" || label == "Property")
 }
 
+/// Force catalog nodes to global memberships regardless of the call `scope`.
 fn schema_node_scope<'a>(labels: &[String], scope: &'a [String]) -> &'a [String] {
     if schema_node_labels(labels) {
         &[]
@@ -1471,6 +1532,7 @@ fn schema_node_scope<'a>(labels: &[String], scope: &'a [String]) -> &'a [String]
     }
 }
 
+/// Force schema-definition edges (`INSTANCE_OF`, `SUBCLASS_OF`, …) to stay global.
 fn schema_edge_scope<'a>(
     structural: Option<&str>,
     subject_labels: &[String],
@@ -1485,6 +1547,7 @@ fn schema_edge_scope<'a>(
     }
 }
 
+/// Accept only pasteable `node` or `fact` handles with a non-empty IRI.
 fn validate_target(target: &TargetArgs) -> Result<()> {
     if !matches!(target.kind.as_str(), "node" | "fact") {
         return Err(DomainError::InvalidInput("target.kind must be node or fact".into()).into());
@@ -1503,6 +1566,7 @@ fn membership_allows(record: &[String], required: &[String]) -> bool {
     record.is_empty() || required.iter().all(|layer| record.contains(layer))
 }
 
+/// Input-ordered node lookup for `memory_recall` `iris`; misses stay `found: false`.
 const RECALL_IRI_NODES_QUERY: &str = r#"
 UNWIND range(0, size($iris) - 1) AS inputIndex
 WITH inputIndex, $iris[inputIndex] AS iri
@@ -1513,6 +1577,7 @@ RETURN inputIndex, iri, n IS NOT NULL AS found, n
 ORDER BY inputIndex ASC
 "#;
 
+/// Incident current facts for each found IRI, bounded per lookup before hops=1 copies them up.
 const RECALL_IRI_FACTS_QUERY: &str = r#"
 UNWIND range(0, size($iris) - 1) AS inputIndex
 WITH inputIndex, $iris[inputIndex] AS iri
@@ -1538,6 +1603,7 @@ ORDER BY inputIndex ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
 "#;
 
 /// `memory_recall` `iris` path: ordered lookups plus a globally bounded fact set.
+/// `memory_recall` `iris`: input-ordered node lookups plus optional hops=1 incident facts.
 pub async fn memory_recall_iris(
     graph: &Graph,
     iris: Vec<String>,
@@ -1819,6 +1885,7 @@ pub async fn memory_recall_around(
     }))
 }
 
+/// Current and `validTo` facts that share a fact handle's subject and predicate.
 const RECALL_HISTORY_FACT_QUERY: &str = r#"
 MATCH (s:Entity)-[anchor]->(o:Entity)
 WHERE anchor.iri = $iri
@@ -1842,6 +1909,7 @@ LIMIT $limit
 RETURN s, r, other AS o, property, current, validTo
 "#;
 
+/// Current and historical incident facts for a node handle (system-owned edges excluded).
 const RECALL_HISTORY_NODE_QUERY: &str = r#"
 MATCH (n:Entity {iri: $iri})
 WHERE size(n.layers) = 0
@@ -2065,6 +2133,7 @@ async fn load_current_fact(
     ))
 }
 
+/// Rebuild a write-shaped subject from a stored node so revise/withdraw can re-MERGE it.
 fn entity_input_from_node(node: &Node) -> Result<EntityInput> {
     Ok(EntityInput {
         kind: "node".into(),
@@ -2074,6 +2143,7 @@ fn entity_input_from_node(node: &Node) -> Result<EntityInput> {
     })
 }
 
+/// Rebuild a tagged `node` or `literal` object from a stored endpoint.
 fn object_input_from_node(node: &Node) -> Result<ObjectInput> {
     let labels: Vec<String> = node
         .labels()
@@ -2337,6 +2407,7 @@ async fn apply_judge_rating_txn(
     Ok((before, after))
 }
 
+/// One judge transaction: lock, apply every ±1 rating, record one Episode, or roll back.
 async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
     let scope = normalize_layers(args.scope)?;
     let locks = args
@@ -2469,6 +2540,7 @@ pub async fn memory_judge(graph: &Graph, args: JudgeArgs) -> Result<Value> {
     unreachable!("bounded retry loop always returns")
 }
 
+/// Validated membership edit after unique-target and add/remove overlap checks.
 #[derive(Clone)]
 struct NormalizedPlaceEdit {
     index: usize,
@@ -2477,6 +2549,7 @@ struct NormalizedPlaceEdit {
     remove: Vec<String>,
 }
 
+/// Membership list before and after one edit, used for closure validation and the result item.
 struct PlannedPlaceEdit {
     normalized: NormalizedPlaceEdit,
     before: Vec<String>,
@@ -2529,6 +2602,7 @@ fn normalize_place_args(args: PlaceArgs) -> Result<(Vec<String>, Vec<NormalizedP
     Ok((scope, edits))
 }
 
+/// Load stored `layers` for a visible non-schema node or current fact.
 async fn load_place_memberships_txn(
     txn: &mut Txn,
     scope: &[String],
@@ -2581,6 +2655,7 @@ async fn load_place_memberships_txn(
     .map_err(Into::into)
 }
 
+/// Lock every current fact and endpoint that the batch could change or expose.
 async fn acquire_place_closure_locks_txn(
     txn: &mut Txn,
     edits: &[NormalizedPlaceEdit],
@@ -2656,6 +2731,7 @@ fn planned_memberships(before: &[String], edit: &NormalizedPlaceEdit) -> Planned
     }
 }
 
+/// Label a hidden endpoint as `literal` or `node` in closure-precondition messages.
 fn hidden_endpoint_kind(iri: &str, labels: &[String]) -> &'static str {
     if labels.iter().any(|label| label == "Literal") || iri.starts_with("mindreader:literal/") {
         "literal"
@@ -2726,6 +2802,7 @@ async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit])
     Ok(())
 }
 
+/// One place transaction: lock, plan final memberships, enforce endpoint closure, commit or roll back.
 async fn memory_place_once(
     graph: &Graph,
     scope: Vec<String>,

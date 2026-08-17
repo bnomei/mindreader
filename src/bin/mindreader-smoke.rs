@@ -68,6 +68,7 @@ impl Report {
         Self { next: 1, failed: 0 }
     }
 
+    /// Print one numbered PASS/FAIL step; increments `failed` on assertion failure.
     fn check(&mut self, name: &str, ok: bool, detail: impl std::fmt::Display) {
         let status = if ok { "PASS" } else { "FAIL" };
         println!("{status} {} {name}", self.next);
@@ -82,6 +83,7 @@ impl Report {
     }
 }
 
+/// Element subject identified by display name (IRI is minted on write).
 fn entity(name: impl Into<String>) -> EntityInput {
     EntityInput {
         kind: "node".into(),
@@ -91,6 +93,7 @@ fn entity(name: impl Into<String>) -> EntityInput {
     }
 }
 
+/// Subject identified by an existing node IRI.
 fn entity_iri(iri: impl Into<String>) -> EntityInput {
     EntityInput {
         kind: "node".into(),
@@ -100,6 +103,7 @@ fn entity_iri(iri: impl Into<String>) -> EntityInput {
     }
 }
 
+/// Element object identified by display name.
 fn object(name: impl Into<String>) -> ObjectInput {
     ObjectInput {
         kind: "node".into(),
@@ -111,6 +115,7 @@ fn object(name: impl Into<String>) -> ObjectInput {
     }
 }
 
+/// Object identified by an existing node IRI.
 fn object_iri(iri: impl Into<String>) -> ObjectInput {
     ObjectInput {
         kind: "node".into(),
@@ -122,6 +127,7 @@ fn object_iri(iri: impl Into<String>) -> ObjectInput {
     }
 }
 
+/// One-triple `memory_write` under the given request `scope`.
 fn write_args(s: EntityInput, p: impl AsRef<str>, o: ObjectInput, scope: Vec<String>) -> WriteArgs {
     WriteArgs {
         facts: vec![WriteFact {
@@ -135,6 +141,7 @@ fn write_args(s: EntityInput, p: impl AsRef<str>, o: ObjectInput, scope: Vec<Str
     }
 }
 
+/// Fact handle IRI from a write or recall envelope (`facts[0].target` or top-level `target`).
 fn relationship_iri(value: &Value) -> Result<String> {
     value
         .pointer("/facts/0/target/iri")
@@ -144,6 +151,7 @@ fn relationship_iri(value: &Value) -> Result<String> {
         .ok_or_else(|| operation_error!("response has no relationship IRI: {value}"))
 }
 
+/// Subject IRI of the first returned fact.
 fn subject_iri(value: &Value) -> Result<String> {
     value
         .pointer("/facts/0/s/iri")
@@ -152,6 +160,7 @@ fn subject_iri(value: &Value) -> Result<String> {
         .ok_or_else(|| operation_error!("response has no subject IRI: {value}"))
 }
 
+/// Object IRI of the first returned fact.
 fn object_result_iri(value: &Value) -> Result<String> {
     value
         .pointer("/facts/0/o/iri")
@@ -160,6 +169,7 @@ fn object_result_iri(value: &Value) -> Result<String> {
         .ok_or_else(|| operation_error!("response has no object IRI: {value}"))
 }
 
+/// Pasteable fact IRIs from top-level `facts[]`, in result order.
 fn fact_relationships(value: &Value) -> Result<Vec<String>> {
     let facts = value
         .get("facts")
@@ -176,6 +186,7 @@ fn fact_relationships(value: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
+/// Incident fact IRIs from `lookups[0].facts` (iris hops=0 path).
 fn lookup_fact_iris(value: &Value) -> Result<Vec<String>> {
     let facts = value
         .pointer("/lookups/0/facts")
@@ -192,6 +203,7 @@ fn lookup_fact_iris(value: &Value) -> Result<Vec<String>> {
         .collect()
 }
 
+/// Insert a live activation with the deterministic smoke embedding and an APOC TTL lease.
 async fn seed_semantic_activation(
     graph: &Graph,
     embedding: &[f64],
@@ -219,6 +231,7 @@ async fn seed_semantic_activation(
     Ok((row.get("elementId")?, row.get("ttl")?))
 }
 
+/// Read the remaining APOC TTL on a seeded activation (used to prove refresh).
 async fn semantic_activation_ttl(graph: &Graph, element_id: &str) -> Result<Option<i64>> {
     fetch_one(
         graph,
@@ -232,6 +245,7 @@ async fn semantic_activation_ttl(graph: &Graph, element_id: &str) -> Result<Opti
     .transpose()
 }
 
+/// Rank index of a fact handle in `facts[]`; used to assert Spike/weight order.
 fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
     value
         .get("facts")
@@ -240,6 +254,7 @@ fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
         .position(|fact| fact.pointer("/target/iri").and_then(Value::as_str) == Some(relationship))
 }
 
+/// Closed-world `memory_recall` text selector at detailed/limit=100.
 async fn search(service: &MemoryService, scope: Vec<String>, text: &str) -> Result<Value> {
     service
         .recall(RecallArgs {
@@ -258,6 +273,7 @@ async fn search(service: &MemoryService, scope: Vec<String>, text: &str) -> Resu
         .await
 }
 
+/// MERGE one entity in its own transaction (lock/concurrency fixtures).
 async fn merge_node_once(graph: neo4rs::Graph, spec: NodeSpec) -> Result<MergedNode> {
     let mut txn = graph.start_txn().await?;
     let node = merge_node_in_txn(&mut txn, &spec, "Element", &[]).await?;
@@ -265,6 +281,7 @@ async fn merge_node_once(graph: neo4rs::Graph, spec: NodeSpec) -> Result<MergedN
     Ok(node)
 }
 
+/// Stored memberships, current-ness (`validTo` null), and weight for a fact IRI.
 async fn relation_state(
     graph: &neo4rs::Graph,
     iri: &str,
@@ -289,6 +306,7 @@ async fn relation_state(
     .transpose()
 }
 
+/// Stored `layers` memberships for a node IRI.
 async fn node_layers(graph: &Graph, iri: &str) -> Result<Option<Vec<String>>> {
     fetch_one(
         graph,
@@ -300,6 +318,7 @@ async fn node_layers(graph: &Graph, iri: &str) -> Result<Option<Vec<String>>> {
     .transpose()
 }
 
+/// Count Episode nodes recorded by one MCP tool name (no-ops must not increment).
 async fn episode_count(graph: &Graph, tool: &str) -> Result<i64> {
     let row = fetch_one(
         graph,
@@ -311,6 +330,7 @@ async fn episode_count(graph: &Graph, tool: &str) -> Result<i64> {
     Ok(row.get("count")?)
 }
 
+/// Count current CONTRADICTS edges between two object IRIs.
 async fn current_contradicts_count(graph: &Graph, from: &str, to: &str) -> Result<i64> {
     let row = fetch_one(
         graph,
@@ -326,6 +346,7 @@ async fn current_contradicts_count(graph: &Graph, from: &str, to: &str) -> Resul
     Ok(row.get("count")?)
 }
 
+/// Model marker plus embedding-space marker after bootstrap (smoke embedding space).
 async fn bootstrap_state(graph: &Graph) -> Result<Value> {
     let row = fetch_one(
         graph,

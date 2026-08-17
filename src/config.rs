@@ -23,7 +23,9 @@ const SECRETS_FILE: &str = ".env";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Neo4jConfig {
+    /// Bolt URI as supplied by the operator (not rewritten).
     pub uri: String,
+    /// Neo4j auth user; password stays in secrets.
     pub user: String,
 }
 
@@ -40,7 +42,9 @@ impl Default for Neo4jConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ProviderConfig {
+    /// Remote model id; required once that provider's API key is set.
     pub model: String,
+    /// Output width that must match the Neo4j activation index (1..=4096).
     pub dimensions: usize,
 }
 
@@ -57,7 +61,9 @@ impl Default for ProviderConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct EmbeddingsConfig {
+    /// Used when `OPENAI_API_KEY` is present (takes precedence over xAI).
     pub openai: ProviderConfig,
+    /// Used when only `XAI_API_KEY` is present.
     pub xai: ProviderConfig,
 }
 
@@ -77,12 +83,19 @@ impl Default for EmbeddingsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SemanticConfig {
+    /// Activation lease length; APOC TTL refreshes this on contributing recalls.
     pub ttl_days: u64,
+    /// Maximum live activation neighbors pulled from the vector index.
     pub neighbor_limit: usize,
+    /// Minimum cosine score for an activation to enter rank fusion.
     pub recall_similarity_threshold: f64,
+    /// Cosine floor before two activations may converge into one node.
     pub convergence_similarity_threshold: f64,
+    /// Jaccard floor on result-ref overlap required for convergence.
     pub convergence_result_overlap_threshold: f64,
+    /// Reciprocal-rank fusion `k`; larger values flatten rank gaps.
     pub rrf_k: f64,
+    /// Extra RRF weight on the closed-world `memory_search` list versus activations.
     pub direct_weight: f64,
 }
 
@@ -181,6 +194,7 @@ pub struct SelectedEmbedding {
     pub provider: EmbeddingProviderKind,
     pub model: String,
     pub dimensions: usize,
+    /// Bearer token from secrets or the process environment; never logged.
     pub api_key: String,
 }
 
@@ -198,6 +212,7 @@ impl SelectedEmbedding {
 /// Provider/model/dimension triple stored on the Neo4j semantic index marker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddingSpace {
+    /// Provider id stored on the marker (`openai`, `xai`, or a fixture such as `smoke`).
     pub provider: String,
     pub model: String,
     pub dimensions: usize,
@@ -210,7 +225,9 @@ pub struct Config {
     pub user: String,
     password: Option<String>,
     pub semantic: SemanticConfig,
+    /// Present only when an embedding API key was resolved.
     pub embedding: Option<SelectedEmbedding>,
+    /// OS or explicit directory that holds `config.toml` and `.env`.
     pub config_dir: PathBuf,
 }
 
@@ -260,12 +277,14 @@ fn initialize_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Treat whitespace-only values as unset so empty process env can fall back to `.env`.
 fn nonempty(value: Option<String>) -> Option<String> {
     value
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
+/// Process environment wins only when non-empty; otherwise use the colocated secret.
 fn prefer_nonempty(process: Option<String>, file: Option<String>) -> Option<String> {
     nonempty(process).or_else(|| nonempty(file))
 }
@@ -289,6 +308,7 @@ impl Config {
         Self::from_dir(config_dir.into())
     }
 
+    /// Seed missing files, then load `config.toml` plus colocated secrets from `config_dir`.
     fn from_dir(config_dir: PathBuf) -> Result<Self> {
         initialize_directory(&config_dir)?;
         let secrets_path = config_dir.join(SECRETS_FILE);
