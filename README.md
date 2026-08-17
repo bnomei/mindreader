@@ -7,11 +7,13 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It stores explicit graph triples (`subject -predicate-> object`) and serves exactly eight tools over stdio.
+Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It gives agents autonomous, explicit, scoped, durable working memory as graph triples (`subject -predicate-> object`) and serves exactly eight tools over stdio.
 
-The agent is the clerk of the graph. A fact exists only after a tool writes it. Later tools paste the handles they were given. Mindreader does not extract memory from conversation with a hidden language model, and it does not expose raw Cypher.
+The agent is the clerk of the graph and owns the memory lifecycle. Without waiting for a user request, it recalls prior context when that context could affect the work and records future-useful knowledge produced or confirmed during discussion, investigation, decisions, implementation, debugging, review, and handoff. A fact exists only after the agent deliberately formulates an assertion and calls a write tool. Later tools paste the handles they were given.
 
-Ordinary writes are set-valued and record an `Episode` when anything changes. Explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`. Closed-world `memory_recall` stays inside Neo4j. Optional `memory_recall_semantic` sends only its query text to the configured OpenAI or xAI embedding API.
+Mindreader itself does not extract memory from conversation with a hidden language model, invent unstated facts, or expose raw Cypher. Autonomous means that the agent performs the editorial judgment and explicit tool calls; it does not mean that the server silently stores a transcript.
+
+Ordinary writes are set-valued and record an `Episode` when anything changes. Explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`. Closed-world `recall` stays inside Neo4j. Optional `recall_semantic` sends only its query text to the configured OpenAI or xAI embedding API.
 
 That is a different contract from chat-memory extractors such as [Graphiti](https://arxiv.org/abs/2501.13956): those systems ingest messages and derive facts automatically. Mindreader records only what an agent asserts, then returns pasteable identifiers for the next call rather than a prose context blob.
 
@@ -31,13 +33,14 @@ That is a different contract from chat-memory extractors such as [Graphiti](http
 ## What mindreader provides
 
 - Explicit triples in a shared Neo4j graph. No hidden extractor, no silent overwrite, no raw Cypher.
+- Agent-driven recall and capture without requiring the user to ask for memory operations.
 - Eight job-shaped tools: closed-world recall, optional semantic recall, write, revise, withdraw, judge, place, and unify.
 - Pasteable `target` handles on nodes and facts so the next tool call copies identity instead of inventing it.
 - Request-scoped layer visibility (`scope`). `[]` is global-only, not all memory. Layers are a flashlight, not an ACL.
-- RDFS schema-as-data: Class and Property nodes live in the graph and are listed with `memory_recall` `labels`.
+- RDFS schema-as-data: Class and Property nodes live in the graph and are listed with `recall` `labels`.
 - Set-valued current facts, explicit `SUPERSEDES` corrections, optional `CONTRADICTS` links, and soft withdrawal (`validTo`).
 - Advisory `review.unify` / `review.alternatives` queues. Merges and corrections stay intentional.
-- Shared signed weights changed only by `memory_judge`. Retrieval never updates rank by itself.
+- Shared signed weights changed only by `judge`. Retrieval never updates rank by itself.
 - Spike categories ranked `Knowledge > Insight > Pattern > Signal`, then weight, then text.
 - A stdio MCP server that completes the handshake before Neo4j is ready and connects lazily.
 
@@ -50,7 +53,7 @@ flowchart LR
     Server -.->|"query text for semantic search only"| Provider["OpenAI or xAI embeddings"]
 ```
 
-The MCP host owns process access and authentication. Mindreader owns tool validation, graph behavior, and provenance. Neo4j stores durable graph records and expiring semantic activations. The embedding provider receives query text only when an agent calls `memory_recall_semantic`; it does not receive stored result bundles.
+The MCP host owns process access and authentication. Mindreader owns tool validation, graph behavior, and provenance. Neo4j stores durable graph records and expiring semantic activations. The embedding provider receives query text only when an agent calls `recall_semantic`; it does not receive stored result bundles.
 
 ## Install a release
 
@@ -171,7 +174,7 @@ Run the binary without arguments to serve MCP. It also accepts `-h`/`--help` and
 
 ## Connect an MCP client
 
-Mindreader uses stdio transport and supports only MCP `2026-07-28`, including the discovery lifecycle and self-contained request metadata. Older initialization protocols are rejected rather than downgraded. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all eight tools in the [MCP tool reference](#mcp-tool-reference).
+Mindreader uses stdio transport. It prefers MCP `2026-07-28` (discovery lifecycle and self-contained request metadata) and also accepts initialize `2025-11-25` so hosts that have not adopted the newer version can still list tools. Older initialization protocols are rejected rather than downgraded. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all eight tools in the [MCP tool reference](#mcp-tool-reference).
 
 ### Local binary
 
@@ -240,10 +243,10 @@ Run `docker compose up -d neo4j` before the client launches the Compose-backed s
 
 ## Agent loop
 
-Most tasks need one recall and no mutation. A durable update usually needs one targeted recall and one batched mutation. The eight tools are verbs, not a checklist.
+Mindreader is agent-driven working memory, not a user-operated notebook. The agent evaluates memory needs at task intake, before consequential decisions, while durable knowledge emerges, and before significant completion or handoff. The user does not need to say "remember." A check may correctly produce no tool call; autonomous capture does not mean storing everything. The eight tools are verbs, not a checklist.
 
 1. Choose the narrowest `scope` that should see the work and copy it on later scoped calls. There is no session default. `[]` means global records only.
-2. Reuse node IRIs and fact `target` handles you already have. Otherwise call `memory_recall` with exactly one selector:
+2. Proactively recall when starting, resuming, or revisiting work that could depend on earlier decisions, rationale, preferences, standing instructions, requirements, constraints, identities, relationships, conventions, commitments, project state, or lessons. Reuse node IRIs and fact `target` handles already in context; otherwise call `recall` with exactly one selector:
 
    | Need | Selector |
    | --- | --- |
@@ -253,33 +256,34 @@ Most tasks need one recall and no mutation. A durable update usually needs one t
    | Neighborhood from a node | `around`, optional `p` and `depth` |
    | Current plus historical facts | `history` (one node or fact IRI) |
 
-   Call `memory_recall_semantic` only when lexical recall is not enough and sending the query text to the embedding provider is acceptable. Both recall tools accept `detail`: `detailed` (default) or `concise`.
-3. If nothing durable should change, stop.
-4. If something should change, pick the smallest verb:
+   Call `recall_semantic` only when lexical recall is not enough and sending the query text to the embedding provider is acceptable. Both recall tools accept `detail`: `detailed` (default) or `concise`.
+3. Do the work. Discussion, investigation, implementation, debugging, and review are capture triggers whenever they establish supported knowledge that another agent or session is likely to need. Reduce that knowledge to concise triples; do not copy conversation.
+4. When durable state should change, pick the smallest verb:
 
    | Situation | Tool |
    | --- | --- |
-   | Same `(s, p, o)`, maybe another layer | `memory_write` (merge or no-op) |
-   | Another valid object for the same pair | `memory_write` |
-   | This object is wrong; replacement known | `memory_revise` (paste the fact `target`) |
-   | This object is stale; no replacement | `memory_withdraw` |
-   | Membership only | `memory_place` (`scope` is visibility; `add` / `remove` is the change) |
-   | Two nodes are the same identity | `memory_unify` after you choose the survivor |
+   | Same `(s, p, o)`, maybe another layer | `write` (merge or no-op) |
+   | Another valid object for the same pair | `write` |
+   | This object is wrong; replacement known | `revise` (paste the fact `target`) |
+   | This object is stale; no replacement | `withdraw` |
+   | Membership only | `place` (`scope` is visibility; `add` / `remove` is the change) |
+   | Two nodes are the same identity | `unify` after you choose the survivor |
 
-5. Paste returned handles. Every success result includes `handles` (`facts`, `nodes`, `current`, `retired`, `unify`). Do not reconstruct `mindreader:relationship/<uuid>`. Do not treat a fuzzy name hit as identity.
-6. `review.unify` and `review.alternatives` are queues, not commands. Judge only retrievals that actually helped or hurt (`rateable: true`).
+5. Before completing significant work or handing it off, perform a capture check for durable outcomes, decisions and rationale, constraints, unresolved commitments, and reusable lessons. Batch related changes. Do not ask the user whether qualifying memory should be saved.
+6. Paste returned handles. Every success result includes `handles` (`facts`, `nodes`, `current`, `retired`, `unify`). Do not reconstruct `mindreader:relationship/<uuid>`. Do not treat a fuzzy name hit as identity.
+7. `review.unify` and `review.alternatives` are queues, not commands. Judge only retrievals that materially helped, distracted, or misled (`rateable: true`). Correct or withdraw false memory instead of merely judging it.
 
-Text and semantic recall also fill `nodes[]` from returned fact endpoints. `iris` reports misses as `lookups[i].found: false`. After `memory_revise`, the live handle is `target` / `handles.current`; `previousTarget` / `handles.retired` is the retired input. `memory_unify` takes `{kind:"node", iri}` handles; paste `review.unify[].source` and `.target`, or `handles.unify[]`.
+Text and semantic recall also fill `nodes[]` from returned fact endpoints. `iris` reports misses as `lookups[i].found: false`. After `revise`, the live handle is `target` / `handles.current`; `previousTarget` / `handles.retired` is the retired input. `unify` takes `{kind:"node", iri}` handles; paste `review.unify[].source` and `.target`, or `handles.unify[]`.
 
 A global fact can appear under a named `scope` with `mutable: false`. Revise or withdraw it with `scope: []`. The error says so.
 
-Keep task chatter, acknowledgements, markdown dumps, and transient status in the conversation. Store identities, durable relationships, decisions that constrain later work, and explicit contention that should stay visible. The reusable agent guide is [`skills/using-mindreader/SKILL.md`](skills/using-mindreader/SKILL.md).
+Memory candidates may come from the user, the agent's reasoning, tool output, repository evidence, or completed work. Store identities and ownership, durable relationships, preferences and standing instructions, decisions and rationale, requirements and invariants, conventions, stable project or environment facts, durable commitments and blockers, reusable operational knowledge, and deliberately classified Signals, Patterns, or Insights. Keep greetings, acknowledgements, reasoning chatter, raw conversation, transient progress, temporary paths, build logs, one-off task instructions, secrets, and prose/Markdown/source dumps out of the graph. Do not mirror an authoritative artifact when future work can derive the fact more safely and cheaply from that artifact. The reusable agent guide is [`skills/using-mindreader/SKILL.md`](skills/using-mindreader/SKILL.md).
 
 ## Minimal write, recall, and walk example
 
 ### Write one durable fact
 
-Call `memory_write` with `facts[]` and an explicit visibility scope:
+Call `write` with `facts[]` and an explicit visibility scope:
 
 ```json
 {
@@ -298,7 +302,7 @@ The response includes one Episode when any fact changed, plus per-item pasteable
 
 ### Recall by text
 
-Call `memory_recall` with the same scope, or a broader OR union:
+Call `recall` with the same scope, or a broader OR union:
 
 ```json
 {
@@ -307,7 +311,7 @@ Call `memory_recall` with the same scope, or a broader OR union:
 }
 ```
 
-Each fact includes a `target` you can pass to `memory_revise`, `memory_withdraw`, `memory_judge`, or `memory_place`.
+Each fact includes a `target` you can pass to `revise`, `withdraw`, `judge`, or `place`.
 
 For conceptual recall, use the separate provider-backed tool:
 
@@ -320,11 +324,11 @@ For conceptual recall, use the separate provider-backed tool:
 }
 ```
 
-This is an input to `memory_recall_semantic`. Ordinary `memory_recall` never sends text outside Neo4j.
+This is an input to `recall_semantic`. Ordinary `recall` never sends text outside Neo4j.
 
 ### Walk from a returned IRI
 
-Call `memory_recall` with `around` and optional predicate names:
+Call `recall` with `around` and optional predicate names:
 
 ```json
 {
@@ -338,7 +342,7 @@ Call `memory_recall` with `around` and optional predicate names:
 For `around`, `paths[i]` is the deterministic shortest witness path for
 `facts[i]`; intermediate path edges do not consume the requested fact limit.
 
-Reasserting the same current triple merges any missing requested memberships; it returns `"noop": true` only when those memberships are already present. Writing a different object adds another current value. Use `memory_revise` when one exact current value is a correction of another.
+Reasserting the same current triple merges any missing requested memberships; it returns `"noop": true` only when those memberships are already present. Writing a different object adds another current value. Use `revise` when one exact current value is a correction of another.
 
 After a returned fact helps, strengthen its shared weight explicitly:
 
@@ -375,28 +379,28 @@ To audit memberships independently of fact values, submit the related edits toge
 }
 ```
 
-Both `memory_judge` and `memory_place` accept 1–20 input items, reject duplicate targets, and record exactly one Episode when the batch changes state. Any invalid item rolls back the whole batch; an all-noop place batch returns `episode:null`.
+Both `judge` and `place` accept 1–20 input items, reject duplicate targets, and record exactly one Episode when the batch changes state. Any invalid item rolls back the whole batch; an all-noop place batch returns `episode:null`.
 
 ## MCP tool reference
 
 All successful results include `ok:true`. Successful mutations include `noop` and `episode`, and scoped mutations echo `scope`; batch mutations include `summary:{requested,changed,noop}` plus input-ordered `items` with stable indexes, targets, statuses, and operation-specific fields. An all-noop mutation has `noop:true` and `episode:null`.
 
-Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable,outcome}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. `outcome:"not_applied"` confirms no mutation committed. `outcome:"unknown"` means the caller must not assume retrying a non-idempotent mutation is safe. Every scoped tool requires a `scope` array; permanent `memory_unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
+Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable,outcome}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. `outcome:"not_applied"` confirms no mutation committed. `outcome:"unknown"` means the caller must not assume retrying a non-idempotent mutation is safe. Every scoped tool requires a `scope` array; permanent `unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
-| `memory_recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around`, `history` | Selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, paths, history, or the Class/Property catalog. Never calls an embedding provider. `iris` accepts 1–20 node IRIs and preserves input order and misses; `around` aligns each fact with a deterministic shortest witness path; `history` returns current and `validTo` facts for one node or fact IRI. |
-| `memory_recall_semantic` | `scope`, non-empty `text` | `labels[]`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall with expiring semantic activations. Sends only query text to the configured embedding provider. |
-| `memory_write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships. One Episode if any fact changed. |
-| `memory_revise` | `scope`, fact `target`, `new` | `spike`, `contradicts`, `reason` | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
-| `memory_withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return a `withdrawn` count plus `withdrawnTargets`. |
-| `memory_judge` | `scope`, `ratings[]` (1–20 unique targets) | None | Apply exactly `+1` or `-1` per visible node/current fact in one transaction and one Episode. |
-| `memory_place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
-| `memory_unify` | same-kind `source` and `target` node handles | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |
+| `recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around`, `history` | Selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, paths, history, or the Class/Property catalog. Never calls an embedding provider. `iris` accepts 1–20 node IRIs and preserves input order and misses; `around` aligns each fact with a deterministic shortest witness path; `history` returns current and `validTo` facts for one node or fact IRI. |
+| `recall_semantic` | `scope`, non-empty `text` | `labels[]`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall with expiring semantic activations. Sends only query text to the configured embedding provider. |
+| `write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`) | Add set-valued triples or merge memberships. One Episode if any fact changed. |
+| `revise` | `scope`, fact `target`, `new` | `spike`, `contradicts`, `reason` | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
+| `withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return a `withdrawn` count plus `withdrawnTargets`. |
+| `judge` | `scope`, `ratings[]` (1–20 unique targets) | None | Apply exactly `+1` or `-1` per visible node/current fact in one transaction and one Episode. |
+| `place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
+| `unify` | same-kind `source` and `target` node handles | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |
 
-Successful results include a `handles` bag. Fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. `memory_write` and `memory_revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
+Successful results include a `handles` bag. Fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. `write` and `revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
 
-`memory_recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate filtering and deterministic ordering happen before the result limit. `iris` applies `limit` per requested IRI; `around` still uses one fact budget for the walk.
+`recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate filtering and deterministic ordering happen before the result limit. `iris` applies `limit` per requested IRI; `around` still uses one fact budget for the walk.
 
 MCP annotations explicitly describe host-facing risk. Ordinary recall is read-only and closed-world. Semantic recall is additive, non-idempotent, and open-world because it contacts the configured provider and maintains activations. Write is additive and idempotent; place is destructive but idempotent; judge is destructive and non-idempotent. Revise, withdraw, and unify use conservative destructive, non-idempotent, closed-world hints. These hints help a host present consent UI, but Mindreader still validates every call.
 
@@ -456,7 +460,7 @@ Use this section to understand behavior and invariants. For exact request fields
 
 ### Layers
 
-Request `scope` is a flashlight: which records this call can see. Record `scope` is membership: where the node or fact lives. On `memory_write` and `memory_revise`, the request also becomes the new record's membership. On `memory_place`, the request is visibility only; each edit's `add` / `remove` is the membership change.
+Request `scope` is a flashlight: which records this call can see. Record `scope` is membership: where the node or fact lives. On `write` and `revise`, the request also becomes the new record's membership. On `place`, the request is visibility only; each edit's `add` / `remove` is the membership change.
 
 The required `scope` array is an OR union. A named record is visible when any membership intersects the requested names. Empty stored memberships mean global, so global records are visible in every named scope. An empty request selects only those global records:
 
@@ -464,15 +468,15 @@ The required `scope` array is an OR union. A named record is visible when any me
 { "scope": [] }
 ```
 
-Visibility is not the right to change a global record. A global fact can appear under `["project:graph-memory"]` and still require `scope: []` for `memory_revise` or `memory_withdraw`.
+Visibility is not the right to change a global record. A global fact can appear under `["project:graph-memory"]` and still require `scope: []` for `revise` or `withdraw`.
 
 Layer IDs match lowercase kebab-case segments separated by colons, such as `project:graph-memory` or `analysis:hypothesis`. Colons provide naming namespaces, not hierarchy. Graph storage uses a `layers` property, but the public MCP request field is always `scope`.
 
 Nodes and relationships both carry memberships. A relationship is returned only when the relationship and both endpoints are visible in the request scope; traversal applies that closure to every path. Assertions inherit memberships onto endpoints. One exact `(subject, property, object)` has one current relationship identity across all memberships: reasserting it with another named layer merges that membership rather than creating a duplicate relationship. An existing global relationship stays global.
 
-For named memberships, `memory_revise` and `memory_withdraw` affect only memberships visible in the requested scope; an old fact becomes historical only after its last membership is removed. It does not become global. `memory_place` is the opposite: removing a target's last named membership stores `[]` and therefore makes it global. To move a record between named layers, add the destination and remove the source in the same edit.
+For named memberships, `revise` and `withdraw` affect only memberships visible in the requested scope; an old fact becomes historical only after its last membership is removed. It does not become global. `place` is the opposite: removing a target's last named membership stores `[]` and therefore makes it global. To move a record between named layers, add the destination and remove the source in the same edit.
 
-`memory_place` audits 1–20 membership edits in one transaction, records one state-changing `memory_place` Episode, never propagates edits implicitly, and validates relationship endpoint closure against the batch's final combined state.
+`place` audits 1–20 membership edits in one transaction, records one state-changing `place` Episode, never propagates edits implicitly, and validates relationship endpoint closure against the batch's final combined state.
 
 Layers are visibility filters, not tenant isolation. Anyone with MCP access can request any valid layer name. Use separate Neo4j databases when you need a hard data-isolation boundary.
 
@@ -482,9 +486,9 @@ Ordinary assertions are set-valued. The same `(subject, property, object)` is id
 
 | Intent | Tool |
 | --- | --- |
-| Keep both values | `memory_write` |
-| This value is wrong; replace it | `memory_revise` on the exact fact `target` |
-| This value is stale; no replacement | `memory_withdraw` |
+| Keep both values | `write` |
+| This value is wrong; replace it | `revise` on the exact fact `target` |
+| This value is stale; no replacement | `withdraw` |
 | Both values stay current, and they cannot both be right | `contradicts: true` on the write or revision |
 
 `review.alternatives` lists other visible current values. It does not mean "revise this." `CONTRADICTS` and `SUPERSEDES` are system-owned: never send them as `p`.
@@ -493,15 +497,15 @@ Ordinary assertions are set-valued. The same `(subject, property, object)` is id
 
 `spike` is a commitment level, not an NLP class: `Knowledge` is worth relying on, `Pattern` is a recurring observation, `Insight` is an interpretation, `Signal` is raw evidence. Do not auto-promote.
 
-Weight is a shared signed integer, not confidence and not recency. Only `memory_judge` changes it, by exactly `+1` or `-1` per rating. Retrieval never updates weight. There is no decay. Judgment can arrive in a later turn.
+Weight is a shared signed integer, not confidence and not recency. Only `judge` changes it, by exactly `+1` or `-1` per rating. Retrieval never updates weight. There is no decay. Judgment can arrive in a later turn.
 
-Pass 1–20 unique recalled node or current-fact targets with `mode:"strengthen"` or `mode:"weaken"` and the retrieval scope. Search first orders facts by Spike category (`Knowledge > Insight > Pattern > Signal`), then by the combined subject + relationship + object weight *within* a category, then by text relevance. Weaken retrieval quality; correct or withdraw a false fact. A judgment batch is atomic, records one `memory_judge` Episode, and rolls back if any rating is invalid.
+Pass 1–20 unique recalled node or current-fact targets with `mode:"strengthen"` or `mode:"weaken"` and the retrieval scope. Search first orders facts by Spike category (`Knowledge > Insight > Pattern > Signal`), then by the combined subject + relationship + object weight *within* a category, then by text relevance. Weaken retrieval quality; correct or withdraw a false fact. A judgment batch is atomic, records one `judge` Episode, and rolls back if any rating is invalid.
 
 Search computes that complete ordering in Neo4j before applying the fact limit, so selective and common queries use the same ranking contract. The top-level `about` array contains at most the requested fact limit of ranked `ABOUT` context entries for endpoints in the returned facts; it is not an unbounded summary of facts discarded by the limit.
 
 ### Semantic recall
 
-`memory_recall_semantic` embeds the query with one external provider, runs the ordinary direct search, retrieves nearby semantic activations from Neo4j's cosine vector index, resolves their relationship IRIs against the current graph and requested scope, and combines the rankings with weighted reciprocal-rank fusion. Direct matches have weight `2.0` by default; recalled bundles are weighted by vector similarity. Recalled facts must still be current, match optional `labels`, and satisfy relationship-and-endpoint visibility in `scope`.
+`recall_semantic` embeds the query with one external provider, runs the ordinary direct search, retrieves nearby semantic activations from Neo4j's cosine vector index, resolves their relationship IRIs against the current graph and requested scope, and combines the rankings with weighted reciprocal-rank fusion. Direct matches have weight `2.0` by default; recalled bundles are weighted by vector similarity. Recalled facts must still be current, match optional `labels`, and satisfy relationship-and-endpoint visibility in `scope`.
 
 An activation is an internal `SemanticActivation:TTL` node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. Every recalled activation that contributes at least one currently resolvable fact refreshes its TTL. A sufficiently similar search with overlapping results also converges its vector and result bundle into one winning activation; otherwise the search creates a new activation. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
 
@@ -509,15 +513,15 @@ The embedding provider, model, and dimensions define one vector space for the da
 
 ### Provenance and history
 
-Each state-changing mutation creates one `Episode` with its canonical tool name (`memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, or `memory_unify`) and timestamp; no-op mutations create none. Internal semantic-activation maintenance is excluded. Relationships carry the episode identifier. Withdrawal sets `validTo` and optionally records a reason; it does not delete graph nodes. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be written, revised, or withdrawn directly.
+Each state-changing mutation creates one `Episode` with its canonical tool name (`write`, `revise`, `withdraw`, `judge`, `place`, or `unify`) and timestamp; no-op mutations create none. Internal semantic-activation maintenance is excluded. Relationships carry the episode identifier. Withdrawal sets `validTo` and optionally records a reason; it does not delete graph nodes. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be written, revised, or withdrawn directly.
 
-`memory_revise` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction. Its result exposes the replacement as `target` and the retired handle as `previousTarget`. `memory_recall` with `history` walks the current and `validTo` facts for one node or fact IRI.
+`revise` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction. Its result exposes the replacement as `target` and the retired handle as `previousTarget`. `recall` with `history` walks the current and `validTo` facts for one node or fact IRI.
 
 Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because their outcome may be ambiguous.
 
 `CONTRADICTS` is multi-valued. Setting `contradicts: true` on a write or revision records explicit links to conflicting visible current objects.
 
-`memory_unify` is the intentional destructive exception to soft history: it requires matching canonical kinds and removes the source node after moving its memberships and current and historical relationships onto the target. Bootstrap-seeded Class and Property IRIs are permanent targets and cannot be sources. It records exactly one `memory_unify` Episode, preserves the target IRI and name, combines memberships and weights, marks moved relationships with unification provenance, and soft-closes unification-created self-relations and duplicate facts. Unifying Properties rewrites their predicate references and refreshed search text transactionally, but both Properties must use the same structural relationship representation; system-owned `CONTRADICTS` and `SUPERSEDES` Properties cannot be unified. It creates no alias. Review the direction before calling it.
+`unify` is the intentional destructive exception to soft history: it requires matching canonical kinds and removes the source node after moving its memberships and current and historical relationships onto the target. Bootstrap-seeded Class and Property IRIs are permanent targets and cannot be sources. It records exactly one `unify` Episode, preserves the target IRI and name, combines memberships and weights, marks moved relationships with unification provenance, and soft-closes unification-created self-relations and duplicate facts. Unifying Properties rewrites their predicate references and refreshed search text transactionally, but both Properties must use the same structural relationship representation; system-owned `CONTRADICTS` and `SUPERSEDES` Properties cannot be unified. It creates no alias. Review the direction before calling it.
 
 ### IRI and record identity
 
@@ -537,7 +541,7 @@ Episodes use generated `mindreader:episode/<uuid>` IRIs. Relationships use gener
 
 ## Security and trust boundary
 
-Mindreader does not add an application authentication layer in front of MCP or Neo4j, and layers are a relationship filter rather than a security boundary. Anyone who can start or control the MCP process can use its configured Neo4j credential and embedding provider key. Graph operations go only to the configured Neo4j endpoint, but every `memory_recall_semantic` also sends its query text to OpenAI or xAI for embedding. It does not send the stored result bundle. Secure the client configuration, native `.env`, host process, network path, Neo4j deployment, and provider accounts accordingly.
+Mindreader does not add an application authentication layer in front of MCP or Neo4j, and layers are a relationship filter rather than a security boundary. Anyone who can start or control the MCP process can use its configured Neo4j credential and embedding provider key. Graph operations go only to the configured Neo4j endpoint, but every `recall_semantic` also sends its query text to OpenAI or xAI for embedding. It does not send the stored result bundle. Secure the client configuration, native `.env`, host process, network path, Neo4j deployment, and provider accounts accordingly.
 
 ## Configuration reference
 

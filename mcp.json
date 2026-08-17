@@ -1,7 +1,7 @@
 {
   "name": "mindreader",
   "version": "0.5.0",
-  "description": "Deterministic Neo4j graph memory for MCP agents: explicit triples, no hidden extraction",
+  "description": "Agent-driven durable Neo4j graph memory for MCP: proactive recall and explicit fact capture without hidden extraction",
   "transport": {
     "type": "stdio",
     "command": "mindreader",
@@ -13,13 +13,13 @@
     "XAI_API_KEY"
   ],
   "tools": [
-    "memory_recall",
-    "memory_recall_semantic",
-    "memory_write",
-    "memory_revise",
-    "memory_withdraw",
-    "memory_judge",
-    "memory_place",
-    "memory_unify"
+    "recall",
+    "recall_semantic",
+    "write",
+    "revise",
+    "withdraw",
+    "judge",
+    "place",
+    "unify"
   ]
 }

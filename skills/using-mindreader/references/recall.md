@@ -2,18 +2,20 @@
 
 Read this file when selecting a recall mode or interpreting a recall result.
 
+Recall is agent-driven. Use it proactively when starting, resuming, or deciding work that could be changed by earlier decisions, preferences, constraints, identities, relationships, conventions, commitments, project state, or lessons. Do not wait for the user to ask what is remembered, but do not recall speculatively when prior context cannot affect the task.
+
 ## Select the narrowest mode
 
 | Need | Call |
 | --- | --- |
-| Search names or terms | `mindreader:memory_recall` with `text` |
-| Fetch known node IRIs | `mindreader:memory_recall` with `iris` |
-| Inspect Class or Property vocabulary | `mindreader:memory_recall` with `labels: ["Class"]` or `["Property"]` |
-| Walk relevant relationships from a node | `mindreader:memory_recall` with `around`, optional `p`, and `depth` |
-| Inspect current plus historical facts | `mindreader:memory_recall` with `history` |
-| Match meaning after lexical recall is insufficient | `mindreader:memory_recall_semantic` with `text` and optional `labels` |
+| Search names or terms | `mindreader:recall` with `text` |
+| Fetch known node IRIs | `mindreader:recall` with `iris` |
+| Inspect Class or Property vocabulary | `mindreader:recall` with `labels: ["Class"]` or `["Property"]` |
+| Walk relevant relationships from a node | `mindreader:recall` with `around`, optional `p`, and `depth` |
+| Inspect current plus historical facts | `mindreader:recall` with `history` |
+| Match meaning after lexical recall is insufficient | `mindreader:recall_semantic` with `text` and optional `labels` |
 
-Use exactly one `mindreader:memory_recall` selector: `text`, `iris`, `labels`, `around`, or `history`.
+Use exactly one `mindreader:recall` selector: `text`, `iris`, `labels`, `around`, or `history`.
 
 - Both recall tools default `limit` to 20 and accept `1..=100`. For ordinary recall, `limit` is the returned fact budget except that catalog mode applies it to catalog nodes; semantic recall uses it as the maximum fused results.
 - Both accept `detail`: `detailed` is the default full envelope; `concise` returns handles plus thin subject/predicate/object lines and clears `paths`/`about`. Concise `iris` keeps top-level `facts[]` empty.

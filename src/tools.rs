@@ -1,7 +1,6 @@
 //! Graph mutations and in-process helpers behind five MCP mutation handlers.
 //!
-//! MCP calls `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`,
-//! and `memory_place` here. Writes are set-valued,
+//! MCP calls `write`, `revise`, `withdraw`, `judge`, and `place` here. Writes are set-valued,
 //! corrections record `SUPERSEDES` in one transaction, withdrawal is soft
 //! (`validTo`), and membership edits keep endpoint closure. Class/Property
 //! records stay global (`layers=[]`, `stub=false`). `CONTRADICTS` and
@@ -153,7 +152,7 @@ fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
 fn validate_write_args(args: &WriteArgs) -> Result<()> {
     if args.facts.is_empty() || args.facts.len() > MAX_WRITE_FACTS {
         return Err(DomainError::InvalidInput(format!(
-            "memory_write facts must contain between 1 and {MAX_WRITE_FACTS} items"
+            "write facts must contain between 1 and {MAX_WRITE_FACTS} items"
         ))
         .into());
     }
@@ -228,7 +227,7 @@ fn relationship_iri() -> String {
     format!("mindreader:relationship/{}", Uuid::new_v4())
 }
 
-/// One set-valued triple inside a `memory_write` `facts[]` item.
+/// One set-valued triple inside a `write` `facts[]` item.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteFact {
@@ -246,7 +245,7 @@ pub struct WriteFact {
     pub contradicts: bool,
 }
 
-/// `memory_write` arguments: `facts[]` plus call-level `scope`.
+/// `write` arguments: `facts[]` plus call-level `scope`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct WriteArgs {
@@ -269,7 +268,7 @@ struct PreparedWriteFact {
     contradicts: bool,
 }
 
-/// Resolved correction plan used internally by `memory_revise`.
+/// Resolved correction plan used internally by `revise`.
 #[derive(Debug, Clone)]
 struct RevisionPlan {
     pub s: EntityInput,
@@ -294,7 +293,7 @@ struct RevisionResult {
     unify: Vec<Value>,
 }
 
-/// Resolved withdrawal selector used internally by `memory_withdraw`.
+/// Resolved withdrawal selector used internally by `withdraw`.
 #[derive(Debug, Clone)]
 struct WithdrawalSelector {
     pub kind: String,
@@ -387,7 +386,7 @@ pub struct JudgeArgs {
     pub ratings: Vec<JudgeRating>,
 }
 
-/// One membership edit inside an atomic `memory_place` batch.
+/// One membership edit inside an atomic `place` batch.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct PlaceEdit {
@@ -776,7 +775,7 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
     let mut txn = graph.start_txn().await?;
     let write = async {
         acquire_fact_locks_in_txn(&mut txn, &locks).await?;
-        let episode = create_episode_in_txn(&mut txn, "memory_write", None).await?;
+        let episode = create_episode_in_txn(&mut txn, "write", None).await?;
         let mut any_changed = false;
         let mut created_iris = Vec::new();
         let mut items = Vec::with_capacity(prepared.len());
@@ -790,7 +789,7 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
                     .json
                     .get("target")
                     .cloned()
-                    .ok_or_else(|| operation_error!("memory_write fact is missing target"))?;
+                    .ok_or_else(|| operation_error!("write fact is missing target"))?;
                 alternatives.push(json!({
                     "target": target,
                     "conflicts": item.alternatives,
@@ -814,7 +813,7 @@ async fn memory_write_once(graph: &Graph, args: WriteArgs) -> Result<Value> {
                 txn.commit()
                     .await
                     .map_err(|source| Error::AmbiguousCommit {
-                        operation: "memory_write",
+                        operation: "write",
                         source,
                     })?;
             } else {
@@ -1190,8 +1189,7 @@ async fn apply_revision_once(
         .await?;
         let (new_object, new_object_is_literal) = merge_object_in_txn(&mut txn, new_value).await?;
         let (_, property_created, _) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
-        let episode =
-            create_episode_in_txn(&mut txn, "memory_revise", args.reason.as_deref()).await?;
+        let episode = create_episode_in_txn(&mut txn, "revise", args.reason.as_deref()).await?;
         apply_node_memberships_txn(&mut txn, &subject, &layers).await?;
         apply_node_memberships_txn(&mut txn, &new_object, &layers).await?;
         change_fact_memberships_txn(
@@ -1275,7 +1273,7 @@ async fn apply_revision_once(
                 txn.commit()
                     .await
                     .map_err(|source| Error::AmbiguousCommit {
-                        operation: "memory_revise",
+                        operation: "revise",
                         source,
                     })?;
                 value
@@ -1499,13 +1497,12 @@ async fn apply_withdrawal_once(
             reason: args.reason,
         });
     }
-    let episode =
-        create_episode_in_txn(&mut txn, "memory_withdraw", args.reason.as_deref()).await?;
+    let episode = create_episode_in_txn(&mut txn, "withdraw", args.reason.as_deref()).await?;
     change_fact_memberships_batch_txn(&mut txn, &changes, &episode, args.reason.as_deref()).await?;
     txn.commit()
         .await
         .map_err(|source| Error::AmbiguousCommit {
-            operation: "memory_withdraw",
+            operation: "withdraw",
             source,
         })?;
     Ok(WithdrawalResult {
@@ -1566,7 +1563,7 @@ fn membership_allows(record: &[String], required: &[String]) -> bool {
     record.is_empty() || required.iter().all(|layer| record.contains(layer))
 }
 
-/// Input-ordered node lookup for `memory_recall` `iris`; misses stay `found: false`.
+/// Input-ordered node lookup for `recall` `iris`; misses stay `found: false`.
 const RECALL_IRI_NODES_QUERY: &str = r#"
 UNWIND range(0, size($iris) - 1) AS inputIndex
 WITH inputIndex, $iris[inputIndex] AS iri
@@ -1602,8 +1599,8 @@ RETURN inputIndex, s, r, o, property
 ORDER BY inputIndex ASC, s.iri ASC, property ASC, o.iri ASC, r.iri ASC
 "#;
 
-/// `memory_recall` `iris` path: ordered lookups plus a globally bounded fact set.
-/// `memory_recall` `iris`: input-ordered node lookups plus optional hops=1 incident facts.
+/// `recall` `iris` path: ordered lookups plus a globally bounded fact set.
+/// `recall` `iris`: input-ordered node lookups plus optional hops=1 incident facts.
 pub async fn memory_recall_iris(
     graph: &Graph,
     iris: Vec<String>,
@@ -1613,16 +1610,15 @@ pub async fn memory_recall_iris(
 ) -> Result<Value> {
     let layers = normalize_layers(scope)?;
     if !(1..=20).contains(&iris.len()) {
-        return Err(DomainError::InvalidInput(
-            "memory_recall iris must contain 1..=20 node IRIs".into(),
-        )
-        .into());
+        return Err(
+            DomainError::InvalidInput("recall iris must contain 1..=20 node IRIs".into()).into(),
+        );
     }
     if hops > 1 {
-        return Err(DomainError::InvalidInput("memory_recall hops must be 0 or 1".into()).into());
+        return Err(DomainError::InvalidInput("recall hops must be 0 or 1".into()).into());
     }
     if !(1..=100).contains(&fact_limit) {
-        return Err(DomainError::InvalidInput("memory_recall limit must be 1..=100".into()).into());
+        return Err(DomainError::InvalidInput("recall limit must be 1..=100".into()).into());
     }
     let iris = iris
         .into_iter()
@@ -1727,7 +1723,7 @@ pub async fn memory_recall_iris(
     }))
 }
 
-/// Variable-length walk query for `memory_recall` `around` at the requested depth.
+/// Variable-length walk query for `recall` `around` at the requested depth.
 fn recall_around_query(depth: u32) -> String {
     format!(
         r#"
@@ -1758,7 +1754,7 @@ fn recall_around_query(depth: u32) -> String {
     )
 }
 
-/// `memory_recall` `around` path with predicate filtering before a deterministic fact limit.
+/// `recall` `around` path with predicate filtering before a deterministic fact limit.
 pub async fn memory_recall_around(
     graph: &Graph,
     from: &str,
@@ -1769,10 +1765,10 @@ pub async fn memory_recall_around(
 ) -> Result<Value> {
     use crate::domain::PredicateRef;
     if !(1..=3).contains(&depth) {
-        return Err(DomainError::InvalidInput("memory_recall depth must be 1..=3".into()).into());
+        return Err(DomainError::InvalidInput("recall depth must be 1..=3".into()).into());
     }
     if !(1..=100).contains(&limit) {
-        return Err(DomainError::InvalidInput("memory_recall limit must be 1..=100".into()).into());
+        return Err(DomainError::InvalidInput("recall limit must be 1..=100".into()).into());
     }
     let layers = normalize_layers(scope)?;
     let mut wanted = predicates
@@ -1928,7 +1924,7 @@ LIMIT $limit
 RETURN s, r, o, property, current, validTo
 "#;
 
-/// `memory_recall` `history` path: current and superseded facts for one handle.
+/// `recall` `history` path: current and superseded facts for one handle.
 pub async fn memory_recall_history(
     graph: &Graph,
     iri: &str,
@@ -1936,7 +1932,7 @@ pub async fn memory_recall_history(
     limit: u32,
 ) -> Result<Value> {
     if !(1..=100).contains(&limit) {
-        return Err(DomainError::InvalidInput("memory_recall limit must be 1..=100".into()).into());
+        return Err(DomainError::InvalidInput("recall limit must be 1..=100".into()).into());
     }
     let layers = normalize_layers(scope)?;
     let protected = SYSTEM_OWNED_RELS
@@ -2171,12 +2167,10 @@ fn object_input_from_node(node: &Node) -> Result<ObjectInput> {
     })
 }
 
-/// MCP `memory_revise`: resolve a fact IRI, then membership-selective SUPERSEDES.
+/// MCP `revise`: resolve a fact IRI, then membership-selective SUPERSEDES.
 pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
     if args.target.kind != "fact" {
-        return Err(
-            DomainError::InvalidInput("memory_revise target.kind must be fact".into()).into(),
-        );
+        return Err(DomainError::InvalidInput("revise target.kind must be fact".into()).into());
     }
     let layers = normalize_layers(args.scope)?;
     let (s, p, old) = load_current_fact(graph, &args.target.iri, &layers).await?;
@@ -2232,23 +2226,22 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
     )
 }
 
-/// MCP `memory_withdraw`: soft-withdraw by fact IRI or subject (optional predicate).
+/// MCP `withdraw`: soft-withdraw by fact IRI or subject (optional predicate).
 pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value> {
     let has_target = args.target.is_some();
     let has_subject = args.subject.is_some();
     if has_target == has_subject {
         return Err(DomainError::InvalidInput(
-            "memory_withdraw requires exactly one of target or subject".into(),
+            "withdraw requires exactly one of target or subject".into(),
         )
         .into());
     }
     let layers = normalize_layers(args.scope.clone())?;
     let withdrawal = if let Some(ref target) = args.target {
         if target.kind != "fact" {
-            return Err(DomainError::InvalidInput(
-                "memory_withdraw target.kind must be fact".into(),
-            )
-            .into());
+            return Err(
+                DomainError::InvalidInput("withdraw target.kind must be fact".into()).into(),
+            );
         }
         let (s, p, o) = load_current_fact(graph, &target.iri, &layers).await?;
         WithdrawalPlan {
@@ -2312,10 +2305,9 @@ fn judge_delta(mode: &str) -> Result<i64> {
     match mode {
         "strengthen" => Ok(1),
         "weaken" => Ok(-1),
-        _ => Err(DomainError::InvalidInput(
-            "memory_judge mode must be strengthen or weaken".into(),
-        )
-        .into()),
+        _ => {
+            Err(DomainError::InvalidInput("judge mode must be strengthen or weaken".into()).into())
+        }
     }
 }
 
@@ -2323,7 +2315,7 @@ fn judge_delta(mode: &str) -> Result<i64> {
 fn validate_judge_args(args: &JudgeArgs) -> Result<()> {
     if args.ratings.is_empty() || args.ratings.len() > MAX_WRITE_FACTS {
         return Err(DomainError::InvalidInput(format!(
-            "memory_judge ratings must contain between 1 and {MAX_WRITE_FACTS} items"
+            "judge ratings must contain between 1 and {MAX_WRITE_FACTS} items"
         ))
         .into());
     }
@@ -2334,7 +2326,7 @@ fn validate_judge_args(args: &JudgeArgs) -> Result<()> {
         judge_delta(&rating.mode)?;
         if !seen.insert((rating.target.kind.clone(), rating.target.iri.clone())) {
             return Err(DomainError::InvalidInput(format!(
-                "memory_judge contains duplicate target {}:{}",
+                "judge contains duplicate target {}:{}",
                 rating.target.kind, rating.target.iri
             ))
             .into());
@@ -2437,7 +2429,7 @@ async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
                 "status": "changed",
             }));
         }
-        let episode = create_episode_in_txn(&mut txn, "memory_judge", None).await?;
+        let episode = create_episode_in_txn(&mut txn, "judge", None).await?;
         let target_iris = args
             .ratings
             .iter()
@@ -2490,7 +2482,7 @@ async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
             txn.commit()
                 .await
                 .map_err(|source| Error::AmbiguousCommit {
-                    operation: "memory_judge",
+                    operation: "judge",
                     source,
                 })?;
             value
@@ -2526,7 +2518,7 @@ async fn memory_judge_once(graph: &Graph, args: JudgeArgs) -> Result<Value> {
     )
 }
 
-/// Apply 1–20 explicit ratings atomically under one `memory_judge` Episode.
+/// Apply 1–20 explicit ratings atomically under one `judge` Episode.
 pub async fn memory_judge(graph: &Graph, args: JudgeArgs) -> Result<Value> {
     validate_judge_args(&args)?;
     for attempt in 0..3_u64 {
@@ -2562,7 +2554,7 @@ struct PlannedPlaceEdit {
 fn normalize_place_args(args: PlaceArgs) -> Result<(Vec<String>, Vec<NormalizedPlaceEdit>)> {
     if args.edits.is_empty() || args.edits.len() > MAX_WRITE_FACTS {
         return Err(DomainError::InvalidInput(format!(
-            "memory_place edits must contain between 1 and {MAX_WRITE_FACTS} items"
+            "place edits must contain between 1 and {MAX_WRITE_FACTS} items"
         ))
         .into());
     }
@@ -2573,7 +2565,7 @@ fn normalize_place_args(args: PlaceArgs) -> Result<(Vec<String>, Vec<NormalizedP
         validate_target(&edit.target)?;
         if !seen.insert((edit.target.kind.clone(), edit.target.iri.clone())) {
             return Err(DomainError::InvalidInput(format!(
-                "memory_place contains duplicate target {}:{}",
+                "place contains duplicate target {}:{}",
                 edit.target.kind, edit.target.iri
             ))
             .into());
@@ -2582,13 +2574,13 @@ fn normalize_place_args(args: PlaceArgs) -> Result<(Vec<String>, Vec<NormalizedP
         let remove = normalize_layers(edit.remove)?;
         if add.is_empty() && remove.is_empty() {
             return Err(DomainError::InvalidInput(format!(
-                "memory_place edit {index} requires at least one add or remove layer"
+                "place edit {index} requires at least one add or remove layer"
             ))
             .into());
         }
         if add.iter().any(|layer| remove.contains(layer)) {
             return Err(DomainError::InvalidInput(format!(
-                "memory_place edit {index} adds and removes the same layer"
+                "place edit {index} adds and removes the same layer"
             ))
             .into());
         }
@@ -2785,7 +2777,7 @@ async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit])
         if !membership_allows(&s_layers, &r_layers) {
             let s_labels = row.get::<Vec<String>>("sLabels")?;
             return Err(DomainError::Precondition(format!(
-                "memory_place final state would expose fact {r_iri} while endpoint {s_iri} ({}) is hidden",
+                "place final state would expose fact {r_iri} while endpoint {s_iri} ({}) is hidden",
                 hidden_endpoint_kind(&s_iri, &s_labels)
             ))
             .into());
@@ -2793,7 +2785,7 @@ async fn validate_place_closure_txn(txn: &mut Txn, planned: &[PlannedPlaceEdit])
         if !membership_allows(&o_layers, &r_layers) {
             let o_labels = row.get::<Vec<String>>("oLabels")?;
             return Err(DomainError::Precondition(format!(
-                "memory_place final state would expose fact {r_iri} while endpoint {o_iri} ({}) is hidden",
+                "place final state would expose fact {r_iri} while endpoint {o_iri} ({}) is hidden",
                 hidden_endpoint_kind(&o_iri, &o_labels)
             ))
             .into());
@@ -2835,7 +2827,7 @@ async fn memory_place_once(
             return Ok::<_, Error>((None, planned));
         }
         validate_place_closure_txn(&mut txn, &planned).await?;
-        let episode = create_episode_in_txn(&mut txn, "memory_place", None).await?;
+        let episode = create_episode_in_txn(&mut txn, "place", None).await?;
         let changed_edits = planned
             .iter()
             .filter(|edit| edit.before != edit.after)
@@ -2931,7 +2923,7 @@ async fn memory_place_once(
             txn.commit()
                 .await
                 .map_err(|source| Error::AmbiguousCommit {
-                    operation: "memory_place",
+                    operation: "place",
                     source,
                 })?;
             (Some(episode), planned)
@@ -3006,7 +2998,7 @@ pub async fn memory_place(graph: &Graph, args: PlaceArgs) -> Result<Value> {
     unreachable!("bounded retry loop always returns")
 }
 
-/// Class/Property catalog used by `memory_recall` (global schema-as-data).
+/// Class/Property catalog used by `recall` (global schema-as-data).
 pub async fn list_schema_catalog(graph: &Graph, kind: &str) -> Result<Value> {
     let kind = kind.trim().to_ascii_lowercase();
     if kind != "class" && kind != "property" {

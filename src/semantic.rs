@@ -1,6 +1,6 @@
 //! Semantic recall: embed a query and fuse it with remembered activations.
 //!
-//! Exposed separately from closed-world `memory_recall`. Combines ranked
+//! Exposed separately from closed-world `recall`. Combines ranked
 //! direct `ASSERTS`/`ABOUT` hits with TTL activation bundles via reciprocal
 //! rank fusion, still under the request `scope`. Query text is sent to the
 //! configured embedding provider; without a key this path fails as
@@ -32,7 +32,7 @@ use std::sync::Arc;
 /// Maximum UTF-8 byte length accepted for semantic query text.
 pub const MAX_SEMANTIC_TEXT_BYTES: usize = 32 * 1024;
 
-/// Arguments for the side-effectful `memory_recall_semantic` operation.
+/// Arguments for the side-effectful `recall_semantic` operation.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SemanticSearchArgs {
@@ -103,14 +103,13 @@ struct Activation {
 fn validate_semantic_text(text: &str) -> Result<String> {
     let text = text.trim();
     if text.is_empty() {
-        return Err(DomainError::InvalidInput(
-            "memory_recall_semantic text must not be empty".into(),
-        )
-        .into());
+        return Err(
+            DomainError::InvalidInput("recall_semantic text must not be empty".into()).into(),
+        );
     }
     if text.len() > MAX_SEMANTIC_TEXT_BYTES {
         return Err(DomainError::InvalidInput(format!(
-            "memory_recall_semantic text must not exceed {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes"
+            "recall_semantic text must not exceed {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes"
         ))
         .into());
     }
@@ -124,7 +123,7 @@ pub fn validate_semantic_search_args(args: &SemanticSearchArgs) -> Result<()> {
     if let Some(labels) = &args.labels {
         if labels.iter().any(|label| label.trim().is_empty()) {
             return Err(DomainError::InvalidInput(
-                "memory_recall_semantic labels must contain non-empty labels".into(),
+                "recall_semantic labels must contain non-empty labels".into(),
             )
             .into());
         }
@@ -132,7 +131,7 @@ pub fn validate_semantic_search_args(args: &SemanticSearchArgs) -> Result<()> {
         for label in labels {
             if !seen.insert(label.trim()) {
                 return Err(DomainError::InvalidInput(format!(
-                    "memory_recall_semantic labels contains duplicate label {:?}",
+                    "recall_semantic labels contains duplicate label {:?}",
                     label.trim()
                 ))
                 .into());
@@ -141,10 +140,9 @@ pub fn validate_semantic_search_args(args: &SemanticSearchArgs) -> Result<()> {
     }
     if let Some(limit) = args.limit {
         if !(1..=100).contains(&limit) {
-            return Err(DomainError::InvalidInput(
-                "memory_recall_semantic limit must be 1..=100".into(),
-            )
-            .into());
+            return Err(
+                DomainError::InvalidInput("recall_semantic limit must be 1..=100".into()).into(),
+            );
         }
     }
     crate::payload::Detail::parse(args.detail.as_deref())?;

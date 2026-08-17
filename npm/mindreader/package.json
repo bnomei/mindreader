@@ -1,7 +1,7 @@
 {
   "name": "@bnomei/mindreader",
   "version": "0.5.0",
-  "description": "Deterministic, privacy-first Neo4j memory MCP server.",
+  "description": "Agent-driven durable Neo4j graph memory MCP server.",
   "homepage": "https://github.com/bnomei/mindreader",
   "repository": {
     "type": "git",

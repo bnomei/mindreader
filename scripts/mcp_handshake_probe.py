@@ -14,7 +14,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 PROTOCOL = "2026-07-28"
-LEGACY_PROTOCOLS = ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"]
+HOST_COMPAT_PROTOCOLS = ["2025-11-25"]
+LEGACY_PROTOCOLS = ["2024-11-05", "2025-03-26", "2025-06-18"]
 UNKNOWN_PROTOCOL = "2099-01-01"
 
 
@@ -242,6 +243,20 @@ def main() -> int:
         if contamination is not None or not initialized_current_protocol(response):
             succeeded = False
 
+        for protocol in HOST_COMPAT_PROTOCOLS:
+            print("=" * 72)
+            print(f"INITIALIZE {protocol}")
+            response, _, stderr, contamination, elapsed = initialize(
+                binary, protocol, env, args.timeout
+            )
+            print(f"elapsed_s={elapsed:.3f}")
+            print(json.dumps(response, indent=2) if response is not None else "TIMEOUT/NONE")
+            print("--- stderr ---")
+            print(stderr)
+            print(f"stdout_contamination={contamination or 'none'}")
+            if contamination is not None or not initialized_protocol(response, protocol):
+                succeeded = False
+
         for protocol in [*LEGACY_PROTOCOLS, UNKNOWN_PROTOCOL]:
             print("=" * 72)
             print(f"REJECT INITIALIZE {protocol}")
@@ -260,14 +275,14 @@ def main() -> int:
 
 UNION_KEYS = {"anyOf", "oneOf", "allOf"}
 EXPECTED_TOOLS = {
-    "memory_judge",
-    "memory_place",
-    "memory_recall",
-    "memory_recall_semantic",
-    "memory_revise",
-    "memory_unify",
-    "memory_withdraw",
-    "memory_write",
+    "judge",
+    "place",
+    "recall",
+    "recall_semantic",
+    "revise",
+    "unify",
+    "withdraw",
+    "write",
 }
 
 
@@ -285,7 +300,7 @@ def discovery_contract_ok(discovery: dict | None, tools: dict | None) -> bool:
     result = ((discovery or {}).get("result") or {})
     if result.get("resultType") != "complete":
         return False
-    if result.get("supportedVersions") != [PROTOCOL]:
+    if result.get("supportedVersions") != [PROTOCOL, *HOST_COMPAT_PROTOCOLS]:
         return False
     caps = result.get("capabilities") or {}
     tools_cap = caps.get("tools")
@@ -321,12 +336,16 @@ def rejected_protocol(response: dict | None) -> bool:
     )
 
 
-def initialized_current_protocol(response: dict | None) -> bool:
+def initialized_protocol(response: dict | None, protocol: str) -> bool:
     return (
         isinstance(response, dict)
         and "error" not in response
-        and ((response.get("result") or {}).get("protocolVersion") == PROTOCOL)
+        and ((response.get("result") or {}).get("protocolVersion") == protocol)
     )
+
+
+def initialized_current_protocol(response: dict | None) -> bool:
+    return initialized_protocol(response, PROTOCOL)
 
 
 if __name__ == "__main__":

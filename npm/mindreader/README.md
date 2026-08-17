@@ -1,7 +1,7 @@
 # @bnomei/mindreader
 
-The npm launcher for [Mindreader](https://github.com/bnomei/mindreader), a deterministic,
-privacy-first Neo4j memory MCP server.
+The npm launcher for [Mindreader](https://github.com/bnomei/mindreader), an agent-driven durable
+Neo4j graph memory MCP server with explicit fact capture and no hidden extraction.
 
 ```bash
 npx -y @bnomei/mindreader@0.5.0 --version

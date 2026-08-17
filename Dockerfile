@@ -20,7 +20,7 @@ COPY packaging/mindreader.docker.toml /config/mindreader/config.toml
 ENV XDG_CONFIG_HOME=/config
 
 LABEL org.opencontainers.image.title="Mindreader" \
-      org.opencontainers.image.description="Deterministic, privacy-first Neo4j memory MCP server" \
+      org.opencontainers.image.description="Agent-driven durable Neo4j graph memory MCP server" \
       org.opencontainers.image.source="https://github.com/bnomei/mindreader" \
       org.opencontainers.image.licenses="MIT" \
       org.opencontainers.image.version="${MINDREADER_VERSION}"

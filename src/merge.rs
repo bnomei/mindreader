@@ -1,6 +1,6 @@
 //! Permanent same-kind unify and advisory duplicate suggestions.
 //!
-//! MCP `memory_unify` calls [`memory_unify`]: source memberships, history, and
+//! MCP `unify` calls [`memory_unify`]: source memberships, history, and
 //! edges move onto a surviving target of the same canonical kind, with no
 //! `scope` filter. Bootstrap-seeded Class/Property IRIs cannot be sources.
 //! Writes may attach [`merge_suggestions_in_txn`] results as review-only
@@ -67,7 +67,7 @@ fn lucene_fuzzy_term(name: &str) -> String {
     query
 }
 
-/// MCP `memory_unify` arguments: surviving `target` node absorbs `source`.
+/// MCP `unify` arguments: surviving `target` node absorbs `source`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct UnifyArgs {
@@ -87,7 +87,7 @@ impl UnifyArgs {
     }
 }
 
-/// Permanently unify two same-kind nodes; MCP name is `memory_unify`.
+/// Permanently unify two same-kind nodes; MCP name is `unify`.
 pub async fn memory_unify(graph: &Graph, args: UnifyArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_unify_once(graph, &args).await {
@@ -130,7 +130,7 @@ async fn memory_unify_once(graph: &Graph, args: &UnifyArgs) -> Result<Value> {
             txn.commit()
                 .await
                 .map_err(|source| Error::AmbiguousCommit {
-                    operation: "memory_unify",
+                    operation: "unify",
                     source,
                 })?;
             Ok(node)
@@ -220,7 +220,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     let locked_affected = affected_fact_locks_in_txn(txn, source_iri, target_iri).await?;
     if locked_affected != initial_affected {
         return Err(Error::ConcurrentMutation(
-            "the relationships affected by memory_unify; retry the operation".into(),
+            "the relationships affected by unify; retry the operation".into(),
         ));
     }
     let row = fetch_one_txn(
@@ -252,7 +252,7 @@ async fn merge_in_txn(txn: &mut Txn, source_iri: &str, target_iri: &str) -> Resu
     let target_layers = target.get::<Vec<String>>("layers")?;
     let layers = merge_memberships(&target_layers, &source_layers);
     let weight = node_weight(&target)?.saturating_add(node_weight(&source)?);
-    let episode = create_episode_in_txn(txn, "memory_unify", None).await?;
+    let episode = create_episode_in_txn(txn, "unify", None).await?;
 
     let source_relationships_row = fetch_all_txn(
         txn,

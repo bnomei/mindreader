@@ -1,4 +1,4 @@
 interface:
   display_name: "Using Mindreader"
-  short_description: "Recall and maintain durable graph memory"
-  default_prompt: "Use $using-mindreader to recall and maintain durable context for this task."
+  short_description: "Autonomously recall and maintain agent memory"
+  default_prompt: "Use $using-mindreader proactively as your durable working memory: recall prior context before it can affect this task and capture future-useful knowledge without waiting for me to ask."

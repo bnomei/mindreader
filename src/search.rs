@@ -1,4 +1,4 @@
-//! Ranked fact retrieval and the graph-free `memory_recall` input contract.
+//! Ranked fact retrieval and the graph-free `recall` input contract.
 //!
 //! Text and non-schema label queries rank current `ASSERTS`/`ABOUT` facts:
 //! Spike category first, then subject+fact+object weight, then text score.
@@ -33,7 +33,7 @@ pub struct SearchArgs {
     pub limit: Option<u32>,
 }
 
-/// MCP `memory_recall` arguments. Runtime accepts exactly one selector.
+/// MCP `recall` arguments. Runtime accepts exactly one selector.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RecallArgs {
@@ -103,7 +103,7 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     .count();
     if selectors != 1 {
         return Err(DomainError::InvalidInput(
-            "memory_recall requires exactly one of text, iris, labels, around, or history".into(),
+            "recall requires exactly one of text, iris, labels, around, or history".into(),
         )
         .into());
     }
@@ -121,32 +121,32 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     crate::payload::Detail::parse(args.detail.as_deref())?;
     if selector != "iris" && args.hops.is_some() {
         return Err(DomainError::InvalidInput(format!(
-            "memory_recall hops applies only to the iris selector, not {selector}"
+            "recall hops applies only to the iris selector, not {selector}"
         ))
         .into());
     }
     if selector != "around" && args.p.is_some() {
         return Err(DomainError::InvalidInput(format!(
-            "memory_recall p applies only to the around selector, not {selector}"
+            "recall p applies only to the around selector, not {selector}"
         ))
         .into());
     }
     if selector != "around" && args.depth.is_some() {
         return Err(DomainError::InvalidInput(format!(
-            "memory_recall depth applies only to the around selector, not {selector}"
+            "recall depth applies only to the around selector, not {selector}"
         ))
         .into());
     }
     if selector != "history" && args.history.is_some() {
         return Err(DomainError::InvalidInput(format!(
-            "memory_recall history applies only to the history selector, not {selector}"
+            "recall history applies only to the history selector, not {selector}"
         ))
         .into());
     }
     if let Some(values) = &args.iris {
         if !(1..=20).contains(&values.len()) {
             return Err(DomainError::InvalidInput(
-                "memory_recall iris must contain 1..=20 node IRIs".into(),
+                "recall iris must contain 1..=20 node IRIs".into(),
             )
             .into());
         }
@@ -155,13 +155,13 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
             let iri = value.trim();
             if !is_iri(iri) || iri.starts_with("mindreader:relationship/") {
                 return Err(DomainError::InvalidInput(format!(
-                    "memory_recall iris accepts node IRIs, not {value:?}"
+                    "recall iris accepts node IRIs, not {value:?}"
                 ))
                 .into());
             }
             if !seen.insert(iri) {
                 return Err(DomainError::InvalidInput(format!(
-                    "memory_recall iris contains duplicate IRI {iri:?}"
+                    "recall iris contains duplicate IRI {iri:?}"
                 ))
                 .into());
             }
@@ -170,7 +170,7 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     if let Some(values) = &args.labels {
         if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
             return Err(DomainError::InvalidInput(
-                "memory_recall labels must contain non-empty labels".into(),
+                "recall labels must contain non-empty labels".into(),
             )
             .into());
         }
@@ -178,7 +178,7 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     if let Some(values) = &args.p {
         if values.is_empty() || values.iter().any(|value| value.trim().is_empty()) {
             return Err(DomainError::InvalidInput(
-                "memory_recall p must contain non-empty predicates".into(),
+                "recall p must contain non-empty predicates".into(),
             )
             .into());
         }
@@ -186,7 +186,7 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     if let Some(iri) = around {
         if !is_iri(iri) || iri.starts_with("mindreader:relationship/") {
             return Err(DomainError::InvalidInput(format!(
-                "memory_recall around requires a node IRI, not {iri:?}"
+                "recall around requires a node IRI, not {iri:?}"
             ))
             .into());
         }
@@ -194,29 +194,25 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
     if let Some(iri) = history {
         if !is_iri(iri) {
             return Err(DomainError::InvalidInput(format!(
-                "memory_recall history requires a node or fact IRI, not {iri:?}"
+                "recall history requires a node or fact IRI, not {iri:?}"
             ))
             .into());
         }
     }
     if let Some(hops) = args.hops {
         if hops != 0 && hops != 1 {
-            return Err(
-                DomainError::InvalidInput("memory_recall hops must be 0 or 1".into()).into(),
-            );
+            return Err(DomainError::InvalidInput("recall hops must be 0 or 1".into()).into());
         }
     }
     if let Some(depth) = args.depth {
         if !(1..=3).contains(&depth) {
-            return Err(
-                DomainError::InvalidInput("memory_recall depth must be 1..=3".into()).into(),
-            );
+            return Err(DomainError::InvalidInput("recall depth must be 1..=3".into()).into());
         }
     }
     if let Some(limit) = args.limit {
         if limit == 0 || limit > 100 {
             return Err(Error::from(DomainError::InvalidInput(
-                "memory_recall limit must be 1..=100".into(),
+                "recall limit must be 1..=100".into(),
             )));
         }
     }

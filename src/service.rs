@@ -62,7 +62,7 @@ impl MemoryService {
         &self.graph
     }
 
-    /// Side-effectful embedding fusion for MCP `memory_recall_semantic`.
+    /// Side-effectful embedding fusion for MCP `recall_semantic`.
     pub async fn recall_semantic(&self, args: SemanticSearchArgs) -> Result<Value> {
         semantic::memory_semantic_search(
             &self.graph,
@@ -73,7 +73,7 @@ impl MemoryService {
         .await
     }
 
-    /// MCP `memory_recall`: dispatch one closed-world selector to search, catalog, or walk.
+    /// MCP `recall`: dispatch one closed-world selector to search, catalog, or walk.
     pub async fn recall(&self, args: RecallArgs) -> Result<Value> {
         validate_recall_args(&args)?;
         let scope = args.scope.clone();
@@ -188,32 +188,32 @@ impl MemoryService {
         crate::payload::finish_recall(result, &scope, detail)
     }
 
-    /// MCP `memory_write`: batched set-valued triples under one `scope`.
+    /// MCP `write`: batched set-valued triples under one `scope`.
     pub async fn write(&self, args: WriteArgs) -> Result<Value> {
         tools::memory_write(&self.graph, args).await
     }
 
-    /// MCP `memory_revise`: membership-selective correction of one fact handle.
+    /// MCP `revise`: membership-selective correction of one fact handle.
     pub async fn revise(&self, args: ReviseArgs) -> Result<Value> {
         tools::memory_revise(&self.graph, args).await
     }
 
-    /// MCP `memory_withdraw`: soft-withdraw a fact handle or a subject/predicate slice.
+    /// MCP `withdraw`: soft-withdraw a fact handle or a subject/predicate slice.
     pub async fn withdraw(&self, args: WithdrawArgs) -> Result<Value> {
         tools::memory_withdraw(&self.graph, args).await
     }
 
-    /// MCP `memory_judge`: sequential ±1 ratings on node or fact handles.
+    /// MCP `judge`: sequential ±1 ratings on node or fact handles.
     pub async fn judge(&self, args: JudgeArgs) -> Result<Value> {
         tools::memory_judge(&self.graph, args).await
     }
 
-    /// MCP `memory_place`: change stored memberships; `scope` is visibility only.
+    /// MCP `place`: change stored memberships; `scope` is visibility only.
     pub async fn place(&self, args: PlaceArgs) -> Result<Value> {
         tools::memory_place(&self.graph, args).await
     }
 
-    /// MCP `memory_unify`: permanent same-kind merge with no visibility filter.
+    /// MCP `unify`: permanent same-kind merge with no visibility filter.
     pub async fn unify(&self, args: UnifyArgs) -> Result<Value> {
         merge::memory_unify(&self.graph, args).await
     }

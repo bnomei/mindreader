@@ -143,7 +143,7 @@ impl PredicateRef {
     }
 }
 
-/// Pasteable node handle used by `memory_unify`.
+/// Pasteable node handle used by `unify`.
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NodeHandle {
@@ -166,13 +166,13 @@ impl NodeHandle {
     pub fn iri(&self) -> Result<&str, DomainError> {
         if self.kind != "node" {
             return Err(DomainError::InvalidInput(
-                "memory_unify source and target kind must be \"node\"".into(),
+                "unify source and target kind must be \"node\"".into(),
             ));
         }
         let iri = self.iri.trim();
         if iri.is_empty() || !is_iri(iri) || iri.starts_with("mindreader:relationship/") {
             return Err(DomainError::InvalidInput(format!(
-                "memory_unify requires a node IRI, not {:?}",
+                "unify requires a node IRI, not {:?}",
                 self.iri
             )));
         }

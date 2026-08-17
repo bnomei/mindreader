@@ -1,8 +1,7 @@
 //! MCP stdio adapter: eight tools, host-compatible schemas, lazy Neo4j.
 //!
-//! Advertises `memory_recall`, `memory_write`, `memory_revise`,
-//! `memory_recall_semantic`, `memory_withdraw`, `memory_judge`, `memory_place`,
-//! and `memory_unify` as
+//! Advertises `recall`, `recall_semantic`, `write`, `revise`, `withdraw`,
+//! `judge`, `place`, and `unify` as
 //! plain tagged object schemas (no `anyOf`/`oneOf`/`allOf`). Initialize and
 //! `tools/list` do not wait on Neo4j. Recoverable failures are structured
 //! `isError` results. The 120/min burst-20 limiter and 45s timeout apply only
@@ -42,7 +41,12 @@ const RATE_LIMIT_PER_MINUTE: f64 = 120.0;
 /// Burst capacity of the same limiter (20 tokens).
 const RATE_LIMIT_BURST: f64 = 20.0;
 /// Protocol versions this process will negotiate; initialize rejects anything else.
-const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[ProtocolVersion::V_2026_07_28];
+///
+/// `2026-07-28` is preferred. `2025-11-25` is accepted so hosts that have not
+/// adopted the newer initialize version (including Grok) can still complete the
+/// handshake. The serve layer echoes the requested version when it is listed here.
+const SUPPORTED_PROTOCOL_VERSIONS: &[ProtocolVersion] =
+    &[ProtocolVersion::V_2026_07_28, ProtocolVersion::V_2025_11_25];
 
 /// Reject initialize requests that are not in [`SUPPORTED_PROTOCOL_VERSIONS`].
 fn require_supported_protocol(requested: ProtocolVersion) -> Result<(), McpError> {
@@ -170,7 +174,7 @@ fn object_input_schema() -> serde_json::Value {
     })
 }
 
-/// Host-compatible `memory_write` input: `facts[]` plus call-level `scope`.
+/// Host-compatible `write` input: `facts[]` plus call-level `scope`.
 fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
     // Host wrappers drop the whole server if any inputSchema uses anyOf.
     object_schema(serde_json::json!({
@@ -360,8 +364,7 @@ fn episode_schema() -> Value {
             "tool": {
                 "type": "string",
                 "enum": [
-                    "memory_judge", "memory_place", "memory_revise", "memory_unify",
-                    "memory_withdraw", "memory_write"
+                    "judge", "place", "revise", "unify", "withdraw", "write"
                 ]
             }
         },
@@ -527,7 +530,7 @@ impl TokenBucket {
 /// Stdio MCP server: eight-tool router, lazy Neo4j service, and invoke limiter.
 #[derive(Clone)]
 pub struct Mindreader {
-    /// RMCP router for the eight `memory_*` tools.
+    /// RMCP router for the eight memory tools.
     pub tool_router: ToolRouter<Self>,
     /// Filled on first invoke or warmup; initialize/`tools/list` leave it empty.
     service: Arc<OnceCell<MemoryService>>,
@@ -733,7 +736,7 @@ fn classify_boxed_source(source: &(dyn StdError + Send + Sync + 'static)) -> &'s
     "operation"
 }
 
-/// Host-compatible `memory_recall` input: `scope` plus exactly one runtime selector.
+/// Host-compatible `recall` input: `scope` plus exactly one runtime selector.
 fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -797,7 +800,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
-/// Host-compatible `memory_recall_semantic` input; `text` is required and embedded remotely.
+/// Host-compatible `recall_semantic` input; `text` is required and embedded remotely.
 fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -829,7 +832,7 @@ fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
-/// Host-compatible `memory_revise` input: fact handle plus replacement object.
+/// Host-compatible `revise` input: fact handle plus replacement object.
 fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -846,7 +849,7 @@ fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
-/// Host-compatible `memory_withdraw` input; runtime requires exactly one of `target` or `subject`.
+/// Host-compatible `withdraw` input; runtime requires exactly one of `target` or `subject`.
 fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -862,7 +865,7 @@ fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
-/// Host-compatible `memory_judge` input: 1–20 unique `strengthen`/`weaken` ratings.
+/// Host-compatible `judge` input: 1–20 unique `strengthen`/`weaken` ratings.
 fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -889,7 +892,7 @@ fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
-/// Host-compatible `memory_place` input: visibility `scope` plus membership `edits`.
+/// Host-compatible `place` input: visibility `scope` plus membership `edits`.
 fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -917,7 +920,7 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
     }))
 }
 
-/// Host-compatible `memory_unify` input; no `scope` because unify is database-wide.
+/// Host-compatible `unify` input; no `scope` because unify is database-wide.
 fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
     object_schema(json!({
         "type": "object",
@@ -1121,14 +1124,14 @@ fn schema_out_memory_unify() -> Arc<rmcp::model::JsonObject> {
 #[tool_router]
 impl Mindreader {
     #[tool(
-        name = "memory_recall",
+        name = "recall",
         title = "Recall visible memory",
-        description = "Use to read visible memory without external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history; other selector fields are rejected. limit defaults to 20 and is at most 100. hops applies only to iris (0 still returns incident fact handles on lookups[i].facts; 1 also fills top-level facts[] when detail is detailed). p and depth apply only to around; history walks current and validTo/SUPERSEDES facts for one node or fact IRI. detail is concise or detailed. Class or Property labels read the global catalog.",
+        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. limit defaults to 20 and is at most 100. hops applies only to iris; p and depth only to around; history accepts one node or fact IRI. detail is concise or detailed. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn memory_recall(
+    async fn recall(
         &self,
         Parameters(args): Parameters<RecallArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1137,14 +1140,14 @@ impl Mindreader {
     }
 
     #[tool(
-        name = "memory_recall_semantic",
+        name = "recall_semantic",
         title = "Recall by meaning",
-        description = "Use for conceptual recall when lexical memory_recall is insufficient. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. detail is concise or detailed. The call maintains expiring semantic activations, so it is neither read-only nor idempotent.",
+        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. detail is concise or detailed. The call maintains expiring semantic activations, so it is neither read-only nor idempotent.",
         input_schema = schema_memory_recall_semantic(),
         output_schema = schema_out_memory_recall_semantic(),
         annotations(title = "Recall by meaning", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
-    async fn memory_recall_semantic(
+    async fn recall_semantic(
         &self,
         Parameters(args): Parameters<SemanticSearchArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1153,14 +1156,14 @@ impl Mindreader {
     }
 
     #[tool(
-        name = "memory_write",
+        name = "write",
         title = "Write facts",
-        description = "Use to add durable triples after recall. facts contains 1–20 input-ordered items under one call-level scope; the batch is atomic and records one Episode only when something changes. Exact reassertions merge requested memberships and are no-ops only when every requested membership is already present. Review review.unify before memory_unify and review.alternatives without assuming another set-valued fact is wrong.",
+        description = "Use proactively whenever discussion, investigation, decision-making, implementation, debugging, review, or handoff establishes knowledge another agent or session should reuse: identities and relationships, preferences and standing instructions, decisions and rationale, requirements and constraints, conventions, durable commitments, stable project facts, or reusable signals, patterns, and insights. The user need not ask. Do not store secrets, chatter, transient status, raw dumps, or unsupported inference. facts contains 1–20 input-ordered items under one call-level scope; the atomic batch records one Episode only when something changes. Exact reassertions merge memberships. Review review.unify and review.alternatives as advisory queues.",
         input_schema = schema_memory_write(),
         output_schema = schema_out_memory_write(),
         annotations(title = "Write facts", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn memory_write(
+    async fn write(
         &self,
         Parameters(args): Parameters<WriteArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1169,14 +1172,14 @@ impl Mindreader {
     }
 
     #[tool(
-        name = "memory_revise",
+        name = "revise",
         title = "Revise a fact",
-        description = "Use to correct one current fact by pasting its fact-only target and supplying the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement and SUPERSEDES history commit in one transaction and the response returns both current target and previousTarget.",
+        description = "Use when current work establishes that one exact current fact is wrong and its replacement is known, whether or not the user requested a correction. Recall or reuse its fact-only target, then supply the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement and SUPERSEDES history commit in one transaction, and the response returns both current target and previousTarget.",
         input_schema = schema_memory_revise(),
         output_schema = schema_out_memory_revise(),
         annotations(title = "Revise a fact", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn memory_revise(
+    async fn revise(
         &self,
         Parameters(args): Parameters<ReviseArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1185,14 +1188,14 @@ impl Mindreader {
     }
 
     #[tool(
-        name = "memory_withdraw",
+        name = "withdraw",
         title = "Withdraw facts",
-        description = "Use to soft-withdraw either one current fact target or every visible current fact for subject, optionally restricted by p. Exactly one of target or subject is required. The operation sets validity history, never hard-deletes nodes or facts, and records one Episode only when something changes.",
+        description = "Use when current work establishes that a stored fact is obsolete, no longer true, or should not remain current and no replacement is known. Prefer one recalled current fact target; use subject with optional p only when every visible current fact in that slice should be withdrawn. Exactly one of target or subject is required. The operation preserves validity history, never hard-deletes nodes or facts, and records one Episode only when something changes.",
         input_schema = schema_memory_withdraw(),
         output_schema = schema_out_memory_withdraw(),
         annotations(title = "Withdraw facts", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn memory_withdraw(
+    async fn withdraw(
         &self,
         Parameters(args): Parameters<WithdrawArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1201,14 +1204,14 @@ impl Mindreader {
     }
 
     #[tool(
-        name = "memory_judge",
+        name = "judge",
         title = "Judge retrieved targets",
-        description = "Use after recalled nodes or facts helped or hurt. ratings contains 1–20 unique targets; strengthen or weaken changes each shared weight by exactly +1 or -1. The input-ordered batch is atomic, records one Episode, and rolls back fully on any failure. Recall itself never changes weight.",
+        description = "Use after the agent actually relied on a recalled node or fact and it materially helped, distracted, or misled the work. Judge retrieval utility, not truth: revise or withdraw a false or stale claim instead, and do not rate every result. ratings contains 1–20 unique targets; strengthen or weaken changes each shared weight by exactly +1 or -1. The input-ordered batch is atomic, records one Episode, and rolls back fully on any failure. Recall itself never changes weight.",
         input_schema = schema_memory_judge(),
         output_schema = schema_out_memory_judge(),
         annotations(title = "Judge retrieved targets", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn memory_judge(
+    async fn judge(
         &self,
         Parameters(args): Parameters<JudgeArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1217,14 +1220,14 @@ impl Mindreader {
     }
 
     #[tool(
-        name = "memory_place",
+        name = "place",
         title = "Place layer memberships",
-        description = "Use to atomically change layer memberships for 1–20 unique node or fact targets. scope controls visibility; each edits item supplies add and/or remove. Include literal fact endpoints in the same batch as {kind:\"node\", iri}. The whole input-ordered batch is validated against its combined final endpoint-closure state, records one Episode if changed, and rolls back fully on failure.",
+        description = "Use when the agent determines that existing memory belongs in additional, fewer, or different project, team, task, or analysis layers without changing the fact itself. This changes visibility membership, not authorization. Apply 1–20 unique node or fact edits atomically; scope controls current visibility and each edit supplies add and/or remove. Include literal fact endpoints in the same batch as {kind:\"node\", iri}. The batch is validated against its combined final endpoint-closure state, records one Episode if changed, and rolls back fully on failure.",
         input_schema = schema_memory_place(),
         output_schema = schema_out_memory_place(),
         annotations(title = "Place layer memberships", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
-    async fn memory_place(
+    async fn place(
         &self,
         Parameters(args): Parameters<PlaceArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1233,14 +1236,14 @@ impl Mindreader {
     }
 
     #[tool(
-        name = "memory_unify",
+        name = "unify",
         title = "Permanently unify nodes",
-        description = "Use only after reviewing review.unify and confirming two same-kind nodes are identical. source and target are pasteable node handles {kind:\"node\", iri}. This database-wide operation permanently absorbs source into target; target IRI and name survive. Reverse the pair when the other identity should survive. It has no scope because all memberships and history must be reconciled.",
+        description = "Use only when current evidence confirms that two same-kind nodes represent the same identity, after reviewing any review.unify suggestion and deciding which IRI and name must survive. Never unify merely because names are similar. source and target are pasteable node handles {kind:\"node\", iri}. This database-wide operation permanently absorbs source into target; reverse the pair when the other identity should survive. It has no scope because all memberships and history must be reconciled.",
         input_schema = schema_memory_unify(),
         output_schema = schema_out_memory_unify(),
         annotations(title = "Permanently unify nodes", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
     )]
-    async fn memory_unify(
+    async fn unify(
         &self,
         Parameters(args): Parameters<UnifyArgs>,
     ) -> Result<CallToolResult, McpError> {
@@ -1251,7 +1254,7 @@ impl Mindreader {
 
 #[tool_handler]
 impl ServerHandler for Mindreader {
-    /// Advertise tools-only capabilities, protocol 2026-07-28, and the eight-tool instructions.
+    /// Advertise tools-only capabilities, preferred protocol 2026-07-28, and the eight-tool instructions.
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_protocol_version(ProtocolVersion::V_2026_07_28)
@@ -1260,23 +1263,25 @@ impl ServerHandler for Mindreader {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "scope is an OR-union ([] is global-only). One memory_recall selector (text, iris, labels, around, or history), or skip recall when the write is already exact. Use memory_recall_semantic only for conceptual retrieval because it calls the embedding provider and updates activations. Write facts[] (1-20). Paste returned target handles into revise, withdraw, judge, place, or unify. Review review.unify before unifying. Never send Cypher or assert CONTRADICTS/SUPERSEDES.",
+                "The agent owns memory: proactively recall when work may depend on prior decisions, preferences, constraints, identities, conventions, project state, or lessons; proactively write future-useful facts[], rationale, and insights learned during work. scope is an OR-union ([] is global-only). Use recall_semantic only after lexical recall is insufficient. Paste returned target handles into mutations. Never store secrets, transient chatter, or raw dumps; never assert CONTRADICTS/SUPERSEDES.",
             )
     }
 
-    /// Negotiate only [`SUPPORTED_PROTOCOL_VERSIONS`]; unknown versions fail initialize.
+    /// Negotiate [`SUPPORTED_PROTOCOL_VERSIONS`]; unknown versions fail initialize.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
-    /// Handshake without Neo4j: version check, then return [`get_info`].
+    /// Handshake without Neo4j: accept a supported version and echo it on [`get_info`].
     async fn initialize(
         &self,
         request: InitializeRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<InitializeResult, McpError> {
-        require_supported_protocol(request.protocol_version)?;
-        Ok(self.get_info())
+        require_supported_protocol(request.protocol_version.clone())?;
+        let mut info = self.get_info();
+        info.protocol_version = request.protocol_version;
+        Ok(info)
     }
 }
 
@@ -1369,14 +1374,14 @@ mod tests {
     fn registers_eight_tools() {
         let names = Mindreader::registered_tool_names();
         let expected = [
-            "memory_judge",
-            "memory_place",
-            "memory_recall",
-            "memory_recall_semantic",
-            "memory_revise",
-            "memory_unify",
-            "memory_withdraw",
-            "memory_write",
+            "judge",
+            "place",
+            "recall",
+            "recall_semantic",
+            "revise",
+            "unify",
+            "withdraw",
+            "write",
         ];
         assert_eq!(names, expected);
         let router = Mindreader::tool_router();
@@ -1392,7 +1397,7 @@ mod tests {
         let tools: Vec<_> = router.list_all();
         let assert_schema = tools
             .iter()
-            .find(|tool| tool.name == "memory_write")
+            .find(|tool| tool.name == "write")
             .unwrap()
             .schema_as_json_value();
         let assert_props = assert_schema
@@ -1440,7 +1445,7 @@ mod tests {
 
         let revise_schema = tools
             .iter()
-            .find(|tool| tool.name == "memory_revise")
+            .find(|tool| tool.name == "revise")
             .unwrap()
             .schema_as_json_value();
         let revise_required = revise_schema["required"].as_array().unwrap();
@@ -1455,7 +1460,7 @@ mod tests {
 
         let withdraw_schema = tools
             .iter()
-            .find(|tool| tool.name == "memory_withdraw")
+            .find(|tool| tool.name == "withdraw")
             .unwrap()
             .schema_as_json_value();
         assert_eq!(
@@ -1465,7 +1470,7 @@ mod tests {
 
         let judge_schema = tools
             .iter()
-            .find(|tool| tool.name == "memory_judge")
+            .find(|tool| tool.name == "judge")
             .unwrap()
             .schema_as_json_value();
         assert_eq!(
@@ -1476,7 +1481,7 @@ mod tests {
 
         let place_schema = tools
             .iter()
-            .find(|tool| tool.name == "memory_place")
+            .find(|tool| tool.name == "place")
             .unwrap()
             .schema_as_json_value();
         assert!(place_schema["properties"].get("target").is_none());
@@ -1496,7 +1501,7 @@ mod tests {
         for tool in router.list_all() {
             let schema = tool.schema_as_json_value();
             let required = schema["required"].as_array().cloned().unwrap_or_default();
-            if tool.name == "memory_unify" {
+            if tool.name == "unify" {
                 assert!(!required.iter().any(|value| value == "scope"));
             } else {
                 assert!(
@@ -1540,7 +1545,7 @@ mod tests {
     }
 
     #[test]
-    fn get_info_and_discovery_advertise_only_2026_07_28() {
+    fn get_info_prefers_2026_07_28_and_discovery_lists_host_compat() {
         let info = test_server().get_info();
         assert_eq!(
             info.protocol_version,
@@ -1553,7 +1558,10 @@ mod tests {
         let versions = test_server().supported_protocol_versions();
         assert_eq!(
             versions.as_ref(),
-            &[rmcp::model::ProtocolVersion::V_2026_07_28]
+            &[
+                rmcp::model::ProtocolVersion::V_2026_07_28,
+                rmcp::model::ProtocolVersion::V_2025_11_25,
+            ]
         );
 
         let discovery = rmcp::model::DiscoverResult::from_server_info(
@@ -1564,14 +1572,18 @@ mod tests {
         assert_eq!(discovery["resultType"], "complete");
         assert_eq!(
             discovery["supportedVersions"],
-            serde_json::json!(["2026-07-28"])
+            serde_json::json!(["2026-07-28", "2025-11-25"])
         );
     }
 
     #[test]
-    fn rejects_every_older_and_unknown_initialize_protocol() {
+    fn accepts_2025_11_25_and_rejects_older_or_unknown_initialize_protocols() {
+        assert!(require_supported_protocol(rmcp::model::ProtocolVersion::V_2026_07_28).is_ok());
+        assert!(require_supported_protocol(rmcp::model::ProtocolVersion::V_2025_11_25).is_ok());
         for version in rmcp::model::ProtocolVersion::KNOWN_VERSIONS {
-            if version != &rmcp::model::ProtocolVersion::V_2026_07_28 {
+            if version != &rmcp::model::ProtocolVersion::V_2026_07_28
+                && version != &rmcp::model::ProtocolVersion::V_2025_11_25
+            {
                 let error = require_supported_protocol(version.clone())
                     .expect_err("older protocol must be rejected");
                 assert_eq!(error.message, "Unsupported protocol version");
@@ -1603,37 +1615,37 @@ mod tests {
                 tool.name
             );
             match tool.name.as_ref() {
-                "memory_recall" => {
+                "recall" => {
                     assert_eq!(annotations.read_only_hint, Some(true));
                     assert_eq!(annotations.destructive_hint, Some(false));
                     assert_eq!(annotations.idempotent_hint, Some(true));
                     assert_eq!(annotations.open_world_hint, Some(false));
                 }
-                "memory_recall_semantic" => {
+                "recall_semantic" => {
                     assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(false));
                     assert_eq!(annotations.idempotent_hint, Some(false));
                     assert_eq!(annotations.open_world_hint, Some(true));
                 }
-                "memory_write" => {
+                "write" => {
                     assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(false));
                     assert_eq!(annotations.idempotent_hint, Some(true));
                     assert_eq!(annotations.open_world_hint, Some(false));
                 }
-                "memory_place" => {
+                "place" => {
                     assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(true));
                     assert_eq!(annotations.idempotent_hint, Some(true));
                     assert_eq!(annotations.open_world_hint, Some(false));
                 }
-                "memory_revise" | "memory_withdraw" | "memory_judge" => {
+                "revise" | "withdraw" | "judge" => {
                     assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(true));
                     assert_eq!(annotations.idempotent_hint, Some(false));
                     assert_eq!(annotations.open_world_hint, Some(false));
                 }
-                "memory_unify" => {
+                "unify" => {
                     assert_eq!(annotations.read_only_hint, Some(false));
                     assert_eq!(annotations.destructive_hint, Some(true));
                     assert_eq!(annotations.idempotent_hint, Some(false));
@@ -1675,7 +1687,7 @@ mod tests {
         let tools: Vec<_> = Mindreader::tool_router().list_all();
         let recall = tools
             .iter()
-            .find(|tool| tool.name == "memory_recall")
+            .find(|tool| tool.name == "recall")
             .unwrap()
             .schema_as_json_value();
         assert_eq!(
@@ -1698,7 +1710,7 @@ mod tests {
 
         let semantic = tools
             .iter()
-            .find(|tool| tool.name == "memory_recall_semantic")
+            .find(|tool| tool.name == "recall_semantic")
             .unwrap()
             .schema_as_json_value();
         assert_eq!(semantic["required"], serde_json::json!(["scope", "text"]));
@@ -1735,7 +1747,7 @@ mod tests {
         let tools: Vec<_> = Mindreader::tool_router().list_all();
         let revise = tools
             .iter()
-            .find(|tool| tool.name == "memory_revise")
+            .find(|tool| tool.name == "revise")
             .unwrap()
             .output_schema
             .as_ref()
@@ -1743,7 +1755,7 @@ mod tests {
         assert!(revise["properties"].get("previousTarget").is_some());
         let withdraw = tools
             .iter()
-            .find(|tool| tool.name == "memory_withdraw")
+            .find(|tool| tool.name == "withdraw")
             .unwrap()
             .output_schema
             .as_ref()
@@ -1753,17 +1765,21 @@ mod tests {
     }
 
     #[test]
-    fn instructions_and_descriptions_start_with_when_to_call() {
+    fn instructions_and_descriptions_define_autonomous_when_to_call() {
         let info = test_server().get_info();
         let instructions = info.instructions.expect("instructions");
         assert!(instructions.len() <= 512, "instructions exceed 512 chars");
+        assert!(instructions.contains("agent owns memory"));
+        assert!(instructions.contains("proactively recall"));
+        assert!(instructions.contains("proactively write"));
         assert!(instructions.contains("OR-union") || instructions.contains("OR union"));
         assert!(instructions.contains("Recall") || instructions.contains("recall"));
-        assert!(instructions.contains("memory_recall_semantic"));
+        assert!(instructions.contains("recall_semantic"));
         assert!(instructions.contains("facts[]"));
         assert!(instructions.contains("target"));
         assert!(instructions.contains("CONTRADICTS"));
-        for tool in Mindreader::tool_router().list_all() {
+        let tools = Mindreader::tool_router().list_all();
+        for tool in &tools {
             let description = tool
                 .description
                 .as_ref()
@@ -1774,6 +1790,25 @@ mod tests {
                 tool.name
             );
         }
+        let recall = tools
+            .iter()
+            .find(|tool| tool.name == "recall")
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap();
+        assert!(recall.contains("proactively"));
+        assert!(recall.contains("user need not request recall"));
+        let write = tools
+            .iter()
+            .find(|tool| tool.name == "write")
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap();
+        assert!(write.contains("proactively"));
+        assert!(write.contains("The user need not ask"));
+        assert!(write.contains("future") || write.contains("another agent or session"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ These instructions apply to the entire repository.
 
 ## Project contract
 
-Mindreader is a Rust stdio MCP server backed by Neo4j. The agent is the clerk of an inspectable graph: it exposes exactly eight memory tools (`memory_recall`, `memory_recall_semantic`, `memory_write`, `memory_revise`, `memory_withdraw`, `memory_judge`, `memory_place`, `memory_unify`) and stores only explicitly asserted triples, with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, explicit supersession history, optional semantic recall, and intentional same-kind entity merging. There is no hidden fact extractor. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/using-mindreader/SKILL.md` aligned with it.
+Mindreader is a Rust stdio MCP server backed by Neo4j. The agent is the clerk of an inspectable graph: it exposes exactly eight memory tools (`recall`, `recall_semantic`, `write`, `revise`, `withdraw`, `judge`, `place`, `unify`) and stores only explicitly asserted triples, with provenance, request-scoped multi-layer visibility, shared explicit feedback weights, auditable layer memberships, soft retraction, explicit supersession history, optional semantic recall, and intentional same-kind entity merging. There is no hidden fact extractor. Treat the behavior in `src/` as authoritative; keep `README.md`, `mcp.json`, and `skills/using-mindreader/SKILL.md` aligned with it.
 
 Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward compatibility, or add abstraction for hypothetical future requirements. Choose the simplest implementation that fully satisfies the current contract.
 
@@ -38,20 +38,20 @@ Aim for feature-complete changes. Do not ship MVP-only slices, preserve backward
 - Parameterize user-provided Cypher values. Validate any identifier that must be interpolated, such as labels or relationship types.
 - Every scoped tool requires a validated `scope` array. `[]` means global-only; named layers form an OR union, and visible relationships require visible endpoints. Layer IDs use lowercase kebab-case colon namespaces. Graph storage still uses the `layers` property.
 - Empty record memberships mean global. An exact relationship has one identity across memberships; assertions merge memberships rather than duplicate the relationship.
-- Class/Property nodes and schema-definition edges are always global (`layers=[]`, `stub=false`). `memory_recall` with `labels` Class and/or Property is the catalog. Database-wide `memory_unify` is the only MCP tool without a `scope` input.
-- `memory_recall` is closed-world and read-only. `memory_recall_semantic` is the only recall tool that sends query text to the configured embedding provider or maintains semantic activations. Both default to 20 results and accept at most 100; `memory_recall.iris` accepts at most 20 node IRIs. `memory_recall` accepts exactly one of `text`, `iris`, `labels`, `around`, or `history`, plus optional `detail` (`concise`|`detailed`).
-- `memory_judge` changes a visible node or current fact's shared signed weight by exactly `+1` or `-1` per rating. Its 1–20 ratings are one atomic transaction and one Episode; duplicate targets are invalid. Retrieval never changes weight automatically, weights do not decay, and search uses weight only within the same Spike category.
-- `memory_place` applies 1–20 membership edits atomically, records at most one Episode, and must validate relationship endpoint closure against the batch's final state. `scope` is visibility; each edit's `add`/`remove` arrays are the membership change. Duplicate targets are invalid.
+- Class/Property nodes and schema-definition edges are always global (`layers=[]`, `stub=false`). `recall` with `labels` Class and/or Property is the catalog. Database-wide `unify` is the only MCP tool without a `scope` input.
+- `recall` is closed-world and read-only. `recall_semantic` is the only recall tool that sends query text to the configured embedding provider or maintains semantic activations. Both default to 20 results and accept at most 100; `recall.iris` accepts at most 20 node IRIs. `recall` accepts exactly one of `text`, `iris`, `labels`, `around`, or `history`, plus optional `detail` (`concise`|`detailed`).
+- `judge` changes a visible node or current fact's shared signed weight by exactly `+1` or `-1` per rating. Its 1–20 ratings are one atomic transaction and one Episode; duplicate targets are invalid. Retrieval never changes weight automatically, weights do not decay, and search uses weight only within the same Spike category.
+- `place` applies 1–20 membership edits atomically, records at most one Episode, and must validate relationship endpoint closure against the batch's final state. `scope` is visibility; each edit's `add`/`remove` arrays are the membership change. Duplicate targets are invalid.
 - Retraction is soft: set `validTo`; do not hard-delete nodes or history.
 - Ordinary assertions are set-valued `facts[]` (1–20 triples, call-level `scope`). Reasserting the exact `(subject, property, object)` merges memberships or is a no-op; asserting another object preserves every current value. One Episode is recorded if any fact changed; all-noop rolls back with `episode: null`.
-- Corrections are explicit: `memory_revise` moves only the requested memberships off the selected fact handle, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in the same transaction.
+- Corrections are explicit: `revise` moves only the requested memberships off the selected fact handle, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in the same transaction.
 - `CONTRADICTS` and `SUPERSEDES` are system-owned. Client commands must not assert, revise, or withdraw them directly.
 - Keep `CONTRADICTS` multi-valued and idempotent per exact pair.
 - Every state-changing mutation records exactly one `Episode` and associates provenance with the changed records. No-op mutations record none.
 - Preserve the MCP host compatibility rule in `src/server.rs`: advertised input and output schemas remain plain tagged object schemas and contain no `anyOf`, `oneOf`, or `allOf`.
 - Recoverable tool failures return MCP `isError` structured results (`{ok:false,reason,message,retryable,outcome}`). Domain validation is not JSON-RPC `-32602`. Protocol errors stay for unknown-tool, unusable-server, and serde of required fields. Every successful tool result includes `ok:true`.
 - The 120/min burst-20 token bucket and 45s invoke timeout apply only to MCP `#[tool]` handlers via `Mindreader::invoke`. Never wrap `tools::*` or smoke in the limiter/timeout.
-- Keep the registered tool list synchronized across `src/server.rs`, its tests, `mcp.json`, and the README (exactly eight `memory_*` names).
+- Keep the registered tool list synchronized across `src/server.rs`, its tests, `mcp.json`, and the README (exactly eight names).
 
 ## Working conventions
 

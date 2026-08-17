@@ -3,6 +3,13 @@
 All notable changes to Mindreader are documented here. The format follows Keep a Changelog, and
 versions follow Semantic Versioning.
 
+## [Unreleased]
+
+### Changed
+
+- Accept MCP initialize `2025-11-25` in addition to preferred `2026-07-28` so hosts that still request the older version can complete the handshake. Discovery lists both. Older and unknown initialize protocols remain rejected.
+- Remove the `memory_` prefix from all eight MCP tools: `recall`, `recall_semantic`, `write`, `revise`, `withdraw`, `judge`, `place`, and `unify`. New mutation Episodes use the same unprefixed names; no compatibility aliases are provided.
+
 ## [0.5.0] - 2026-08-16
 
 ### Changed

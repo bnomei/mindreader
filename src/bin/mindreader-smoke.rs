@@ -127,7 +127,7 @@ fn object_iri(iri: impl Into<String>) -> ObjectInput {
     }
 }
 
-/// One-triple `memory_write` under the given request `scope`.
+/// One-triple `write` under the given request `scope`.
 fn write_args(s: EntityInput, p: impl AsRef<str>, o: ObjectInput, scope: Vec<String>) -> WriteArgs {
     WriteArgs {
         facts: vec![WriteFact {
@@ -254,7 +254,7 @@ fn fact_position(value: &Value, relationship: &str) -> Option<usize> {
         .position(|fact| fact.pointer("/target/iri").and_then(Value::as_str) == Some(relationship))
 }
 
-/// Closed-world `memory_recall` text selector at detailed/limit=100.
+/// Closed-world `recall` text selector at detailed/limit=100.
 async fn search(service: &MemoryService, scope: Vec<String>, text: &str) -> Result<Value> {
     service
         .recall(RecallArgs {
@@ -407,14 +407,14 @@ async fn run() -> Result<u32> {
     let mut tool_names = Mindreader::registered_tool_names();
     tool_names.sort();
     let mut expected_tool_names = vec![
-        "memory_judge".to_string(),
-        "memory_place".to_string(),
-        "memory_recall".to_string(),
-        "memory_recall_semantic".to_string(),
-        "memory_revise".to_string(),
-        "memory_unify".to_string(),
-        "memory_withdraw".to_string(),
-        "memory_write".to_string(),
+        "judge".to_string(),
+        "place".to_string(),
+        "recall".to_string(),
+        "recall_semantic".to_string(),
+        "revise".to_string(),
+        "unify".to_string(),
+        "withdraw".to_string(),
+        "write".to_string(),
     ];
     expected_tool_names.sort();
     report.check(
@@ -572,9 +572,9 @@ async fn run() -> Result<u32> {
         .param("iri", format!("mindreader:property/{property}")),
     )
     .await?
-    .ok_or_else(|| operation_error!("memory_write did not declare property {property}"))?;
+    .ok_or_else(|| operation_error!("write did not declare property {property}"))?;
     report.check(
-        "memory_write declares global properties under its mutation Episode",
+        "write declares global properties under its mutation Episode",
         schema_property
             .get::<Vec<String>>("layers")
             .is_ok_and(|layers| layers.is_empty())
@@ -678,7 +678,7 @@ async fn run() -> Result<u32> {
         .await?;
     let batch_episode = batch.pointer("/episode/iri").and_then(Value::as_str);
     report.check(
-        "one memory_write facts[] call records one Episode for three triples",
+        "one write facts[] call records one Episode for three triples",
         batch.get("noop").and_then(Value::as_bool) == Some(false)
             && batch
                 .get("facts")
@@ -716,7 +716,7 @@ async fn run() -> Result<u32> {
         })
         .await?;
     report.check(
-        "all-noop memory_write facts[] rolls back without an Episode",
+        "all-noop write facts[] rolls back without an Episode",
         batch_noop.get("noop").and_then(Value::as_bool) == Some(true)
             && batch_noop.get("episode").is_some_and(Value::is_null)
             && batch_noop
@@ -853,7 +853,7 @@ async fn run() -> Result<u32> {
     let replace_b =
         fact_relationships(&search(&service, vec![layer_b.clone()], &merge_token).await?)?;
     report.check(
-        "memory_revise moves only selected memberships and preserves unrelated scope",
+        "revise moves only selected memberships and preserves unrelated scope",
         relation_state(&graph, &merged_rel).await? == Some((vec![layer_b.clone()], true, 0))
             && relation_state(&graph, &replacement_rel).await?
                 == Some((vec![layer_a.clone()], true, 0))
@@ -881,7 +881,7 @@ async fn run() -> Result<u32> {
         })
         .await?;
     report.check(
-        "memory_withdraw retires a fact when its last named membership is removed",
+        "withdraw retires a fact when its last named membership is removed",
         withdrawn.get("withdrawn").and_then(Value::as_u64) == Some(1)
             && relation_state(&graph, &merged_rel).await?
                 == Some((vec![layer_b.clone()], false, 0)),
@@ -1066,7 +1066,7 @@ async fn run() -> Result<u32> {
         ),
     );
 
-    let judge_episodes_before = episode_count(&graph, "memory_judge").await?;
+    let judge_episodes_before = episode_count(&graph, "judge").await?;
     let judged = service
         .judge(JudgeArgs {
             scope: vec![layer_a.clone()],
@@ -1088,7 +1088,7 @@ async fn run() -> Result<u32> {
             ],
         })
         .await?;
-    let judge_episodes_after = episode_count(&graph, "memory_judge").await?;
+    let judge_episodes_after = episode_count(&graph, "judge").await?;
     let high_after_batch = relation_state(&graph, &high_rel).await?;
     let rollback = service
         .judge(JudgeArgs {
@@ -1112,8 +1112,8 @@ async fn run() -> Result<u32> {
         })
         .await;
     report.check(
-        "memory_judge batches atomically under one Episode and rolls back mixed failures",
-        judged.pointer("/episode/tool").and_then(Value::as_str) == Some("memory_judge")
+        "judge batches atomically under one Episode and rolls back mixed failures",
+        judged.pointer("/episode/tool").and_then(Value::as_str) == Some("judge")
             && judged
                 .get("items")
                 .and_then(Value::as_array)
@@ -1121,7 +1121,7 @@ async fn run() -> Result<u32> {
             && judge_episodes_after == judge_episodes_before + 1
             && rollback.is_err()
             && relation_state(&graph, &high_rel).await? == high_after_batch
-            && episode_count(&graph, "memory_judge").await? == judge_episodes_after,
+            && episode_count(&graph, "judge").await? == judge_episodes_after,
         format!(
             "judged={judged} rollback={rollback:?} high={high_after_batch:?} episodes={judge_episodes_before}->{judge_episodes_after}"
         ),
@@ -1205,7 +1205,7 @@ async fn run() -> Result<u32> {
         })
         .await;
     report.check(
-        "memory_place succeeds only when endpoint/fact closure is preserved",
+        "place succeeds only when endpoint/fact closure is preserved",
         premature_relation_add.is_err()
             && subject_add.get("noop").and_then(Value::as_bool) == Some(false)
             && object_add.get("noop").and_then(Value::as_bool) == Some(false)
@@ -1227,7 +1227,7 @@ async fn run() -> Result<u32> {
     let place_subject = subject_iri(&place)?;
     let place_object = object_result_iri(&place)?;
     let place_fact = relationship_iri(&place)?;
-    let place_episodes_before = episode_count(&graph, "memory_place").await?;
+    let place_episodes_before = episode_count(&graph, "place").await?;
     let placed = service
         .place(PlaceArgs {
             scope: vec![layer_a.clone()],
@@ -1248,7 +1248,7 @@ async fn run() -> Result<u32> {
             .collect(),
         })
         .await?;
-    let place_episodes_after = episode_count(&graph, "memory_place").await?;
+    let place_episodes_after = episode_count(&graph, "place").await?;
     let place_rollback = service
         .place(PlaceArgs {
             scope: vec![layer_a.clone(), layer_c.clone()],
@@ -1273,8 +1273,8 @@ async fn run() -> Result<u32> {
         })
         .await;
     report.check(
-        "memory_place validates combined final closure, records one Episode, and rolls back mixed failures",
-        placed.pointer("/episode/tool").and_then(Value::as_str) == Some("memory_place")
+        "place validates combined final closure, records one Episode, and rolls back mixed failures",
+        placed.pointer("/episode/tool").and_then(Value::as_str) == Some("place")
             && placed
                 .get("items")
                 .and_then(Value::as_array)
@@ -1285,7 +1285,7 @@ async fn run() -> Result<u32> {
             && place_rollback.is_err()
             && node_layers(&graph, &place_subject).await?
                 == Some(vec![layer_a.clone(), layer_c.clone()])
-            && episode_count(&graph, "memory_place").await? == place_episodes_after,
+            && episode_count(&graph, "place").await? == place_episodes_after,
         format!(
             "placed={placed} rollback={place_rollback:?} episodes={place_episodes_before}->{place_episodes_after}"
         ),
@@ -1386,7 +1386,7 @@ async fn run() -> Result<u32> {
         })
         .await;
     report.check(
-        "memory_place keeps Class and Property schema records global",
+        "place keeps Class and Property schema records global",
         schema_place.is_err(),
         format!("schemaPlace={schema_place:?}"),
     );
@@ -1536,7 +1536,7 @@ async fn run() -> Result<u32> {
         })
         .await?;
     report.check(
-        "memory_recall preserves IRI order and misses, enforces one fact budget, and returns filtered witness paths",
+        "recall preserves IRI order and misses, enforces one fact budget, and returns filtered witness paths",
         recalled.get("mode").and_then(Value::as_str) == Some("iris")
             && lookup_order == recall_order.iter().map(String::as_str).collect::<Vec<_>>()
             && recalled
@@ -1589,7 +1589,7 @@ async fn run() -> Result<u32> {
         ),
     );
     report.check(
-        "memory_recall catalog emits pasteable node handles in the normalized schema",
+        "recall catalog emits pasteable node handles in the normalized schema",
         catalog.get("mode").and_then(Value::as_str) == Some("catalog")
             && schema_judgment
                 .pointer("/items/0/after")
@@ -1658,7 +1658,7 @@ async fn run() -> Result<u32> {
         })
         .await?;
     report.check(
-        "memory_recall hops 0 still returns incident fact handles, concise detail, and history walks a fact",
+        "recall hops 0 still returns incident fact handles, concise detail, and history walks a fact",
         hops0.get("mode").and_then(Value::as_str) == Some("iris")
             && hops0
                 .get("facts")
@@ -1906,7 +1906,7 @@ async fn run() -> Result<u32> {
         })
         .await?;
     report.check(
-        "merge suggestions prefer the shorter name and memory_unify keeps only the target",
+        "merge suggestions prefer the shorter name and unify keeps only the target",
         suggested
             && survivor.pointer("/node/iri").and_then(Value::as_str) == Some(short_iri.as_str())
             && removed.pointer("/lookups/0/found").and_then(Value::as_bool) == Some(false)

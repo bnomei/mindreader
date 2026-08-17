@@ -1230,7 +1230,7 @@ pub struct Episode {
     pub iri: String,
     /// Timestamp string returned by Neo4j for the Episode node.
     pub at: String,
-    /// MCP tool name that created this Episode (`memory_write`, …).
+    /// MCP tool name that created this Episode (`write`, …).
     pub tool: String,
 }
 

@@ -190,7 +190,7 @@ async fn seed(
         .collect())
 }
 
-/// Sample ranked `memory_recall` text search and fail if fact order leaves the weight oracle.
+/// Sample ranked `recall` text search and fail if fact order leaves the weight oracle.
 async fn benchmark_search(
     service: &MemoryService,
     layer: &str,
@@ -223,20 +223,20 @@ async fn benchmark_search(
         let relationships = result
             .get("facts")
             .and_then(Value::as_array)
-            .ok_or_else(|| operation_error!("memory_recall response has no facts array"))?
+            .ok_or_else(|| operation_error!("recall response has no facts array"))?
             .iter()
             .map(|fact| {
                 fact.pointer("/target/iri")
                     .and_then(Value::as_str)
                     .map(str::to_string)
-                    .ok_or_else(|| operation_error!("memory_recall fact has no target.iri: {fact}"))
+                    .ok_or_else(|| operation_error!("recall fact has no target.iri: {fact}"))
             })
             .collect::<Result<Vec<_>>>()?;
         if sample == 0 {
             reference = relationships;
         } else if relationships != reference {
             return Err(operation_error!(
-                "memory_recall returned nondeterministic fact ordering"
+                "recall returned nondeterministic fact ordering"
             ));
         }
     }
@@ -257,7 +257,7 @@ async fn benchmark_search(
         .collect::<Vec<_>>();
     if reference != expected {
         return Err(operation_error!(
-            "memory_recall ranking diverged from the benchmark oracle: expected={expected:?} actual={reference:?}"
+            "recall ranking diverged from the benchmark oracle: expected={expected:?} actual={reference:?}"
         ));
     }
     Ok((summary(timings), reference))
