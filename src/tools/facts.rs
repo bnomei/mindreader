@@ -9,7 +9,8 @@
 //! exactly one Episode.
 
 use crate::domain::{
-    DomainError, EntityInput, EntityRef, ObjectInput, ObjectValue, PredicateRef, SpikeRank,
+    DomainError, EffectiveInterval, EffectiveUpdate, EntityInput, EntityRef,
+    NormalizedEffectiveInterval, ObjectInput, ObjectValue, PredicateRef, SpikeRank,
     WithdrawalScope,
 };
 use crate::graph::{
@@ -186,6 +187,17 @@ pub(super) fn prepare_write_fact(fact: WriteFact) -> Result<PreparedWriteFact> {
     let object_iri = object_value.resolved_iri();
     let prop_iri = predicate.iri().to_string();
     let structural = structural_relationship_for(&prop_iri);
+    if structural.is_some() && fact.effective.is_some() {
+        return Err(DomainError::InvalidInput(
+            "write effective applies only to ordinary state facts, not structural relationships"
+                .into(),
+        )
+        .into());
+    }
+    let effective = fact
+        .effective
+        .map(|interval| interval.normalize("write facts[].effective"))
+        .transpose()?;
     Ok(PreparedWriteFact {
         subject_spec,
         subject_kind,
@@ -196,6 +208,7 @@ pub(super) fn prepare_write_fact(fact: WriteFact) -> Result<PreparedWriteFact> {
         structural,
         spike,
         contradicts: fact.contradicts,
+        effective,
     })
 }
 
@@ -253,6 +266,9 @@ pub struct WriteFact {
     /// When true, add current CONTRADICTS edges from this object to other current values.
     #[serde(default)]
     pub contradicts: bool,
+    /// Optional half-open world-time interval; absent/null means temporally unknown.
+    #[serde(default)]
+    pub effective: Option<EffectiveInterval>,
 }
 
 /// `write` arguments: `facts[]` plus call-level `scope`.
@@ -276,6 +292,7 @@ pub(super) struct PreparedWriteFact {
     structural: Option<String>,
     spike: Option<String>,
     pub(super) contradicts: bool,
+    effective: Option<NormalizedEffectiveInterval>,
 }
 
 /// Resolved correction plan used internally by `revise`.
@@ -289,6 +306,8 @@ struct RevisionPlan {
     pub spike: Option<String>,
     pub contradicts: bool,
     pub reason: Option<String>,
+    pub effective: EffectiveUpdate,
+    pub previous_effective: Option<NormalizedEffectiveInterval>,
 }
 
 /// Outcome of one revise attempt, including no-op same-object corrections.
@@ -367,6 +386,9 @@ pub struct ReviseArgs {
     /// Optional audit note stored on the Episode and replacement fact.
     #[serde(default)]
     pub reason: Option<String>,
+    /// Omitted inherits the selected fact's interval; null clears it; an object replaces it.
+    #[serde(default)]
+    pub effective: EffectiveUpdate,
 }
 
 /// Soft-withdraw by fact handle or subject (+ optional predicate).
@@ -495,6 +517,7 @@ pub(super) struct CurrentFact {
     pub(super) iri: String,
     pub(super) layers: Vec<String>,
     pub(super) spike: Option<String>,
+    pub(super) effective: Option<NormalizedEffectiveInterval>,
 }
 
 /// Remaining memberships for one current fact after a revise/withdraw selection.
@@ -540,13 +563,15 @@ async fn find_current_pairs_txn(
     prop_iri: &str,
     structural: Option<&str>,
     o: &str,
+    effective: Option<&NormalizedEffectiveInterval>,
 ) -> Result<Vec<CurrentFact>> {
     let rows = if let Some(rel) = structural {
         let rel = safe_rel(rel)?;
         let cypher = format!(
             "MATCH (s:Entity {{iri: $s}})-[r:{rel}]->(o:Entity {{iri: $o}}) \
              WHERE r.validTo IS NULL RETURN id(r) AS rid, r.iri AS iri, \
-             r.layers AS layers, r.spike AS spike"
+             r.layers AS layers, r.spike AS spike, \
+             false AS effectiveQualified, null AS effectiveFrom, null AS effectiveTo"
         );
         fetch_all_txn(
             txn,
@@ -561,11 +586,30 @@ async fn find_current_pairs_txn(
             query(
                 "MATCH (s:Entity {iri: $s})-[r:ASSERTS]->(o:Entity {iri: $o}) \
                  WHERE r.validTo IS NULL AND r.propertyIri = $p \
-                 RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers, r.spike AS spike",
+                   AND coalesce(r.effectiveQualified, false) = $effectiveQualified \
+                   AND (($effectiveFrom IS NULL AND r.effectiveFrom IS NULL) \
+                        OR ($effectiveFrom IS NOT NULL \
+                            AND r.effectiveFrom = datetime($effectiveFrom))) \
+                   AND (($effectiveTo IS NULL AND r.effectiveTo IS NULL) \
+                        OR ($effectiveTo IS NOT NULL \
+                            AND r.effectiveTo = datetime($effectiveTo))) \
+                 RETURN id(r) AS rid, r.iri AS iri, r.layers AS layers, r.spike AS spike, \
+                        coalesce(r.effectiveQualified, false) AS effectiveQualified, \
+                        toString(r.effectiveFrom) AS effectiveFrom, \
+                        toString(r.effectiveTo) AS effectiveTo",
             )
             .param("s", s.to_string())
             .param("o", o.to_string())
-            .param("p", prop_iri.to_string()),
+            .param("p", prop_iri.to_string())
+            .param("effectiveQualified", effective.is_some())
+            .param(
+                "effectiveFrom",
+                effective.and_then(|interval| interval.from.clone()),
+            )
+            .param(
+                "effectiveTo",
+                effective.and_then(|interval| interval.to.clone()),
+            ),
         )
         .await?
     };
@@ -576,6 +620,13 @@ async fn find_current_pairs_txn(
                 iri: row.get("iri")?,
                 layers: row.get("layers")?,
                 spike: row.get::<String>("spike").ok(),
+                effective: row
+                    .get::<bool>("effectiveQualified")
+                    .unwrap_or(false)
+                    .then(|| NormalizedEffectiveInterval {
+                        from: row.get::<String>("effectiveFrom").ok(),
+                        to: row.get::<String>("effectiveTo").ok(),
+                    }),
             })
         })
         .collect()
@@ -593,6 +644,8 @@ struct RelationWrite<'a> {
     fact_text: &'a str,
     /// `Some` classifies or reclassifies the exact fact; `None` preserves an existing value.
     spike: Option<&'a str>,
+    /// Ordinary ASSERTS identity qualifier; structural relationships are always atemporal.
+    effective: Option<&'a NormalizedEffectiveInterval>,
 }
 
 /// Reassert an exact triple by merging memberships, or CREATE a new fact identity.
@@ -606,6 +659,7 @@ async fn ensure_relation_txn(
         write.prop_iri,
         Some(write.rel_type).filter(|rel| *rel != "ASSERTS"),
         write.o,
+        write.effective,
     )
     .await?;
     if current.len() > 1 {
@@ -652,11 +706,16 @@ async fn ensure_relation_txn(
             layers: $layers,
             weight: 0,
             validFrom: datetime(),
+            effectiveQualified: $effectiveQualified,
             episodeId: $episode,
             factText: $factText,
             spike: $spike
         }}]->(o)
-        SET r.reason = $reason
+        SET r.reason = $reason,
+            r.effectiveFrom = CASE WHEN $effectiveFrom IS NULL
+              THEN null ELSE datetime($effectiveFrom) END,
+            r.effectiveTo = CASE WHEN $effectiveTo IS NULL
+              THEN null ELSE datetime($effectiveTo) END
         RETURN r.iri AS iri
         "#
     );
@@ -671,7 +730,16 @@ async fn ensure_relation_txn(
             .param("episode", write.episode.iri.clone())
             .param("reason", write.reason.map(str::to_string))
             .param("factText", write.fact_text.to_string())
-            .param("spike", write.spike.map(str::to_string)),
+            .param("spike", write.spike.map(str::to_string))
+            .param("effectiveQualified", write.effective.is_some())
+            .param(
+                "effectiveFrom",
+                write.effective.and_then(|interval| interval.from.clone()),
+            )
+            .param(
+                "effectiveTo",
+                write.effective.and_then(|interval| interval.to.clone()),
+            ),
     )
     .await?
     .ok_or_else(|| operation_error!("failed to create relationship {iri}"))?;
@@ -713,6 +781,7 @@ async fn find_conflicts_txn(
     structural: Option<&str>,
     o_iri: &str,
     layers: &[String],
+    effective: Option<&NormalizedEffectiveInterval>,
 ) -> Result<Vec<Value>> {
     let rel_type = structural.unwrap_or("ASSERTS");
     let is_structural = structural.is_some();
@@ -727,6 +796,15 @@ async fn find_conflicts_txn(
               AND (size(o.layers) = 0 OR any(layer IN o.layers WHERE layer IN $layers))
               AND (($isStructural AND type(r) = $relType)
                 OR (NOT $isStructural AND type(r) = 'ASSERTS' AND r.propertyIri = $p))
+              AND ($isStructural
+                OR ($effectiveQualified = false
+                    AND coalesce(r.effectiveQualified, false) = false)
+                OR ($effectiveQualified = true
+                    AND coalesce(r.effectiveQualified, false) = true
+                    AND ($effectiveTo IS NULL OR r.effectiveFrom IS NULL
+                         OR r.effectiveFrom < datetime($effectiveTo))
+                    AND (r.effectiveTo IS NULL OR $effectiveFrom IS NULL
+                         OR datetime($effectiveFrom) < r.effectiveTo)))
             RETURN r, o, r.propertyIri AS p
             "#,
         )
@@ -735,7 +813,16 @@ async fn find_conflicts_txn(
         .param("layers", layers.to_vec())
         .param("p", prop_iri.to_string())
         .param("relType", rel_type.to_string())
-        .param("isStructural", is_structural),
+        .param("isStructural", is_structural)
+        .param("effectiveQualified", effective.is_some())
+        .param(
+            "effectiveFrom",
+            effective.and_then(|interval| interval.from.clone()),
+        )
+        .param(
+            "effectiveTo",
+            effective.and_then(|interval| interval.to.clone()),
+        ),
     )
     .await?
     .into_iter()
@@ -785,6 +872,7 @@ async fn ensure_contradictions_txn(
                 reason: None,
                 fact_text: &text,
                 spike: None,
+                effective: None,
             },
         )
         .await?;
@@ -943,6 +1031,7 @@ async fn write_prepared_fact_txn(
             reason: None,
             fact_text: &fact_text_value,
             spike: fact.spike.as_deref(),
+            effective: fact.effective.as_ref(),
         },
     )
     .await?;
@@ -957,6 +1046,7 @@ async fn write_prepared_fact_txn(
         fact.structural.as_deref(),
         &object.iri,
         layers,
+        fact.effective.as_ref(),
     )
     .await?;
     if fact.contradicts {
@@ -1137,6 +1227,18 @@ async fn apply_revision_once(
     let new_iri = new_value.resolved_iri();
     let prop_iri = predicate.iri().to_string();
     let structural = structural_relationship_for(&prop_iri);
+    if structural.is_some() && !matches!(&args.effective, EffectiveUpdate::Inherit) {
+        return Err(DomainError::InvalidInput(
+            "revise effective applies only to ordinary state facts, not structural relationships"
+                .into(),
+        )
+        .into());
+    }
+    let replacement_effective = match args.effective.clone() {
+        EffectiveUpdate::Inherit => args.previous_effective.clone(),
+        EffectiveUpdate::Clear => None,
+        EffectiveUpdate::Set(interval) => Some(interval.normalize("revise effective")?),
+    };
     let locks = revision_fact_lock_requests(
         &subject_iri,
         &prop_iri,
@@ -1152,6 +1254,7 @@ async fn apply_revision_once(
         &prop_iri,
         structural.as_deref(),
         &old_iri,
+        args.previous_effective.as_ref(),
     )
     .await?;
     let old_current = select_revision_current(&old_currents, &layers, expected_fact_iri)
@@ -1170,8 +1273,8 @@ async fn apply_revision_once(
                 ))
             }
         })?;
-    if old_iri == new_iri {
-        // Same object is a no-op: roll back, no Episode, no SUPERSEDES.
+    if old_iri == new_iri && old_current.effective == replacement_effective {
+        // Same object and interval is a no-op: roll back, no Episode, no SUPERSEDES.
         txn.rollback().await?;
         let target_iri = expected_fact_iri.unwrap_or(&old_current.iri);
         let target = TargetArgs::fact(target_iri);
@@ -1215,6 +1318,7 @@ async fn apply_revision_once(
                 reason: args.reason.as_deref(),
                 fact_text: &new_text,
                 spike: effective_spike.as_deref(),
+                effective: replacement_effective.as_ref(),
             },
         )
         .await?;
@@ -1231,6 +1335,7 @@ async fn apply_revision_once(
                 reason: args.reason.as_deref(),
                 fact_text: &supersedes_text,
                 spike: None,
+                effective: None,
             },
         )
         .await?;
@@ -1256,6 +1361,7 @@ async fn apply_revision_once(
             structural.as_deref(),
             &new_object.iri,
             &layers,
+            replacement_effective.as_ref(),
         )
         .await?;
         if args.contradicts {
@@ -1264,6 +1370,13 @@ async fn apply_revision_once(
         }
         let subject_json = refreshed_node_json_txn(&mut txn, &subject.iri).await?;
         let new_json = refreshed_node_json_txn(&mut txn, &new_object.iri).await?;
+        let relationship_json = refreshed_relation_json_txn(
+            &mut txn,
+            &new_relationship_iri,
+            &subject.iri,
+            &new_object.iri,
+        )
+        .await?;
         let mut created_iris = Vec::new();
         if subject.created {
             created_iris.push(subject.iri.clone());
@@ -1280,28 +1393,37 @@ async fn apply_revision_once(
             subject_json,
             new_json,
             new_relationship_iri,
+            relationship_json,
             conflicts,
             args.contradicts,
             merge_suggestions,
         ))
     }
     .await;
-    let (episode, subject, new, relationship_iri, alternatives, contradicts, merge_suggestions) =
-        match result {
-            Ok(value) => {
-                txn.commit()
-                    .await
-                    .map_err(|source| Error::AmbiguousCommit {
-                        operation: "revise",
-                        source,
-                    })?;
-                value
-            }
-            Err(error) => {
-                let _ = txn.rollback().await;
-                return Err(error);
-            }
-        };
+    let (
+        episode,
+        subject,
+        new,
+        relationship_iri,
+        relationship,
+        alternatives,
+        contradicts,
+        merge_suggestions,
+    ) = match result {
+        Ok(value) => {
+            txn.commit()
+                .await
+                .map_err(|source| Error::AmbiguousCommit {
+                    operation: "revise",
+                    source,
+                })?;
+            value
+        }
+        Err(error) => {
+            let _ = txn.rollback().await;
+            return Err(error);
+        }
+    };
     let current_target = TargetArgs::fact(relationship_iri);
     let previous_target = TargetArgs::fact(expected_fact_iri.unwrap_or(&old_current.iri));
     let conflicts = if contradicts {
@@ -1309,15 +1431,8 @@ async fn apply_revision_once(
     } else {
         json!([])
     };
-    let fact = json!({
-            "target": current_target.clone(),
-            "s": subject,
-            "p": prop_iri,
-            "o": new,
-            "scope": layers.clone(),
-            "spike": effective_spike,
-            "conflicts": conflicts,
-    });
+    let mut fact = crate::graph::fact_envelope(subject, &prop_iri, new, &relationship, &layers)?;
+    fact["conflicts"] = conflicts;
     Ok(RevisionResult {
         noop: false,
         scope: layers,
@@ -1482,6 +1597,7 @@ async fn apply_withdrawal_once(
                 iri: row.get("iri")?,
                 layers: row.get("layers")?,
                 spike: None,
+                effective: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1535,7 +1651,12 @@ async fn load_current_fact(
     graph: &Graph,
     iri: &str,
     layers: &[String],
-) -> Result<(EntityInput, String, ObjectInput)> {
+) -> Result<(
+    EntityInput,
+    String,
+    ObjectInput,
+    Option<NormalizedEffectiveInterval>,
+)> {
     let row = fetch_one(
         graph,
         query(
@@ -1548,7 +1669,10 @@ async fn load_current_fact(
                    OR any(layer IN r.layers WHERE layer IN $layers))
               AND (size(o.layers) = 0
                    OR any(layer IN o.layers WHERE layer IN $layers))
-            RETURN s, r, o, r.propertyIri AS p
+            RETURN s, r, o, r.propertyIri AS p,
+                   coalesce(r.effectiveQualified, false) AS effectiveQualified,
+                   toString(r.effectiveFrom) AS effectiveFrom,
+                   toString(r.effectiveTo) AS effectiveTo
             "#,
         )
         .param("iri", iri.to_string())
@@ -1587,10 +1711,18 @@ async fn load_current_fact(
     let subject: Node = row.get("s")?;
     let object: Node = row.get("o")?;
     let property: String = row.get("p")?;
+    let effective = row
+        .get::<bool>("effectiveQualified")
+        .unwrap_or(false)
+        .then(|| NormalizedEffectiveInterval {
+            from: row.get::<String>("effectiveFrom").ok(),
+            to: row.get::<String>("effectiveTo").ok(),
+        });
     Ok((
         entity_input_from_node(&subject)?,
         crate::graph::local_predicate_name(&property),
         object_input_from_node(&object)?,
+        effective,
     ))
 }
 
@@ -1638,7 +1770,8 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
         return Err(DomainError::InvalidInput("revise target.kind must be fact".into()).into());
     }
     let layers = normalize_layers(args.scope)?;
-    let (s, p, old) = load_current_fact(graph, &args.target.iri, &layers).await?;
+    let (s, p, old, previous_effective) =
+        load_current_fact(graph, &args.target.iri, &layers).await?;
     let result = apply_revision(
         graph,
         RevisionPlan {
@@ -1650,6 +1783,8 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
             spike: args.spike,
             contradicts: args.contradicts,
             reason: args.reason,
+            effective: args.effective,
+            previous_effective,
         },
         Some(&args.target.iri),
     )
@@ -1710,7 +1845,7 @@ pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value>
                 DomainError::InvalidInput("withdraw target.kind must be fact".into()).into(),
             );
         }
-        let (s, p, o) = load_current_fact(graph, &target.iri, &layers).await?;
+        let (s, p, o, _) = load_current_fact(graph, &target.iri, &layers).await?;
         WithdrawalPlan {
             target: WithdrawalSelector {
                 kind: "fact".into(),

@@ -5,9 +5,10 @@
 //! inventing their own. MCP exposes eight tools: ordinary and semantic recall,
 //! write, revise, withdraw, judge, place, and unify.
 //!
-//! Facts are explicit triples with Episode provenance, request `scope`
-//! (stored as `layers` memberships), signed judgment weights, soft withdrawal
-//! (`validTo`), and intentional same-kind unify.
+//! Facts are explicit triples with Episode provenance, optional effective-time
+//! intervals independent of transaction validity, request `scope` (stored as
+//! `layers` memberships), signed judgment weights, soft withdrawal (`validTo`),
+//! and intentional same-kind unify.
 
 mod config;
 mod domain;
@@ -71,6 +72,11 @@ pub mod developer {
         pub use crate::merge::merge_suggestions_in_txn;
     }
 
+    /// Existing MCP input schemas reused by non-MCP developer adapters.
+    pub mod schemas {
+        pub use crate::server::{developer_error_payload, developer_input_schema};
+    }
+
     /// Deterministic semantic runtime construction for the live smoke suite.
     pub mod semantic {
         pub use crate::semantic::SemanticRuntime;
@@ -78,11 +84,13 @@ pub mod developer {
 
     /// Application operations exercised by live developer binaries.
     pub mod service {
+        pub use crate::domain::{EffectiveInterval, EffectiveUpdate};
         pub use crate::payload::ToolOutput;
         pub use crate::service::{
-            JudgeArgs, JudgeRating, MemoryService, PlaceArgs, PlaceEdit, RecallArgs, ReviseArgs,
-            SemanticSearchArgs, TargetArgs, UnifyArgs, WithdrawArgs, WriteArgs, WriteFact,
+            JudgeArgs, MemoryService, PlaceArgs, RecallArgs, ReviseArgs, SemanticSearchArgs,
+            UnifyArgs, WithdrawArgs, WriteArgs,
         };
+        pub use crate::tools::{JudgeRating, PlaceEdit, TargetArgs, WriteFact};
     }
 
     /// MCP server used to verify eager developer connections.

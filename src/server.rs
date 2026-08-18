@@ -70,7 +70,7 @@ fn object_schema(value: serde_json::Value) -> Arc<rmcp::model::JsonObject> {
 fn scope_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "array",
-        "description": "Visibility union. [] selects global/unlayered records only. Named records match any requested layer. IDs use lowercase kebab-case with colon namespaces, for example project:mindreader or analysis:hypothesis; colons are naming, not hierarchy.",
+        "description": "Visibility union. [] selects global/unlayered records only. Named records match any requested layer. IDs use lowercase kebab-case with colon namespaces, for example project:mindreader or analysis:hypothesis; colons are naming, not hierarchy. When a task or host supplies scope, copy its exact values; a modified or invented ID is a different layer.",
         "uniqueItems": true,
         "items": {
             "type": "string",
@@ -142,10 +142,10 @@ fn predicate_list_schema(description: &str) -> serde_json::Value {
 }
 
 /// Tagged `kind=node` subject bag; runtime requires `iri` or `name`.
-fn entity_input_schema() -> serde_json::Value {
+fn entity_input_schema(description: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "A node reference. Runtime validation requires at least one of iri or name.",
+        "description": description,
         "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node"] },
@@ -161,7 +161,7 @@ fn entity_input_schema() -> serde_json::Value {
 fn object_input_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "A tagged node or literal. Node values use iri/name/labels; literal values use value and optional datatype.",
+        "description": "The assertion object. Node values use kind=node with iri/name/labels; literal values use kind=literal with value and optional datatype.",
         "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node", "literal"] },
@@ -172,6 +172,19 @@ fn object_input_schema() -> serde_json::Value {
             "datatype": { "type": "string", "minLength": 1, "default": "xsd:string" }
         },
         "required": ["kind"]
+    })
+}
+
+/// Half-open world-time interval. Presence is explicit even when both bounds are open.
+fn effective_interval_schema(nullable: bool) -> serde_json::Value {
+    json!({
+        "type": if nullable { json!(["object", "null"]) } else { json!("object") },
+        "description": "State-only half-open effective interval [from,to). Bounds are complete timezone-qualified RFC 3339 instants such as 2024-01-01T00:00:00Z, not date-only strings; omitted bounds are open. Model point events with event/date facts instead.",
+        "additionalProperties": false,
+        "properties": {
+            "from": { "type": "string", "format": "date-time" },
+            "to": { "type": "string", "format": "date-time" }
+        }
     })
 }
 
@@ -186,19 +199,28 @@ fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 20,
-                "description": "Atomic, input-ordered batch. The whole call rolls back if any item is invalid or fails.",
+                "description": "Exactly 1–20 facts total. Split larger sets into additional calls before invoking and put focal durable claims first. This input-ordered batch is atomic and rolls back if any item fails.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
-                        "s": entity_input_schema(),
-                        "p": { "type": "string", "minLength": 1 },
+                        "s": entity_input_schema("The assertion subject: who or what the fact is about. Use iri for an established identity; otherwise use name and optional labels. Runtime validation requires at least one of iri or name."),
+                        "p": {
+                            "type": "string",
+                            "minLength": 1,
+                            "description": "Predicate name or Property IRI describing the relationship from subject s to object o. Reuse established vocabulary for the same concept."
+                        },
                         "o": object_input_schema(),
                         "spike": {
                             "type": "string",
-                            "enum": ["Signal", "Pattern", "Insight", "Knowledge"]
+                            "enum": ["Signal", "Pattern", "Insight", "Knowledge"],
+                            "description": "Optional commitment for this exact fact: Signal raw evidence, Pattern recurrence, Insight interpretation, Knowledge a fact worth relying on. Omit rather than invent."
                         },
-                        "contradicts": { "type": "boolean" }
+                        "contradicts": {
+                            "type": "boolean",
+                            "description": "Set true only when this fact and visible current alternatives are directly incompatible and should remain current."
+                        },
+                        "effective": effective_interval_schema(true)
                     },
                     "required": ["s", "p", "o"]
                 }
@@ -284,7 +306,8 @@ fn relationship_schema() -> Value {
             "weight": { "type": "integer" },
             "episodeId": { "type": "string" },
             "reason": { "type": "string" },
-            "spike": { "type": ["string", "null"], "enum": ["Signal", "Pattern", "Insight", "Knowledge", null] }
+            "spike": { "type": ["string", "null"], "enum": ["Signal", "Pattern", "Insight", "Knowledge", null] },
+            "effective": effective_interval_schema(true)
         },
         "required": ["kind", "type", "iri", "from", "to", "propertyIri", "scope", "weight"]
     })
@@ -351,7 +374,18 @@ fn fact_schema() -> Value {
             "current": { "type": "boolean" },
             "rateable": { "type": "boolean" },
             "mutable": { "type": "boolean" },
-            "validTo": { "type": "string" }
+            "validTo": { "type": "string" },
+            "effective": effective_interval_schema(true),
+            "transactionCurrent": { "type": "boolean" },
+            "transaction": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "from": { "type": "string", "format": "date-time" },
+                    "to": { "type": ["string", "null"], "format": "date-time" }
+                },
+                "required": ["from", "to"]
+            }
         },
         "required": ["target", "s", "p", "o"]
     })
@@ -766,7 +800,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             "text": {
                 "type": "string",
                 "minLength": 1,
-                "description": "Lexical fact query. Use only when text is the selected recall mode."
+                "description": "Lexical fact query. Use concrete entity and action terms; do not embed parameter syntax such as effectiveAt in the text. Use only when text is the selected recall mode."
             },
             "iris": {
                 "type": "array",
@@ -794,7 +828,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
                 "enum": [0, 1],
                 "default": 0
             },
-            "p": predicate_list_schema("Around mode only: predicate names or IRIs to filter before limiting."),
+            "p": predicate_list_schema("Around mode only: predicate names or IRIs to filter before limiting. Omit this filter until the stored predicate vocabulary is known, especially for counts and comparisons."),
             "depth": {
                 "type": "integer",
                 "description": "Around mode only: traversal depth.",
@@ -812,6 +846,11 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
                 "type": "string",
                 "minLength": 1,
                 "description": "One node or fact IRI. Returns current and historical facts for that identity."
+            },
+            "effectiveAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional state-as-of filter for text, non-catalog labels, iris, or around. Only explicitly time-qualified facts effective at this instant match; unknown-time facts are excluded. Do not use it merely to search for dated point events."
             },
             "detail": detail_schema(),
             "limit": {
@@ -845,6 +884,11 @@ fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
                 "uniqueItems": true,
                 "items": label_schema()
             },
+            "effectiveAt": {
+                "type": "string",
+                "format": "date-time",
+                "description": "Optional state-as-of filter. Direct, activation, and structural facts must be explicitly effective at this instant; unknown-time facts are excluded. Do not use it merely to search for dated point events."
+            },
             "detail": detail_schema(),
             "limit": {
                 "type": "integer",
@@ -869,7 +913,8 @@ fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
             "new": object_input_schema(),
             "spike": { "type": "string", "enum": ["Signal", "Pattern", "Insight", "Knowledge"] },
             "contradicts": { "type": "boolean" },
-            "reason": { "type": "string" }
+            "reason": { "type": "string" },
+            "effective": effective_interval_schema(true)
         },
         "required": ["scope", "target", "new"]
     }))
@@ -883,12 +928,43 @@ fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
         "properties": {
             "scope": scope_schema(),
             "target": fact_target_schema(),
-            "subject": entity_input_schema(),
+            "subject": entity_input_schema("Subject node whose visible outgoing facts will be withdrawn. Use iri for an established identity; otherwise use name and optional labels. Runtime validation requires at least one of iri or name."),
             "p": { "type": "string", "minLength": 1 },
             "reason": { "type": "string", "description": "Optional audit reason." }
         },
         "required": ["scope"]
     }))
+}
+
+/// Return one existing MCP input schema for an in-process developer adapter.
+///
+/// The LongMemEval harness uses this seam to present the exact same arguments to
+/// OpenAI without constructing an MCP router or duplicating the wire contract.
+#[cfg(feature = "developer-tools")]
+pub fn developer_input_schema(name: &str) -> Option<Value> {
+    let schema = match name {
+        "recall" => schema_memory_recall(),
+        "recall_semantic" => schema_memory_recall_semantic(),
+        "write" => schema_memory_write(),
+        "revise" => schema_memory_revise(),
+        "withdraw" => schema_memory_withdraw(),
+        _ => return None,
+    };
+    Some(Value::Object(schema.as_ref().clone()))
+}
+
+/// Map one application failure into the direct developer adapter's JSON dialect.
+#[cfg(feature = "developer-tools")]
+pub fn developer_error_payload(error: &Error) -> Value {
+    let reason = classify_tool_error(error);
+    let unknown = matches!(error, Error::AmbiguousCommit { .. });
+    json!({
+        "ok": false,
+        "reason": reason,
+        "message": error.to_string(),
+        "retryable": !unknown && (error_retryable(reason) || error.is_transient_neo4j()),
+        "outcome": if unknown { "unknown" } else { "not_applied" }
+    })
 }
 
 /// Host-compatible `judge` input: 1–20 unique `strengthen`/`weaken` ratings.
@@ -1164,7 +1240,7 @@ impl Mindreader {
     #[tool(
         name = "recall",
         title = "Recall visible memory",
-        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Text recall safely combines an exact phrase with bounded OR-keyword matching of terms at least four Unicode characters long. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. limit defaults to 20 and is at most 100. hops applies only to iris; p, direction, and depth only to around, where they constrain every traversed edge. history accepts one node or fact IRI and returns exact revision events plus current/historical facts. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. Class or Property labels read the global catalog.",
+        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Text recall safely combines an exact phrase with bounded OR-keyword matching of terms at least four Unicode characters long. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. For comparisons and counts, retrieve every named anchor and avoid an around predicate filter until stored vocabulary is known. limit defaults to 20 and is at most 100. hops applies only to iris; p, direction, and depth only to around, where they constrain every traversed edge. effectiveAt is only a state-as-of filter: it excludes unknown-time facts and is invalid for history, point-event lookup, and Class/Property catalog recall. history accepts one node or fact IRI and returns exact revision events plus transaction/effective-time facts. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1181,7 +1257,7 @@ impl Mindreader {
     #[tool(
         name = "recall_semantic",
         title = "Recall by meaning",
-        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. Every call combines exact and bounded keyword candidates with matching semantic activations, so untouched topics can surface lexically before later paraphrases reuse their activation group. Exact evidence outweighs keyword-only evidence, and repeated activations cannot amplify a fact by accumulation. Grounded anchors may surface bounded degree-normalized one-hop ASSERTS context; expanded facts stay weaker than anchors and never teach activations. A query with no results creates no activation. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. The call may maintain expiring semantic activations, so it is neither read-only nor idempotent.",
+        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. Every call combines exact and bounded keyword candidates with matching semantic activations, so untouched topics can surface lexically before later paraphrases reuse their activation group. Exact evidence outweighs keyword-only evidence, and repeated activations cannot amplify a fact by accumulation. Grounded anchors may surface bounded degree-normalized one-hop ASSERTS context; expanded facts stay weaker than anchors and never teach activations. A query with no results creates no activation. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. Optional effectiveAt filters direct, activation, and structural ordinary facts to explicitly qualified intervals containing that world-time instant. limit defaults to 20 and is at most 100. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. The call may maintain expiring semantic activations, so it is neither read-only nor idempotent.",
         input_schema = schema_memory_recall_semantic(),
         output_schema = schema_out_memory_recall_semantic(),
         annotations(title = "Recall by meaning", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
@@ -1198,7 +1274,7 @@ impl Mindreader {
     #[tool(
         name = "write",
         title = "Write facts",
-        description = "Use proactively whenever discussion, investigation, decision-making, implementation, debugging, review, or handoff establishes knowledge another agent or session should reuse: identities and relationships, preferences and standing instructions, decisions and rationale, requirements and constraints, conventions, durable commitments, stable project facts, or reusable signals, patterns, and insights. The user need not ask. Do not store secrets, chatter, transient status, raw dumps, or unsupported inference. facts contains 1–20 input-ordered items under one call-level scope; the atomic batch records one Episode only when something changes. spike classifies only that exact fact and never creates ABOUT context; write ABOUT explicitly when intended. Exact reassertions merge memberships, and an explicit spike reclassifies that fact. Review review.unify and review.alternatives as advisory queues.",
+        description = "Use proactively whenever discussion, investigation, decision-making, implementation, debugging, review, or handoff establishes knowledge another agent or session should reuse: identities and relationships, preferences and standing instructions, decisions and rationale, requirements and constraints, conventions, durable commitments, stable project facts, or reusable signals, patterns, and insights. The user need not ask. Do not store secrets, chatter, transient status, raw dumps, or unsupported inference. Preserve the focal durable assertion before adjacent detail. facts contains exactly 1–20 input-ordered items under one call-level scope; split larger sets before calling and put focal claims first. The atomic batch records one Episode only when something changes. An ordinary state fact may include a complete timezone-qualified half-open effective interval [from,to), independent of transaction history; structural relationships reject it, and point events should use event/date facts instead. spike classifies only that exact fact and never creates ABOUT context; write ABOUT explicitly when intended. Exact subject/property/object/effective-interval reassertions merge memberships, and an explicit spike reclassifies that fact. Review review.unify and review.alternatives as advisory queues.",
         input_schema = schema_memory_write(),
         output_schema = schema_out_memory_write(),
         annotations(title = "Write facts", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1214,7 +1290,7 @@ impl Mindreader {
     #[tool(
         name = "revise",
         title = "Revise a fact",
-        description = "Use when current work establishes that one exact current fact is wrong and its replacement is known, whether or not the user requested a correction. Recall or reuse its fact-only target, then supply the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement preserves the previous fact's spike classification unless a new spike is supplied. The replacement and SUPERSEDES history commit in one transaction, and the response returns both current target and previousTarget.",
+        description = "Use when current work establishes that one exact current fact or its effective interval is wrong and its replacement is known, whether or not the user requested a correction. Recall or reuse its fact-only target, then supply the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement preserves the previous fact's spike classification unless a new spike is supplied. Omitted effective inherits the old interval, explicit null clears temporal qualification, and an object replaces the interval. The replacement and SUPERSEDES history commit in one transaction, and the response returns both current target and previousTarget.",
         input_schema = schema_memory_revise(),
         output_schema = schema_out_memory_revise(),
         annotations(title = "Revise a fact", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
@@ -1469,6 +1545,11 @@ mod tests {
             Some("boolean")
         );
         assert_eq!(
+            item_props["effective"]["type"],
+            serde_json::json!(["object", "null"])
+        );
+        assert_eq!(item_props["effective"]["additionalProperties"], false);
+        assert_eq!(
             item_props["s"]["properties"]["kind"]["enum"],
             serde_json::json!(["node"])
         );
@@ -1494,6 +1575,10 @@ mod tests {
             assert!(revise_required.iter().any(|value| value == name));
         }
         assert_eq!(revise_schema["properties"]["new"]["type"], "object");
+        assert_eq!(
+            revise_schema["properties"]["effective"]["type"],
+            serde_json::json!(["object", "null"])
+        );
         assert_eq!(
             revise_schema["properties"]["target"]["properties"]["kind"]["enum"],
             serde_json::json!(["fact"])
@@ -1534,6 +1619,20 @@ mod tests {
             place_schema["required"],
             serde_json::json!(["scope", "edits"])
         );
+    }
+
+    #[test]
+    fn recall_schemas_advertise_effective_time_without_schema_unions() {
+        let tools: Vec<_> = Mindreader::tool_router().list_all();
+        for name in ["recall", "recall_semantic"] {
+            let schema = tools
+                .iter()
+                .find(|tool| tool.name == name)
+                .unwrap()
+                .schema_as_json_value();
+            assert_eq!(schema["properties"]["effectiveAt"]["format"], "date-time");
+            assert_eq!(schema["properties"]["effectiveAt"]["type"], "string");
+        }
     }
 
     #[test]

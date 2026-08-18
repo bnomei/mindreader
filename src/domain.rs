@@ -5,6 +5,7 @@
 //! adapters turn the validated values into Cypher parameters.
 
 use crate::iri::{default_lower_for_kind, is_iri, kind_for_label, mint_iri, slugify};
+use chrono::{DateTime, SecondsFormat, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
@@ -20,6 +21,96 @@ pub enum DomainError {
     /// The graph exists but the requested handle, membership, or closure is unusable.
     #[error("{0}")]
     Precondition(String),
+}
+
+/// Caller-facing half-open world-time interval on an ordinary state fact.
+///
+/// Presence of the object means the fact is time-qualified. Missing bounds are
+/// open; an absent/null object means the fact's effective time is unknown.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EffectiveInterval {
+    /// Inclusive RFC 3339 lower bound.
+    #[serde(default)]
+    pub from: Option<String>,
+    /// Exclusive RFC 3339 upper bound.
+    #[serde(default)]
+    pub to: Option<String>,
+}
+
+/// Canonical UTC effective interval used for identity, persistence, and queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NormalizedEffectiveInterval {
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+}
+
+/// Parse one timezone-qualified RFC 3339 instant and canonicalize it to UTC.
+pub(crate) fn normalize_rfc3339(value: &str, field: &str) -> Result<String, DomainError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(DomainError::InvalidInput(format!(
+            "{field} must be a timezone-qualified RFC 3339 timestamp"
+        )));
+    }
+    let parsed = DateTime::parse_from_rfc3339(value).map_err(|_| {
+        DomainError::InvalidInput(format!(
+            "{field} must be a timezone-qualified RFC 3339 timestamp"
+        ))
+    })?;
+    Ok(parsed
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::AutoSi, true))
+}
+
+impl EffectiveInterval {
+    /// Canonicalize both optional bounds and enforce half-open `from < to`.
+    pub(crate) fn normalize(self, field: &str) -> Result<NormalizedEffectiveInterval, DomainError> {
+        let from = self
+            .from
+            .as_deref()
+            .map(|value| normalize_rfc3339(value, &format!("{field}.from")))
+            .transpose()?;
+        let to = self
+            .to
+            .as_deref()
+            .map(|value| normalize_rfc3339(value, &format!("{field}.to")))
+            .transpose()?;
+        if let (Some(from), Some(to)) = (&from, &to) {
+            let from_value =
+                DateTime::parse_from_rfc3339(from).expect("normalized effective.from must parse");
+            let to_value =
+                DateTime::parse_from_rfc3339(to).expect("normalized effective.to must parse");
+            if from_value >= to_value {
+                return Err(DomainError::InvalidInput(format!(
+                    "{field}.from must be earlier than {field}.to"
+                )));
+            }
+        }
+        Ok(NormalizedEffectiveInterval { from, to })
+    }
+}
+
+/// Revision-specific effective-time update: omission inherits, null clears, object replaces.
+#[derive(Debug, Clone, Default, JsonSchema)]
+pub enum EffectiveUpdate {
+    /// Field omitted: preserve the selected fact's complete interval.
+    #[default]
+    Inherit,
+    /// Explicit JSON null: make effective time unknown.
+    Clear,
+    /// Explicit interval object: replace the complete interval.
+    Set(EffectiveInterval),
+}
+
+impl<'de> Deserialize<'de> for EffectiveUpdate {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Option::<EffectiveInterval>::deserialize(deserializer)
+            .map(|value| value.map_or(Self::Clear, Self::Set))
+    }
 }
 
 /// A validated graph visibility layer identifier.
@@ -430,8 +521,8 @@ impl WithdrawalScope {
 #[cfg(test)]
 mod tests {
     use super::{
-        literal_iri, EntityInput, EntityRef, LayerId, NodeHandle, ObjectInput, ObjectValue,
-        PredicateRef,
+        literal_iri, normalize_rfc3339, EffectiveInterval, EntityInput, EntityRef, LayerId,
+        NodeHandle, ObjectInput, ObjectValue, PredicateRef,
     };
 
     #[test]
@@ -529,5 +620,30 @@ mod tests {
             PredicateRef::parse(" worksOn ").unwrap().iri(),
             "mindreader:property/worksOn"
         );
+    }
+
+    #[test]
+    fn effective_intervals_are_canonical_half_open_rfc3339_ranges() {
+        let interval = EffectiveInterval {
+            from: Some("2024-01-01T01:00:00+01:00".into()),
+            to: Some("2025-01-01T00:00:00Z".into()),
+        }
+        .normalize("effective")
+        .unwrap();
+        assert_eq!(interval.from.as_deref(), Some("2024-01-01T00:00:00Z"));
+        assert_eq!(interval.to.as_deref(), Some("2025-01-01T00:00:00Z"));
+        assert!(EffectiveInterval {
+            from: Some("2025-01-01T00:00:00Z".into()),
+            to: Some("2025-01-01T00:00:00Z".into()),
+        }
+        .normalize("effective")
+        .is_err());
+        assert!(normalize_rfc3339("2025-01-01", "effectiveAt").is_err());
+        assert!(EffectiveInterval {
+            from: None,
+            to: None,
+        }
+        .normalize("effective")
+        .is_ok());
     }
 }

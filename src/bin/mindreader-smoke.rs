@@ -16,8 +16,9 @@ use mindreader::developer::graph::{
 };
 use mindreader::developer::semantic::SemanticRuntime;
 use mindreader::developer::service::{
-    JudgeArgs, JudgeRating, MemoryService, PlaceArgs, PlaceEdit, RecallArgs, ReviseArgs,
-    SemanticSearchArgs, TargetArgs, ToolOutput, UnifyArgs, WithdrawArgs, WriteArgs, WriteFact,
+    EffectiveInterval, EffectiveUpdate, JudgeArgs, JudgeRating, MemoryService, PlaceArgs,
+    PlaceEdit, RecallArgs, ReviseArgs, SemanticSearchArgs, TargetArgs, ToolOutput, UnifyArgs,
+    WithdrawArgs, WriteArgs, WriteFact,
 };
 use mindreader::developer::Mindreader;
 use mindreader::operation_error;
@@ -158,6 +159,7 @@ fn write_args(s: EntityInput, p: impl AsRef<str>, o: ObjectInput, scope: Vec<Str
             o,
             spike: None,
             contradicts: false,
+            effective: None,
         }],
         scope,
     }
@@ -292,6 +294,34 @@ async fn search(service: &MemoryService, scope: Vec<String>, text: &str) -> Resu
             history: None,
             detail: Some("detailed".into()),
             limit: Some(100),
+            effective_at: None,
+        })
+        .await
+        .map(ToolOutput::into_value)
+}
+
+/// Closed-world detailed text recall at one world-time instant.
+async fn search_effective(
+    service: &MemoryService,
+    scope: Vec<String>,
+    text: &str,
+    effective_at: &str,
+) -> Result<Value> {
+    service
+        .recall(RecallArgs {
+            scope,
+            text: Some(text.into()),
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            direction: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(100),
+            effective_at: Some(effective_at.into()),
         })
         .await
         .map(ToolOutput::into_value)
@@ -668,6 +698,318 @@ async fn run() -> Result<u32> {
         format!("global={only_global:?} A={seen_a:?} B={seen_b:?} AB={seen_ab:?}"),
     );
 
+    let temporal_subject = format!("temporal-state-{tag}");
+    let temporal_property = format!("residesIn{tag}");
+    let temporal_rome = format!("temporal-rome-{tag}");
+    let temporal_lisbon = format!("temporal-lisbon-{tag}");
+    let temporal_unknown = format!("temporal-unknown-{tag}");
+    let temporal_write = service
+        .write(WriteArgs {
+            facts: vec![
+                WriteFact {
+                    s: entity(temporal_subject.clone()),
+                    p: temporal_property.clone(),
+                    o: object(temporal_rome.clone()),
+                    spike: None,
+                    contradicts: false,
+                    effective: Some(EffectiveInterval {
+                        from: Some("2020-01-01T00:00:00Z".into()),
+                        to: Some("2022-01-01T00:00:00Z".into()),
+                    }),
+                },
+                WriteFact {
+                    s: entity(temporal_subject.clone()),
+                    p: temporal_property.clone(),
+                    o: object(temporal_lisbon.clone()),
+                    spike: None,
+                    contradicts: false,
+                    effective: Some(EffectiveInterval {
+                        from: Some("2022-01-01T00:00:00Z".into()),
+                        to: Some("2024-01-01T00:00:00Z".into()),
+                    }),
+                },
+                WriteFact {
+                    s: entity(temporal_subject.clone()),
+                    p: temporal_property.clone(),
+                    o: object(temporal_rome.clone()),
+                    spike: None,
+                    contradicts: false,
+                    effective: Some(EffectiveInterval {
+                        from: Some("2024-01-01T00:00:00Z".into()),
+                        to: None,
+                    }),
+                },
+                WriteFact {
+                    s: entity(temporal_subject.clone()),
+                    p: temporal_property.clone(),
+                    o: object(temporal_unknown.clone()),
+                    spike: None,
+                    contradicts: false,
+                    effective: None,
+                },
+            ],
+            scope: vec![layer_a.clone()],
+        })
+        .await?;
+    let temporal_subject_iri = subject_iri(&temporal_write)?;
+    let first_rome_target = temporal_write
+        .pointer("/facts/0/target/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| operation_error!("first temporal fact has no target"))?;
+    let second_rome_target = temporal_write
+        .pointer("/facts/2/target/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| operation_error!("second temporal fact has no target"))?
+        .to_string();
+    let object_names = |value: &Value| {
+        let mut names = value
+            .get("facts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|fact| fact.pointer("/o/name").and_then(Value::as_str))
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        names.sort();
+        names
+    };
+    let temporal_2021 = search_effective(
+        &service,
+        vec![layer_a.clone()],
+        &temporal_subject,
+        "2021-12-31T23:59:59Z",
+    )
+    .await?;
+    let temporal_2022 = search_effective(
+        &service,
+        vec![layer_a.clone()],
+        &temporal_subject,
+        "2022-01-01T00:00:00Z",
+    )
+    .await?;
+    let temporal_unfiltered = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: Some(vec![temporal_subject_iri.clone()]),
+            labels: None,
+            around: None,
+            hops: Some(1),
+            p: None,
+            depth: None,
+            direction: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+            effective_at: None,
+        })
+        .await?;
+    report.check(
+        "effective intervals are distinct half-open fact identities and exclude unknown time",
+        first_rome_target != second_rome_target
+            && object_names(&temporal_2021) == vec![temporal_rome.clone()]
+            && object_names(&temporal_2022) == vec![temporal_lisbon.clone()]
+            && object_names(&temporal_unfiltered).len() == 4
+            && !object_names(&temporal_2022).contains(&temporal_unknown),
+        format!(
+            "write={temporal_write} at2021={temporal_2021} at2022={temporal_2022} all={temporal_unfiltered}"
+        ),
+    );
+    let temporal_iri = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: Some(vec![temporal_subject_iri.clone()]),
+            labels: None,
+            around: None,
+            hops: Some(1),
+            p: None,
+            depth: None,
+            direction: None,
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+            effective_at: Some("2022-01-01T00:00:00Z".into()),
+        })
+        .await?;
+    let temporal_around = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: Some(temporal_subject_iri),
+            hops: None,
+            p: Some(vec![temporal_property.clone()]),
+            depth: Some(1),
+            direction: Some("outgoing".into()),
+            history: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+            effective_at: Some("2022-01-01T00:00:00Z".into()),
+        })
+        .await?;
+    let temporal_semantic = service
+        .recall_semantic(SemanticSearchArgs {
+            scope: vec![layer_a.clone()],
+            text: temporal_subject.clone(),
+            labels: None,
+            detail: Some("detailed".into()),
+            limit: Some(20),
+            effective_at: Some("2022-01-01T00:00:00Z".into()),
+        })
+        .await?;
+    let iri_names = temporal_iri
+        .pointer("/lookups/0/facts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|fact| fact.pointer("/o/name").and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    report.check(
+        "effectiveAt applies consistently to IRI, around, and semantic recall",
+        iri_names == vec![temporal_lisbon.as_str()]
+            && object_names(&temporal_around) == vec![temporal_lisbon.clone()]
+            && object_names(&temporal_semantic) == vec![temporal_lisbon.clone()],
+        format!("iri={temporal_iri} around={temporal_around} semantic={temporal_semantic}"),
+    );
+
+    let temporal_rome_iri = temporal_write
+        .pointer("/facts/2/o/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| operation_error!("temporal Rome fact has no object IRI"))?;
+    let temporal_revision = service
+        .revise(ReviseArgs {
+            scope: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "fact".into(),
+                iri: second_rome_target.clone(),
+            },
+            new: object_iri(temporal_rome_iri),
+            spike: None,
+            contradicts: false,
+            reason: Some("correct effective state boundary".into()),
+            effective: EffectiveUpdate::Set(EffectiveInterval {
+                from: Some("2025-01-01T00:00:00Z".into()),
+                to: None,
+            }),
+        })
+        .await?;
+    let temporal_replacement = relationship_iri(&temporal_revision)?;
+    let temporal_history = service
+        .recall(RecallArgs {
+            scope: vec![layer_a.clone()],
+            text: None,
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            direction: None,
+            history: Some(temporal_replacement),
+            detail: Some("detailed".into()),
+            limit: Some(20),
+            effective_at: None,
+        })
+        .await?;
+    let temporal_2024 = search_effective(
+        &service,
+        vec![layer_a.clone()],
+        &temporal_subject,
+        "2024-06-01T00:00:00Z",
+    )
+    .await?;
+    let temporal_2025 = search_effective(
+        &service,
+        vec![layer_a.clone()],
+        &temporal_subject,
+        "2025-01-01T00:00:00Z",
+    )
+    .await?;
+    report.check(
+        "same-object revision corrects effective time while history preserves both clocks",
+        object_names(&temporal_2024).is_empty()
+            && object_names(&temporal_2025) == vec![temporal_rome]
+            && temporal_history
+                .get("facts")
+                .and_then(Value::as_array)
+                .is_some_and(|facts| {
+                    facts.iter().any(|fact| {
+                        fact.get("transactionCurrent").and_then(Value::as_bool) == Some(false)
+                            && fact.pointer("/effective/from").and_then(Value::as_str)
+                                == Some("2024-01-01T00:00:00Z")
+                            && fact.pointer("/transaction/from").is_some()
+                    }) && facts.iter().any(|fact| {
+                        fact.get("transactionCurrent").and_then(Value::as_bool) == Some(true)
+                            && fact.pointer("/effective/from").and_then(Value::as_str)
+                                == Some("2025-01-01T00:00:00Z")
+                    })
+                }),
+        format!(
+            "revision={temporal_revision} history={temporal_history} at2024={temporal_2024} at2025={temporal_2025}"
+        ),
+    );
+
+    let temporal_lisbon_target = temporal_write
+        .pointer("/facts/1/target/iri")
+        .and_then(Value::as_str)
+        .ok_or_else(|| operation_error!("temporal Lisbon fact has no target"))?;
+    let inherited_revision = service
+        .revise(ReviseArgs {
+            scope: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "fact".into(),
+                iri: temporal_lisbon_target.to_string(),
+            },
+            new: object(format!("temporal-porto-{tag}")),
+            spike: None,
+            contradicts: false,
+            reason: Some("replace value while preserving effective interval".into()),
+            effective: EffectiveUpdate::Inherit,
+        })
+        .await?;
+    let inherited_target = relationship_iri(&inherited_revision)?;
+    let cleared_revision = service
+        .revise(ReviseArgs {
+            scope: vec![layer_a.clone()],
+            target: TargetArgs {
+                kind: "fact".into(),
+                iri: inherited_target,
+            },
+            new: inherited_revision
+                .pointer("/fact/o/iri")
+                .and_then(Value::as_str)
+                .map(object_iri)
+                .ok_or_else(|| operation_error!("inherited revision has no object IRI"))?,
+            spike: None,
+            contradicts: false,
+            reason: Some("clear unsupported effective interval".into()),
+            effective: EffectiveUpdate::Clear,
+        })
+        .await?;
+    let temporal_2023_after_clear = search_effective(
+        &service,
+        vec![layer_a.clone()],
+        &temporal_subject,
+        "2023-01-01T00:00:00Z",
+    )
+    .await?;
+    report.check(
+        "revision inherits an omitted interval and explicit null clears it",
+        inherited_revision.pointer("/fact/effective/from").and_then(Value::as_str)
+            == Some("2022-01-01T00:00:00Z")
+            && inherited_revision.pointer("/fact/effective/to").and_then(Value::as_str)
+                == Some("2024-01-01T00:00:00Z")
+            && cleared_revision
+                .pointer("/fact/effective")
+                .is_some_and(Value::is_null)
+            && object_names(&temporal_2023_after_clear).is_empty(),
+        format!(
+            "inherited={inherited_revision} cleared={cleared_revision} at2023={temporal_2023_after_clear}"
+        ),
+    );
+
     let batch_token = format!("batch-{tag}");
     let batch = service
         .write(WriteArgs {
@@ -678,6 +1020,7 @@ async fn run() -> Result<u32> {
                     o: object(format!("{batch_token}-a")),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 },
                 WriteFact {
                     s: entity(format!("{batch_token}-two")),
@@ -685,6 +1028,7 @@ async fn run() -> Result<u32> {
                     o: object(format!("{batch_token}-b")),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 },
                 WriteFact {
                     s: entity(format!("{batch_token}-three")),
@@ -692,6 +1036,7 @@ async fn run() -> Result<u32> {
                     o: object(format!("{batch_token}-c")),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 },
             ],
             scope: vec![layer_a.clone()],
@@ -731,6 +1076,7 @@ async fn run() -> Result<u32> {
                     o: object_iri(object),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 })
                 .collect(),
             scope: vec![layer_a.clone()],
@@ -839,6 +1185,7 @@ async fn run() -> Result<u32> {
                 o: object(contradiction_new_name.clone()),
                 spike: None,
                 contradicts: true,
+                effective: None,
             }],
             scope: vec![layer_a.clone()],
         },),
@@ -849,6 +1196,7 @@ async fn run() -> Result<u32> {
                 o: object(contradiction_new_name),
                 spike: None,
                 contradicts: true,
+                effective: None,
             }],
             scope: vec![layer_a.clone()],
         },),
@@ -876,6 +1224,7 @@ async fn run() -> Result<u32> {
             spike: None,
             contradicts: false,
             reason: Some("smoke scoped revision".into()),
+            effective: Default::default(),
         })
         .await?;
     let replacement_rel = relationship_iri(&replacement)?;
@@ -912,6 +1261,7 @@ async fn run() -> Result<u32> {
             history: Some(replacement_rel.clone()),
             detail: Some("concise".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -1476,6 +1826,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -1511,6 +1862,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: None,
             limit: Some(1),
+            effective_at: None,
         })
         .await?;
     let lookup_order = recalled
@@ -1539,6 +1891,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: None,
             limit: Some(1),
+            effective_at: None,
         })
         .await?;
     let witnessed_around = service
@@ -1555,6 +1908,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: None,
             limit: Some(1),
+            effective_at: None,
         })
         .await?;
     let route_property = format!("route-{tag}");
@@ -1595,6 +1949,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("concise".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let route_incoming = service
@@ -1611,6 +1966,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("concise".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let route_wrong_direction = service
@@ -1627,6 +1983,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("concise".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let route_property_iri = format!("mindreader:property/{route_property}");
@@ -1683,6 +2040,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: None,
             limit: Some(100),
+            effective_at: None,
         })
         .await?;
     let judged_schema_iri = catalog_before
@@ -1722,6 +2080,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: None,
             limit: Some(100),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -1829,6 +2188,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("concise".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let history_iri = relationship_iri(&witnessed_around)?;
@@ -1846,6 +2206,7 @@ async fn run() -> Result<u32> {
             history: Some(history_iri.clone()),
             detail: None,
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -1900,6 +2261,7 @@ async fn run() -> Result<u32> {
                 o: object(format!("spike-obj-{tag}")),
                 spike: Some("Knowledge".into()),
                 contradicts: false,
+                effective: None,
             }],
             scope: vec![layer_a.clone()],
         })
@@ -1940,6 +2302,7 @@ async fn run() -> Result<u32> {
                 },
                 spike: Some("Insight".into()),
                 contradicts: false,
+                effective: None,
             }],
             scope: vec![layer_a.clone()],
         })
@@ -1959,6 +2322,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -1996,6 +2360,7 @@ async fn run() -> Result<u32> {
             o: object(format!("fanout-{tag}-{index}")),
             spike: None,
             contradicts: false,
+            effective: None,
         });
     }
     service
@@ -2012,6 +2377,7 @@ async fn run() -> Result<u32> {
             o: object(format!("fanout-{tag}-{index}")),
             spike: None,
             contradicts: false,
+            effective: None,
         });
     }
     service
@@ -2035,6 +2401,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let hops1_budget = service
@@ -2051,6 +2418,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let hops0_iris = lookup_fact_iris(&hops0_budget)?;
@@ -2087,6 +2455,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -2133,6 +2502,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let cold_semantic = service
@@ -2142,6 +2512,7 @@ async fn run() -> Result<u32> {
             labels: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -2162,6 +2533,7 @@ async fn run() -> Result<u32> {
                     o: labeled_object(format!("generic-alpha-{tag}"), &semantic_fanout_label),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 },
                 WriteFact {
                     s: labeled_entity(semantic_fanout_subject.clone(), &semantic_fanout_label),
@@ -2169,6 +2541,7 @@ async fn run() -> Result<u32> {
                     o: labeled_object(format!("generic-beta-{tag}"), &semantic_fanout_label),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 },
                 WriteFact {
                     s: labeled_entity(semantic_fanout_subject.clone(), &semantic_fanout_label),
@@ -2176,6 +2549,7 @@ async fn run() -> Result<u32> {
                     o: labeled_object(format!("generic-gamma-{tag}"), &semantic_fanout_label),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 },
                 WriteFact {
                     s: labeled_entity(semantic_fanout_subject.clone(), &semantic_fanout_label),
@@ -2183,6 +2557,7 @@ async fn run() -> Result<u32> {
                     o: labeled_object(format!("answer-skeleton-{tag}"), &semantic_fanout_label),
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 },
             ],
             scope: vec![layer_a.clone()],
@@ -2210,6 +2585,7 @@ async fn run() -> Result<u32> {
             labels: Some(vec![semantic_fanout_label.clone()]),
             detail: Some("detailed".into()),
             limit: Some(5),
+            effective_at: None,
         })
         .await?;
     let semantic_fanout_activation = fetch_one(
@@ -2238,6 +2614,7 @@ async fn run() -> Result<u32> {
             labels: Some(vec![semantic_fanout_label]),
             detail: Some("detailed".into()),
             limit: Some(5),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -2292,6 +2669,7 @@ async fn run() -> Result<u32> {
             labels: Some(vec![activation_only_label]),
             detail: Some("detailed".into()),
             limit: Some(5),
+            effective_at: None,
         })
         .await?;
     let activation_only_count_after = fetch_one(
@@ -2324,6 +2702,7 @@ async fn run() -> Result<u32> {
             labels: Some(vec![format!("NoSuchSemanticLabel{tag}")]),
             detail: Some("concise".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     let activation_count_after_empty = fetch_one(
@@ -2404,6 +2783,7 @@ async fn run() -> Result<u32> {
             history: None,
             detail: Some("detailed".into()),
             limit: Some(20),
+            effective_at: None,
         })
         .await?;
     report.check(
@@ -2538,6 +2918,7 @@ async fn run() -> Result<u32> {
         labels: None,
         detail: None,
         limit: Some(20),
+        effective_at: None,
     };
     let semantic_first = service.recall_semantic(semantic_args.clone()).await?;
     let activation_after_first = fetch_one(

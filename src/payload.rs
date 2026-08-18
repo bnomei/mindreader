@@ -432,8 +432,11 @@ fn thin_fact(fact: &Value, history: bool) -> Result<Value> {
     if let Some(value) = fact.get("spike").filter(|value| !value.is_null()) {
         out.insert("spike".into(), value.clone());
     }
+    if let Some(value) = fact.get("effective").filter(|value| !value.is_null()) {
+        out.insert("effective".into(), value.clone());
+    }
     if history {
-        for key in ["current", "validTo"] {
+        for key in ["current", "validTo", "transactionCurrent", "transaction"] {
             if let Some(value) = fact.get(key) {
                 out.insert(key.to_string(), value.clone());
             }

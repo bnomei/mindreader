@@ -17,6 +17,7 @@ use crate::{
     error::{Context, Error, Result},
     graph_error,
 };
+use chrono::{DateTime, FixedOffset, SecondsFormat, Utc};
 use neo4rs::{query, Graph, Node, Path, Relation, Row, Txn, UnboundedRelation};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -28,7 +29,7 @@ const LABEL_OK: &str = "label";
 /// Property key on the singleton model marker node.
 pub const MODEL_MARKER_KEY: &str = "model";
 /// Current graph model version; incompatible databases must be recreated.
-pub const MODEL_VERSION: i64 = 8;
+pub const MODEL_VERSION: i64 = 9;
 /// Vector index name for expiring semantic activations.
 pub const SEMANTIC_INDEX: &str = "semantic_activation_v4_embeddings";
 /// Keyword full-text index used for advisory merge candidate names.
@@ -782,6 +783,27 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Result<Value> {
     if let Ok(v) = rel.get::<String>("spike") {
         obj["spike"] = json!(v);
     }
+    obj["effective"] = if rel.get::<bool>("effectiveQualified").unwrap_or(false) {
+        let from = rel
+            .get::<DateTime<FixedOffset>>("effectiveFrom")
+            .ok()
+            .map(|value| {
+                value
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+            });
+        let to = rel
+            .get::<DateTime<FixedOffset>>("effectiveTo")
+            .ok()
+            .map(|value| {
+                value
+                    .with_timezone(&Utc)
+                    .to_rfc3339_opts(SecondsFormat::AutoSi, true)
+            });
+        json!({ "from": from, "to": to })
+    } else {
+        Value::Null
+    };
     obj["scope"] = json!(rel.get::<Vec<String>>("layers")?);
     obj["weight"] = json!(relation_weight(rel)?);
     Ok(obj)
@@ -1298,6 +1320,7 @@ pub fn fact_envelope(
         "o": object,
         "scope": scope,
         "spike": relationship.get("spike").cloned().unwrap_or(Value::Null),
+        "effective": relationship.get("effective").cloned().unwrap_or(Value::Null),
         "weight": weight,
         "current": true,
     }))
@@ -1382,12 +1405,12 @@ mod tests {
     }
 
     #[test]
-    fn model_v8_requires_recreating_older_databases() {
-        assert_eq!(MODEL_VERSION, 8);
-        assert!(validate_model_version(8).is_ok());
+    fn model_v9_requires_recreating_older_databases() {
+        assert_eq!(MODEL_VERSION, 9);
+        assert!(validate_model_version(9).is_ok());
         assert_eq!(
-            validate_model_version(7).unwrap_err().to_string(),
-            "Mindreader database model version 7 is incompatible with required version 8; recreate the Neo4j database or volume before starting Mindreader"
+            validate_model_version(8).unwrap_err().to_string(),
+            "Mindreader database model version 8 is incompatible with required version 9; recreate the Neo4j database or volume before starting Mindreader"
         );
     }
 

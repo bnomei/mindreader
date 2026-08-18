@@ -476,9 +476,20 @@ struct DuplicateRetirement {
     survivor: String,
 }
 
+/// Exact current relationship identity, including optional world-time qualification.
+type FactIdentity = (
+    String,
+    String,
+    String,
+    String,
+    bool,
+    Option<String>,
+    Option<String>,
+);
+
 /// Keep the lowest IRI in each exact-triple group; merge memberships, weights, and provenance.
 fn duplicate_consolidation_plan(
-    groups: &mut BTreeMap<(String, String, String, String), Vec<DuplicateFact>>,
+    groups: &mut BTreeMap<FactIdentity, Vec<DuplicateFact>>,
 ) -> (Vec<SurvivorUpdate>, Vec<DuplicateRetirement>) {
     let mut updates = Vec::new();
     let mut retirements = Vec::new();
@@ -551,14 +562,15 @@ async fn consolidate_current_duplicates(
              WHERE r.validTo IS NULL AND (s.iri = $target OR o.iri = $target \
                 OR ($includePropertyFacts AND r.propertyIri = $target)) \
              RETURN s.iri AS s, type(r) AS type, r.propertyIri AS property, \
-                    o.iri AS o, r",
+                    o.iri AS o, coalesce(r.effectiveQualified, false) AS effectiveQualified, \
+                    toString(r.effectiveFrom) AS effectiveFrom, \
+                    toString(r.effectiveTo) AS effectiveTo, r",
         )
         .param("target", target_iri.to_string())
         .param("includePropertyFacts", include_property_facts),
     )
     .await?;
-    let mut groups: BTreeMap<(String, String, String, String), Vec<DuplicateFact>> =
-        BTreeMap::new();
+    let mut groups: BTreeMap<FactIdentity, Vec<DuplicateFact>> = BTreeMap::new();
     for row in rows {
         let relation: Relation = row.get("r")?;
         let iri = relation.get::<String>("iri")?;
@@ -576,6 +588,9 @@ async fn consolidate_current_duplicates(
                 row.get("type")?,
                 row.get("property")?,
                 row.get("o")?,
+                row.get("effectiveQualified")?,
+                row.get::<String>("effectiveFrom").ok(),
+                row.get::<String>("effectiveTo").ok(),
             ))
             .or_default()
             .push(DuplicateFact {
@@ -898,6 +913,9 @@ mod tests {
                     "REL".into(),
                     "property-a".into(),
                     "o-a".into(),
+                    false,
+                    None,
+                    None,
                 ),
                 vec![
                     DuplicateFact {
@@ -920,6 +938,9 @@ mod tests {
                     "REL".into(),
                     "property-b".into(),
                     "o-b".into(),
+                    false,
+                    None,
+                    None,
                 ),
                 vec![
                     DuplicateFact {
@@ -942,6 +963,9 @@ mod tests {
                     "REL".into(),
                     "property-c".into(),
                     "o-c".into(),
+                    false,
+                    None,
+                    None,
                 ),
                 vec![DuplicateFact {
                     iri: "rel-single".into(),
@@ -988,5 +1012,44 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn duplicate_plan_keeps_distinct_effective_intervals() {
+        let fact = |iri: &str| DuplicateFact {
+            iri: iri.into(),
+            layers: vec!["project:x".into()],
+            weight: 0,
+            episodes: Vec::new(),
+        };
+        let mut groups = BTreeMap::from([
+            (
+                (
+                    "s".into(),
+                    "ASSERTS".into(),
+                    "p".into(),
+                    "o".into(),
+                    true,
+                    Some("2020-01-01T00:00:00Z".into()),
+                    Some("2021-01-01T00:00:00Z".into()),
+                ),
+                vec![fact("first")],
+            ),
+            (
+                (
+                    "s".into(),
+                    "ASSERTS".into(),
+                    "p".into(),
+                    "o".into(),
+                    true,
+                    Some("2022-01-01T00:00:00Z".into()),
+                    None,
+                ),
+                vec![fact("second")],
+            ),
+        ]);
+        let (updates, retirements) = duplicate_consolidation_plan(&mut groups);
+        assert!(updates.is_empty());
+        assert!(retirements.is_empty());
     }
 }

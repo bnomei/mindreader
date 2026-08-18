@@ -8,7 +8,7 @@
 //! is intentionally not read-only.
 
 use crate::config::{Config, EmbeddingSpace, SemanticConfig};
-use crate::domain::DomainError;
+use crate::domain::{normalize_rfc3339, DomainError};
 use crate::embeddings::{build_provider, normalize_vector, EmbeddingProvider};
 use crate::graph::{
     endpoint_json, fact_envelope, fetch_all, fetch_one, rel_json, require_embedding_space,
@@ -58,6 +58,9 @@ pub struct SemanticSearchArgs {
     /// Maximum fused facts; default 20, at most 100.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Optional world-time instant; only explicitly qualified state facts can match.
+    #[serde(default, rename = "effectiveAt")]
+    pub effective_at: Option<String>,
 }
 
 /// Process-wide embedding provider plus fusion tunables. Absent at [`SemanticRuntime::from_config`] when no API key selected a provider.
@@ -163,6 +166,9 @@ pub fn validate_semantic_search_args(args: &SemanticSearchArgs) -> Result<()> {
             );
         }
     }
+    if let Some(effective_at) = args.effective_at.as_deref() {
+        normalize_rfc3339(effective_at, "recall_semantic effectiveAt")?;
+    }
     crate::payload::Detail::parse(args.detail.as_deref())?;
     Ok(())
 }
@@ -188,6 +194,11 @@ pub async fn memory_semantic_search(
     let layers = normalize_scope(args.scope)?;
     let labels = args.labels.unwrap_or_default();
     let limit = args.limit.unwrap_or(20) as usize;
+    let effective_at = args
+        .effective_at
+        .as_deref()
+        .map(|value| normalize_rfc3339(value, "recall_semantic effectiveAt"))
+        .transpose()?;
     let embedding = runtime.provider.embed(&text).await?;
 
     // Direct recall is capped at 100 so fusion can rerank before the caller limit.
@@ -196,6 +207,7 @@ pub async fn memory_semantic_search(
         text: Some(text.clone()),
         labels: Some(labels.clone()),
         limit: Some(100),
+        effective_at: effective_at.clone(),
     };
     let (activations, direct_result) = tokio::try_join!(
         query_activations(graph, runtime, &embedding),
@@ -224,7 +236,9 @@ pub async fn memory_semantic_search(
         .into_iter()
         .filter(|iri| !facts_by_iri.contains_key(iri))
         .collect::<Vec<_>>();
-    for (iri, fact, group) in resolve_facts(graph, &layers, &labels, missing).await? {
+    for (iri, fact, group) in
+        resolve_facts(graph, &layers, &labels, missing, effective_at.as_deref()).await?
+    {
         fact_groups.insert(iri.clone(), group);
         facts_by_iri.insert(iri, fact);
     }
@@ -279,6 +293,7 @@ pub async fn memory_semantic_search(
             .iter()
             .map(|(iri, _)| iri.clone())
             .collect(),
+        effective_at.as_deref(),
     )
     .await?;
     add_structural_ranked(
@@ -609,6 +624,7 @@ async fn resolve_facts(
     layers: &[String],
     labels: &[String],
     relationship_iris: Vec<String>,
+    effective_at: Option<&str>,
 ) -> Result<Vec<(String, Value, FactGroup)>> {
     if relationship_iris.is_empty() {
         return Ok(Vec::new());
@@ -620,6 +636,12 @@ async fn resolve_facts(
             MATCH (s:Entity)-[r]->(o:Entity)
             WHERE r.iri IN $iris AND r.validTo IS NULL
               AND type(r) = 'ASSERTS'
+              AND ($effectiveAt IS NULL
+                   OR (coalesce(r.effectiveQualified, false)
+                       AND (r.effectiveFrom IS NULL
+                            OR r.effectiveFrom <= datetime($effectiveAt))
+                       AND (r.effectiveTo IS NULL
+                            OR datetime($effectiveAt) < r.effectiveTo)))
               AND (size(s.layers) = 0
                    OR any(layer IN s.layers WHERE layer IN $layers))
               AND (size(r.layers) = 0
@@ -634,7 +656,8 @@ async fn resolve_facts(
         .param("iris", relationship_iris)
         .param("layers", layers.to_vec())
         .param("labels", labels.to_vec())
-        .param("labelCount", labels.len() as i64),
+        .param("labelCount", labels.len() as i64)
+        .param("effectiveAt", effective_at.map(str::to_string)),
     )
     .await?;
     let mut facts = Vec::new();
@@ -650,6 +673,7 @@ async fn resolve_structural_facts(
     layers: &[String],
     labels: &[String],
     anchor_iris: Vec<String>,
+    effective_at: Option<&str>,
 ) -> Result<Vec<StructuralCandidate>> {
     if anchor_iris.is_empty() {
         return Ok(Vec::new());
@@ -661,6 +685,12 @@ async fn resolve_structural_facts(
             UNWIND $anchorIris AS anchorIri
             MATCH (anchorS:Entity)-[anchor:ASSERTS]->(anchorO:Entity)
             WHERE anchor.iri = anchorIri AND anchor.validTo IS NULL
+              AND ($effectiveAt IS NULL
+                   OR (coalesce(anchor.effectiveQualified, false)
+                       AND (anchor.effectiveFrom IS NULL
+                            OR anchor.effectiveFrom <= datetime($effectiveAt))
+                       AND (anchor.effectiveTo IS NULL
+                            OR datetime($effectiveAt) < anchor.effectiveTo)))
               AND (size(anchorS.layers) = 0
                    OR any(layer IN anchorS.layers WHERE layer IN $layers))
               AND (size(anchor.layers) = 0
@@ -675,6 +705,12 @@ async fn resolve_structural_facts(
               WITH anchor, shared
               MATCH (shared)-[degreeRelationship:ASSERTS]-(degreeOther:Entity)
               WHERE degreeRelationship <> anchor AND degreeRelationship.validTo IS NULL
+                AND ($effectiveAt IS NULL
+                     OR (coalesce(degreeRelationship.effectiveQualified, false)
+                         AND (degreeRelationship.effectiveFrom IS NULL
+                              OR degreeRelationship.effectiveFrom <= datetime($effectiveAt))
+                         AND (degreeRelationship.effectiveTo IS NULL
+                              OR datetime($effectiveAt) < degreeRelationship.effectiveTo)))
                 AND (size(shared.layers) = 0
                      OR any(layer IN shared.layers WHERE layer IN $layers))
                 AND (size(degreeRelationship.layers) = 0
@@ -690,6 +726,12 @@ async fn resolve_structural_facts(
               WITH anchor, shared
               MATCH (shared)-[candidate:ASSERTS]-(other:Entity)
               WHERE candidate <> anchor AND candidate.validTo IS NULL
+                AND ($effectiveAt IS NULL
+                     OR (coalesce(candidate.effectiveQualified, false)
+                         AND (candidate.effectiveFrom IS NULL
+                              OR candidate.effectiveFrom <= datetime($effectiveAt))
+                         AND (candidate.effectiveTo IS NULL
+                              OR datetime($effectiveAt) < candidate.effectiveTo)))
                 AND (size(shared.layers) = 0
                      OR any(layer IN shared.layers WHERE layer IN $layers))
                 AND (size(candidate.layers) = 0
@@ -710,7 +752,8 @@ async fn resolve_structural_facts(
         .param("layers", layers.to_vec())
         .param("labels", labels.to_vec())
         .param("labelCount", labels.len() as i64)
-        .param("perEndpoint", MAX_STRUCTURAL_FACTS_PER_ENDPOINT),
+        .param("perEndpoint", MAX_STRUCTURAL_FACTS_PER_ENDPOINT)
+        .param("effectiveAt", effective_at.map(str::to_string)),
     )
     .await?;
     let mut candidates = Vec::new();
@@ -971,6 +1014,7 @@ mod tests {
             labels: Some(vec!["Element".into()]),
             detail: None,
             limit: Some(100),
+            effective_at: None,
         };
         assert!(validate_semantic_search_args(&args).is_ok());
         assert!(validate_semantic_search_args(&SemanticSearchArgs {

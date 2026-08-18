@@ -15,10 +15,7 @@ use crate::search::{self, is_schema_catalog_labels, validate_recall_args, Search
 pub use crate::semantic::SemanticSearchArgs;
 use crate::semantic::{self, SemanticRuntime};
 use crate::tools;
-pub use crate::tools::{
-    JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, ReviseArgs, TargetArgs, WithdrawArgs, WriteArgs,
-    WriteFact,
-};
+pub use crate::tools::{JudgeArgs, PlaceArgs, ReviseArgs, WithdrawArgs, WriteArgs};
 use neo4rs::Graph;
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -81,6 +78,7 @@ impl MemoryService {
         let scope = args.scope.clone();
         let detail = crate::payload::Detail::parse(args.detail.as_deref())?;
         let has_iris = args.iris.is_some();
+        let effective_at = args.effective_at.clone();
         let result = if let Some(history) = args
             .history
             .as_deref()
@@ -100,16 +98,7 @@ impl MemoryService {
             .map(str::trim)
             .filter(|value| !value.is_empty())
         {
-            tools::memory_recall_around(
-                &self.graph,
-                around,
-                scope.clone(),
-                args.p.unwrap_or_default(),
-                args.depth.unwrap_or(1),
-                args.direction.as_deref().unwrap_or("both"),
-                args.limit.unwrap_or(20),
-            )
-            .await?
+            tools::memory_recall_around(&self.graph, around, &args).await?
         } else if let Some(iris) = args
             .iris
             .filter(|values| values.iter().any(|value| !value.trim().is_empty()))
@@ -120,6 +109,7 @@ impl MemoryService {
                 scope.clone(),
                 args.hops.unwrap_or(0),
                 args.limit.unwrap_or(20),
+                effective_at.clone(),
             )
             .await?
         } else if let Some(labels) = args
@@ -168,6 +158,7 @@ impl MemoryService {
                         text: None,
                         labels: Some(labels),
                         limit: args.limit,
+                        effective_at: effective_at.clone(),
                     },
                 )
                 .await?
@@ -180,6 +171,7 @@ impl MemoryService {
                     text: args.text,
                     labels: None,
                     limit: args.limit,
+                    effective_at,
                 },
             )
             .await?

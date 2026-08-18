@@ -7,7 +7,7 @@
 //! MCP catalog labels (`Class`/`Property`) are diverted in `service` before
 //! this rank path. Retrieval never changes weights.
 
-use crate::domain::DomainError;
+use crate::domain::{normalize_rfc3339, DomainError};
 use crate::error::{Error, Result};
 use crate::graph::{endpoint_json, fact_envelope, fetch_all, node_json, rel_json, spike_rank};
 use crate::iri::{is_iri, property_iri, split_camel_case};
@@ -47,6 +47,9 @@ pub struct SearchArgs {
     /// Maximum facts; default 20, clamped to 1..=100.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Optional world-time instant; only explicitly qualified facts can match.
+    #[serde(default, rename = "effectiveAt")]
+    pub effective_at: Option<String>,
 }
 
 /// Internal direct-search evidence used by semantic rank fusion.
@@ -138,6 +141,9 @@ pub struct RecallArgs {
     /// Maximum facts; default 20, at most 100.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Optional world-time instant for text, non-catalog labels, IRI, or around recall.
+    #[serde(default, rename = "effectiveAt")]
+    pub effective_at: Option<String>,
 }
 
 /// Graph-free recall input contract (runtime XOR, no schema union).
@@ -217,6 +223,21 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
             "recall history applies only to the history selector, not {selector}"
         ))
         .into());
+    }
+    if let Some(effective_at) = args.effective_at.as_deref() {
+        normalize_rfc3339(effective_at, "recall effectiveAt")?;
+        if selector == "history" {
+            return Err(DomainError::InvalidInput(
+                "recall effectiveAt does not apply to history; history exposes both clocks".into(),
+            )
+            .into());
+        }
+        if selector == "labels" && args.labels.as_deref().is_some_and(is_schema_catalog_labels) {
+            return Err(DomainError::InvalidInput(
+                "recall effectiveAt does not apply to the Class/Property catalog".into(),
+            )
+            .into());
+        }
     }
     if let Some(values) = &args.iris {
         if !(1..=20).contains(&values.len()) {
@@ -474,6 +495,10 @@ WITH s, r, o, 1.0 AS indexScore,
 const RANK_AND_LIMIT: &str = r#"
 WHERE r.validTo IS NULL
   AND type(r) = 'ASSERTS'
+  AND ($effectiveAt IS NULL
+       OR (coalesce(r.effectiveQualified, false)
+           AND (r.effectiveFrom IS NULL OR r.effectiveFrom <= datetime($effectiveAt))
+           AND (r.effectiveTo IS NULL OR datetime($effectiveAt) < r.effectiveTo)))
   AND (size(s.layers) = 0
        OR any(layer IN s.layers WHERE layer IN $layers))
   AND (size(r.layers) = 0
@@ -667,6 +692,11 @@ pub(crate) async fn memory_search_with_matches(
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as i64;
     let labels = args.labels.unwrap_or_default();
     let trimmed = args.text.unwrap_or_default().trim().to_string();
+    let effective_at = args
+        .effective_at
+        .as_deref()
+        .map(|value| normalize_rfc3339(value, "recall effectiveAt"))
+        .transpose()?;
     // In-process SearchArgs may be empty; MCP recall never reaches here without a selector.
     if trimmed.is_empty() && labels.is_empty() {
         return Ok(SearchResult {
@@ -689,7 +719,8 @@ pub(crate) async fn memory_search_with_matches(
         .param("labelCount", labels.len() as i64)
         .param("limit", query_limit)
         .param("minWeight", i64::MIN)
-        .param("maxWeight", i64::MAX);
+        .param("maxWeight", i64::MAX)
+        .param("effectiveAt", effective_at);
     if text_mode {
         ranked = ranked
             .param("qExact", lucene_exact_query(&trimmed))
@@ -821,6 +852,8 @@ mod tests {
         ));
         let query = ranked_query(true);
         assert!(query.contains("AND type(r) = 'ASSERTS'"));
+        assert!(query.contains("coalesce(r.effectiveQualified, false)"));
+        assert!(query.contains("datetime($effectiveAt) < r.effectiveTo"));
         assert!(query.contains("WHEN r.spike = 'Knowledge'"));
         assert!(query.contains("WHEN a.spike = 'Knowledge'"));
         assert!(!query.contains("WHEN s:Knowledge"));
@@ -864,6 +897,7 @@ mod tests {
             history: None,
             detail: None,
             limit: None,
+            effective_at: None,
         };
         assert!(validate_recall_args(&args).is_err());
         args.text = Some("Alice".into());
@@ -902,6 +936,7 @@ mod tests {
             history: None,
             detail: None,
             limit: Some(20),
+            effective_at: None,
         };
         assert!(validate_recall_args(&base).is_ok());
         assert!(validate_recall_args(&RecallArgs {
@@ -934,6 +969,43 @@ mod tests {
                 "mindreader:element/alice".into(),
                 " mindreader:element/alice ".into(),
             ]),
+            ..base
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn recall_effective_at_is_strict_and_selector_aware() {
+        let base = RecallArgs {
+            scope: vec![],
+            text: Some("Alice".into()),
+            iris: None,
+            labels: None,
+            around: None,
+            hops: None,
+            p: None,
+            depth: None,
+            direction: None,
+            history: None,
+            detail: None,
+            limit: Some(20),
+            effective_at: Some("2024-01-01T01:00:00+01:00".into()),
+        };
+        assert!(validate_recall_args(&base).is_ok());
+        assert!(validate_recall_args(&RecallArgs {
+            effective_at: Some("2024-01-01".into()),
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate_recall_args(&RecallArgs {
+            text: None,
+            history: Some("mindreader:relationship/fact".into()),
+            ..base.clone()
+        })
+        .is_err());
+        assert!(validate_recall_args(&RecallArgs {
+            text: None,
+            labels: Some(vec!["Property".into()]),
             ..base
         })
         .is_err());

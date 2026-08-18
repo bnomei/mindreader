@@ -891,6 +891,7 @@ name = "mindreader"
 version = "0.5.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "directories",
  "divan",
  "dotenvy",

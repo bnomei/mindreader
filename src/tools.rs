@@ -40,9 +40,10 @@ mod tests {
         revision_fact_lock_requests, select_revision_current, validate_judge_args,
         validate_write_args, withdrawal_fact_lock_requests, write_fact_lock_requests, CurrentFact,
         FactMembershipChange, JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, RecallDirection,
-        TargetArgs, WriteArgs, WriteFact, HUB_DEGREE_THRESHOLD, LAYERS_PROPERTY, MAX_WRITE_FACTS,
-        PREDICATE_USAGE_PROPERTY, RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
+        ReviseArgs, TargetArgs, WriteArgs, WriteFact, HUB_DEGREE_THRESHOLD, LAYERS_PROPERTY,
+        MAX_WRITE_FACTS, PREDICATE_USAGE_PROPERTY, RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
     };
+    use crate::domain::EffectiveUpdate;
     use crate::domain::{DomainError, EntityInput, ObjectInput};
     use crate::error::Error;
     use crate::graph::{fact_lock_specs, spike_rank};
@@ -65,6 +66,7 @@ mod tests {
         assert!(RECALL_IRI_FACTS_QUERY.contains("ORDER BY inputIndex ASC"));
         assert!(RECALL_IRI_FACTS_QUERY.contains("LIMIT $limit"));
         assert!(RECALL_IRI_FACTS_QUERY.contains("type(r) <> 'ABOUT'"));
+        assert!(RECALL_IRI_FACTS_QUERY.contains("coalesce(r.effectiveQualified, false)"));
 
         let around = recall_around_query(3, RecallDirection::Both);
         let predicate_filter = around.find("pathRel.propertyIri IN $predicates").unwrap();
@@ -104,6 +106,7 @@ mod tests {
             iri: "fact:new".into(),
             layers: vec!["project:a".into()],
             spike: None,
+            effective: None,
         };
         assert!(select_revision_current(
             std::slice::from_ref(&replacement),
@@ -284,6 +287,7 @@ mod tests {
             iri: format!("mindreader:fact/{rel_id}"),
             layers: layers.iter().map(|layer| (*layer).to_string()).collect(),
             spike: None,
+            effective: None,
         }
     }
 
@@ -327,6 +331,7 @@ mod tests {
                     },
                     spike: None,
                     contradicts: false,
+                    effective: None,
                 })
                 .collect(),
             scope: Vec::new(),
@@ -368,6 +373,7 @@ mod tests {
                 },
                 spike: None,
                 contradicts: true,
+                effective: None,
             })
             .expect("unique contradict facts prepare");
             locks.extend(write_fact_lock_requests(
@@ -384,6 +390,30 @@ mod tests {
             160,
             "20 unique contradict facts expand to 160 fact-lock rows, not the unexpanded 100"
         );
+    }
+
+    #[test]
+    fn revise_effective_distinguishes_omitted_null_and_interval() {
+        let base = serde_json::json!({
+            "scope": [],
+            "target": {"kind": "fact", "iri": "mindreader:relationship/fact"},
+            "new": {"kind": "literal", "value": "new"}
+        });
+        let inherited: ReviseArgs = serde_json::from_value(base.clone()).unwrap();
+        assert!(matches!(inherited.effective, EffectiveUpdate::Inherit));
+
+        let mut cleared = base.clone();
+        cleared["effective"] = serde_json::Value::Null;
+        let cleared: ReviseArgs = serde_json::from_value(cleared).unwrap();
+        assert!(matches!(cleared.effective, EffectiveUpdate::Clear));
+
+        let mut replaced = base;
+        replaced["effective"] = serde_json::json!({
+            "from": "2024-01-01T00:00:00Z",
+            "to": "2025-01-01T00:00:00Z"
+        });
+        let replaced: ReviseArgs = serde_json::from_value(replaced).unwrap();
+        assert!(matches!(replaced.effective, EffectiveUpdate::Set(_)));
     }
 
     #[test]

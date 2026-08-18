@@ -9,10 +9,11 @@
 //! exactly one Episode.
 
 use super::facts::{normalize_layers, serialized_scope};
-use crate::domain::DomainError;
+use crate::domain::{normalize_rfc3339, DomainError};
 use crate::graph::{
     endpoint_json, fetch_all, fetch_one, node_json, path_to_json, rel_json, safe_label,
 };
+use crate::search::RecallArgs;
 use crate::vocabulary::{FIXED_RELATIONSHIPS, SYSTEM_RELATIONSHIPS};
 use crate::{error::Result, operation_error};
 use neo4rs::{query, Graph, Node, Path, Relation};
@@ -42,6 +43,10 @@ CALL {
   MATCH (root)-[r]-(other:Entity)
   WHERE r.validTo IS NULL
     AND type(r) <> 'ABOUT'
+    AND ($effectiveAt IS NULL OR type(r) <> 'ASSERTS'
+         OR (coalesce(r.effectiveQualified, false)
+             AND (r.effectiveFrom IS NULL OR r.effectiveFrom <= datetime($effectiveAt))
+             AND (r.effectiveTo IS NULL OR datetime($effectiveAt) < r.effectiveTo)))
     AND (size(r.layers) = 0
          OR any(layer IN r.layers WHERE layer IN $layers))
     AND (size(other.layers) = 0
@@ -65,6 +70,7 @@ pub async fn memory_recall_iris(
     scope: Vec<String>,
     hops: u32,
     fact_limit: u32,
+    effective_at: Option<String>,
 ) -> Result<Value> {
     let layers = normalize_layers(scope)?;
     if !(1..=20).contains(&iris.len()) {
@@ -82,6 +88,10 @@ pub async fn memory_recall_iris(
         .into_iter()
         .map(|value| value.trim().to_string())
         .collect::<Vec<_>>();
+    let effective_at = effective_at
+        .as_deref()
+        .map(|value| normalize_rfc3339(value, "recall effectiveAt"))
+        .transpose()?;
     let mut lookups = iris
         .iter()
         .map(|iri| json!({ "iri": iri, "found": false, "facts": [], "truncated": false }))
@@ -115,7 +125,8 @@ pub async fn memory_recall_iris(
         query(RECALL_IRI_FACTS_QUERY)
             .param("iris", iris)
             .param("layers", layers.clone())
-            .param("limit", i64::from(fact_limit.saturating_add(1))),
+            .param("limit", i64::from(fact_limit.saturating_add(1)))
+            .param("effectiveAt", effective_at),
     )
     .await?;
     let mut counts: HashMap<i64, usize> = HashMap::new();
@@ -226,6 +237,12 @@ pub(super) fn recall_around_query(depth: u32, direction: RecallDirection) -> Str
           OR any(layer IN n.layers WHERE layer IN $layers))
           AND all(pathRel IN relationships(path) WHERE
             type(pathRel) IN $rels AND pathRel.validTo IS NULL
+            AND ($effectiveAt IS NULL OR type(pathRel) <> 'ASSERTS'
+                 OR (coalesce(pathRel.effectiveQualified, false)
+                     AND (pathRel.effectiveFrom IS NULL
+                          OR pathRel.effectiveFrom <= datetime($effectiveAt))
+                     AND (pathRel.effectiveTo IS NULL
+                          OR datetime($effectiveAt) < pathRel.effectiveTo)))
             AND (size(pathRel.layers) = 0
                  OR any(layer IN pathRel.layers WHERE layer IN $layers))
             AND (size($predicates) = 0 OR pathRel.propertyIri IN $predicates))
@@ -236,6 +253,12 @@ pub(super) fn recall_around_query(depth: u32, direction: RecallDirection) -> Str
             WITH witnessNode
             MATCH {degree_walk}
             WHERE type(hubRel) IN $rels AND hubRel.validTo IS NULL
+              AND ($effectiveAt IS NULL OR type(hubRel) <> 'ASSERTS'
+                   OR (coalesce(hubRel.effectiveQualified, false)
+                       AND (hubRel.effectiveFrom IS NULL
+                            OR hubRel.effectiveFrom <= datetime($effectiveAt))
+                       AND (hubRel.effectiveTo IS NULL
+                            OR datetime($effectiveAt) < hubRel.effectiveTo)))
               AND (size(witnessNode.layers) = 0
                    OR any(layer IN witnessNode.layers WHERE layer IN $layers))
               AND (size(hubRel.layers) = 0
@@ -281,25 +304,27 @@ pub(super) fn recall_around_query(depth: u32, direction: RecallDirection) -> Str
 }
 
 /// `recall` `around` path with whole-path constraints and hub-aware deterministic ranking.
-pub async fn memory_recall_around(
-    graph: &Graph,
-    from: &str,
-    scope: Vec<String>,
-    predicates: Vec<String>,
-    depth: u32,
-    direction: &str,
-    limit: u32,
-) -> Result<Value> {
+pub async fn memory_recall_around(graph: &Graph, from: &str, args: &RecallArgs) -> Result<Value> {
     use crate::domain::PredicateRef;
+    let depth = args.depth.unwrap_or(1);
+    let limit = args.limit.unwrap_or(20);
     if !(1..=3).contains(&depth) {
         return Err(DomainError::InvalidInput("recall depth must be 1..=3".into()).into());
     }
     if !(1..=100).contains(&limit) {
         return Err(DomainError::InvalidInput("recall limit must be 1..=100".into()).into());
     }
-    let direction = RecallDirection::parse(direction)?;
-    let layers = normalize_layers(scope)?;
-    let mut wanted = predicates
+    let direction = RecallDirection::parse(args.direction.as_deref().unwrap_or("both"))?;
+    let layers = normalize_layers(args.scope.clone())?;
+    let effective_at = args
+        .effective_at
+        .as_deref()
+        .map(|value| normalize_rfc3339(value, "recall effectiveAt"))
+        .transpose()?;
+    let mut wanted = args
+        .p
+        .clone()
+        .unwrap_or_default()
         .into_iter()
         .map(|value| PredicateRef::parse(value).map(|predicate| predicate.iri().to_string()))
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -346,7 +371,8 @@ pub async fn memory_recall_around(
                     .collect::<Vec<_>>(),
             )
             .param("predicates", wanted)
-            .param("limit", i64::from(limit.saturating_add(1))),
+            .param("limit", i64::from(limit.saturating_add(1)))
+            .param("effectiveAt", effective_at),
     )
     .await?;
     let truncated = rows.len() > limit as usize;
@@ -433,10 +459,11 @@ WHERE r.propertyIri = property
        })
   AND (size(other.layers) = 0
        OR any(layer IN other.layers WHERE layer IN $layers))
-WITH s, r, other, property, r.validTo IS NULL AS current, toString(r.validTo) AS validTo
+WITH s, r, other, property, r.validTo IS NULL AS current,
+     toString(r.validFrom) AS transactionFrom, toString(r.validTo) AS validTo
 ORDER BY current DESC, validTo DESC, r.iri ASC
 LIMIT $limit
-RETURN s, r, other AS o, property, current, validTo
+RETURN s, r, other AS o, property, current, transactionFrom, validTo
 "#;
 
 /// Current and historical incident facts for a node handle (system-owned edges excluded).
@@ -459,10 +486,11 @@ WHERE type(r) <> 'ABOUT'
        OR any(layer IN other.layers WHERE layer IN $layers))
 WITH startNode(r) AS s, r, endNode(r) AS o,
      r.propertyIri AS property,
-     r.validTo IS NULL AS current, toString(r.validTo) AS validTo
+     r.validTo IS NULL AS current,
+     toString(r.validFrom) AS transactionFrom, toString(r.validTo) AS validTo
 ORDER BY current DESC, validTo DESC, r.iri ASC
 LIMIT $limit
-RETURN s, r, o, property, current, validTo
+RETURN s, r, o, property, current, transactionFrom, validTo
 "#;
 
 /// Exact revision events for the fact family selected by one fact handle.
@@ -651,6 +679,16 @@ pub async fn memory_recall_history(
             &memberships,
         )?;
         fact["current"] = json!(current);
+        fact["transactionCurrent"] = json!(current);
+        let transaction_from = row.get::<String>("transactionFrom")?;
+        let transaction_to = row
+            .get::<String>("validTo")
+            .ok()
+            .filter(|value| !value.is_empty() && value != "null");
+        fact["transaction"] = json!({
+            "from": transaction_from,
+            "to": transaction_to,
+        });
         if let Ok(valid_to) = row.get::<String>("validTo") {
             if !valid_to.is_empty() && valid_to != "null" {
                 fact["validTo"] = json!(valid_to);

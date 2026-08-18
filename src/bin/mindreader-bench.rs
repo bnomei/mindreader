@@ -212,6 +212,7 @@ async fn benchmark_search(
         history: None,
         detail: Some("detailed".into()),
         limit: Some(20),
+        effective_at: None,
     };
     for _ in 0..WARMUPS {
         service.recall(args()).await?;
