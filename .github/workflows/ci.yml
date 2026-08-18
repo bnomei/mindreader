@@ -22,7 +22,7 @@ jobs:
         with:
           components: rustfmt
       - name: Install Just
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: just@1.58.0
           fallback: none
@@ -56,7 +56,7 @@ jobs:
         with:
           components: clippy
       - name: Install Just
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: just@1.58.0
           fallback: none
@@ -80,7 +80,7 @@ jobs:
         with:
           toolchain: "1.89"
       - name: Install Just
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: just@1.58.0
           fallback: none
@@ -101,7 +101,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install Just
-        uses: taiki-e/install-action@v2.85.5
+        uses: taiki-e/install-action@v2.86.3
         with:
           tool: just@1.58.0
           fallback: none
