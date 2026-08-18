@@ -1,7 +1,7 @@
 {
   "name": "@bnomei/mindreader",
   "version": "0.5.0",
-  "description": "Agent-driven durable Neo4j graph memory MCP server.",
+  "description": "Selective, explicit Neo4j graph memory for AI agents.",
   "homepage": "https://github.com/bnomei/mindreader",
   "repository": {
     "type": "git",

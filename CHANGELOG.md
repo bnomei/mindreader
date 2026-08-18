@@ -22,10 +22,11 @@ versions follow Semantic Versioning.
 - Accept MCP initialize `2025-11-25` in addition to preferred `2026-07-28` so hosts that still request the older version can complete the handshake. Discovery lists both. Older and unknown initialize protocols remain rejected.
 - Remove the `memory_` prefix from all eight MCP tools: `recall`, `recall_semantic`, `write`, `revise`, `withdraw`, `judge`, `place`, and `unify`. New mutation Episodes use the same unprefixed names; no compatibility aliases are provided.
 
-## [0.5.0] - 2026-08-16
+## [0.5.0] - 2026-08-18
 
 ### Changed
 
+- Reworked the README around Mindreader's selective prospective memory model, including when to use it, when transcript or RAG memory is a better fit, and how semantic recall builds expiring associative trails into grounded graph neighborhoods. Kept installation, client setup, configuration, and operations guidance intact while moving detailed agent behavior to the bundled skill.
 - Require MCP `2026-07-28`, advertise only that protocol through `server/discover`, require self-contained request metadata, and reject older initialization protocols instead of negotiating a fallback.
 - Advance the fresh-database graph contract to model v6 and use numeric weights only.
 - Name-only `spike` writes mint `mindreader:element/<slug>` and keep the spike as an extra label instead of minting `mindreader:knowledge/<slug>`.
