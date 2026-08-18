@@ -146,7 +146,7 @@ pub fn decorate_node(node: &mut Value, request_scope: &[String]) -> Result<()> {
 fn validate_endpoint(value: &Value) -> Result<()> {
     match value.get("kind").and_then(Value::as_str) {
         Some("literal") => {
-            nonempty_string(value, "iri", "literal endpoint")?;
+            let iri = nonempty_string(value, "iri", "literal endpoint")?;
             value.get("value").and_then(Value::as_str).ok_or_else(|| {
                 crate::operation_error!("literal endpoint is missing its string value")
             })?;
@@ -155,6 +155,15 @@ fn validate_endpoint(value: &Value) -> Result<()> {
             value.get("weight").and_then(Value::as_i64).ok_or_else(|| {
                 crate::operation_error!("literal endpoint is missing its integer weight")
             })?;
+            let target = value.get("target").ok_or_else(|| {
+                crate::operation_error!("literal endpoint is missing its canonical node handle")
+            })?;
+            let target_iri = exact_handle_iri(target, "node", "literal node target")?;
+            if target_iri != iri {
+                return Err(crate::operation_error!(
+                    "literal node target IRI does not match the literal IRI"
+                ));
+            }
         }
         Some("node") => {
             let iri = nonempty_string(value, "iri", "node endpoint")?;
@@ -691,7 +700,7 @@ mod tests {
             json!({
                 "target": {"kind":"fact","iri":"mindreader:relationship/a"},
                 "s": {"kind":"node","iri":"mindreader:element/alice","name":"Alice","target":{"kind":"node","iri":"mindreader:element/alice"}},
-                "o": {"kind":"literal","iri":"mindreader:literal/x","value":"1","datatype":"xsd:string"}
+                "o": {"kind":"literal","iri":"mindreader:literal/x","value":"1","datatype":"xsd:string","target":{"kind":"node","iri":"mindreader:literal/x"}}
             }),
             json!({
                 "target": {"kind":"fact","iri":"mindreader:relationship/b"},
@@ -843,7 +852,7 @@ mod tests {
             "target": {"kind":"fact","iri":"mindreader:relationship/a"},
             "s": {"kind":"node","iri":"mindreader:element/a","name":"A","labels":["Element"],"scope":[],"weight":0,"target":{"kind":"node","iri":"mindreader:element/a"}},
             "p": "value",
-            "o": {"kind":"literal","iri":"mindreader:literal/one","value":"1","datatype":"xsd:string","scope":[],"weight":0},
+            "o": {"kind":"literal","iri":"mindreader:literal/one","value":"1","datatype":"xsd:string","scope":[],"weight":0,"target":{"kind":"node","iri":"mindreader:literal/one"}},
             "scope": [],
             "weight": 0
         });

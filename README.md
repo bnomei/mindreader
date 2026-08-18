@@ -1,4 +1,4 @@
-# mindreader
+# Mindreader
 
 [![Crates.io Version](https://img.shields.io/crates/v/mindreader)](https://crates.io/crates/mindreader)
 [![Build Status](https://github.com/bnomei/mindreader/actions/workflows/ci.yml/badge.svg)](https://github.com/bnomei/mindreader/actions/workflows/ci.yml)
@@ -7,32 +7,35 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) memory server backed by Neo4j. It gives agents autonomous, explicit, scoped, durable working memory as graph triples (`subject -predicate-> object`) and serves exactly eight tools over stdio.
+Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that gives AI agents durable, inspectable Neo4j graph memory. It serves exactly eight stdio tools for storing and maintaining explicit triples: `subject -predicate-> object`.
 
-The agent is the clerk of the graph and owns the memory lifecycle. Without waiting for a user request, it recalls prior context when that context could affect the work and records future-useful knowledge produced or confirmed during discussion, investigation, decisions, implementation, debugging, review, and handoff. A fact exists only after the agent deliberately formulates an assertion and calls a write tool. Later tools paste the handles they were given.
+Use Mindreader when an agent needs reusable facts, decisions, constraints, or relationships to survive beyond its current context—not when you need a transcript or an automatic fact extractor. The agent is the clerk: it decides what is worth retaining, calls a mutation tool explicitly, and pastes returned handles into later maintenance calls. Mindreader never reads a conversation on its own, invents facts, exposes raw Cypher, or silently overwrites a stored assertion.
 
-Mindreader itself does not extract memory from conversation with a hidden language model, invent unstated facts, or expose raw Cypher. Autonomous means that the agent performs the editorial judgment and explicit tool calls; it does not mean that the server silently stores a transcript.
+The resulting contract is deliberately narrow: assertions you choose to store remain scoped, auditable, and maintainable; details that were never asserted are unavailable. Ordinary recall stays closed-world in Neo4j. Optional semantic recall sends only its query text to a configured OpenAI or xAI embedding provider.
 
-Mindreader is selective prospective memory, not comprehensive chat storage. An agent has free editorial judgment over what deserves retention, and details it never asserts are intentionally unavailable later. The contract is that chosen assertions can be stored, maintained, and recalled faithfully—not that arbitrary questions can reconstruct an earlier conversation.
+At a glance:
 
-Ordinary writes are set-valued and may qualify state facts with a half-open effective interval `[from,to)`. This world-time interval is independent of the transaction-time `Episode` and validity history. Explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`. Closed-world `recall` stays inside Neo4j. Optional `recall_semantic` sends only its query text to the configured OpenAI or xAI embedding API.
-
-That is a different contract from chat-memory extractors such as [Graphiti](https://arxiv.org/abs/2501.13956): those systems ingest messages and derive facts automatically. Mindreader records only what an agent asserts, then returns pasteable identifiers for the next call rather than a prose context blob.
+- **Explicit and inspectable.** Every fact is an asserted triple with a stable handle, provenance, memberships, and soft-retention history.
+- **Set-valued and correctable.** Compatible values coexist. Corrections retire one selected fact and record an explicit `SUPERSEDES` link.
+- **Scoped, not access-controlled.** A call's `scope` decides what is visible; it is a graph filter, not an authorization boundary.
+- **Temporal when needed.** State facts can carry a half-open effective interval `[from,to)` independently of transaction history.
+- **Selective by design.** No hidden extraction or chat-log reconstruction is involved.
 
 ## Start here
 
-| Goal | Read |
+| I want to… | Start here |
 | --- | --- |
-| Install a packaged binary | [Install a release](#install-a-release) |
-| Build and verify Mindreader with a disposable Neo4j database | [Quickstart from source](#quickstart-from-source) |
-| Add Mindreader to an MCP host | [Connect an MCP client](#connect-an-mcp-client) |
-| Teach an agent the recall → paste → mutate loop | [Agent loop](#agent-loop) |
-| Look up exact inputs, defaults, and limits | [MCP tool reference](#mcp-tool-reference) |
-| Understand layers, ranking, semantic recall, and history | [Memory model](#memory-model) |
-| Configure Neo4j, embeddings, and semantic recall | [Configuration reference](#configuration-reference) |
-| Develop or validate the project | [Development](#development) |
+| Install the released server | [Install a release](#install-a-release) |
+| Run and verify the project from source | [Quickstart from source](#quickstart-from-source) |
+| Register it with an MCP host | [Connect an MCP client](#connect-an-mcp-client) |
+| Learn the agent's recall → paste → mutate workflow | [Agent loop](#agent-loop) and the reusable [agent skill](skills/using-mindreader/SKILL.md) |
+| See a complete first write and recall | [Minimal write, recall, and walk example](#minimal-write-recall-and-walk-example) |
+| Check an exact tool input, default, or limit | [MCP tool reference](#mcp-tool-reference) |
+| Understand scope, time, ranking, semantic recall, or history | [Memory model](#memory-model) |
+| Configure Neo4j or embeddings | [Configuration reference](#configuration-reference) |
+| Develop, test, or benchmark the server | [Development](#development) |
 
-## What mindreader provides
+## What Mindreader provides
 
 - Explicit triples in a shared Neo4j graph. No hidden extractor, no silent overwrite, no raw Cypher.
 - Agent-driven recall and capture without requiring the user to ask for memory operations.
@@ -136,7 +139,7 @@ This path runs Neo4j in Docker, verifies the graph behavior, and builds a local 
 cp .env.example .env
 ```
 
-Set a private `NEO4J_PASSWORD` in `.env`. The example password is intended only for local development.
+Set a private `NEO4J_PASSWORD` in `.env`. The example password is intended only for local development. The smoke test in the next step needs the same value in its process environment.
 This repository-level file supplies Docker Compose. A native Mindreader process instead uses its OS configuration directory, described in [Configuration reference](#configuration-reference).
 
 ### 2. Start Neo4j
@@ -152,10 +155,13 @@ Mindreader does not migrate older graph models. Recreate a disposable local volu
 
 ```bash
 docker compose --profile tools up -d neo4j-tools
-NEO4J_PASSWORD='<same-password-as-repository-.env>' cargo run --features developer-tools --bin mindreader-smoke -- --config-dir packaging/tools-config
+set -a
+. ./.env
+set +a
+cargo run --features developer-tools --bin mindreader-smoke -- --config-dir packaging/tools-config
 ```
 
-The smoke process reads secrets from `packaging/tools-config` (Bolt 7688) so it cannot rewrite a live MCP embedding space on 7687. Process `NEO4J_PASSWORD` still wins over the colocated `.env`.
+The `set -a` block is for POSIX shells and exports the password from the Compose `.env` without putting it in your shell history. The smoke process reads non-secret settings from `packaging/tools-config` (Bolt 7688) so it cannot rewrite a live MCP embedding space on 7687. Process `NEO4J_PASSWORD` still wins over that colocated `.env`.
 
 The smoke test creates test graph data and exercises catalog creation, dynamic multi-layer visibility, membership merging, scoped revision and withdrawal, signed judgment ranking, concurrent judgments, membership auditing, endpoint closure, and stable fact-handle retrieval. A successful run ends with:
 
@@ -418,8 +424,8 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
-| `recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around`, `history` | `effectiveAt` for non-history, non-catalog reads; selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `direction` (`both`\|`outgoing`\|`incoming`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, compact witness paths, revision history, or the Class/Property catalog. Text combines an exact phrase with bounded OR-keyword matching and never calls an embedding provider. `effectiveAt` returns only explicitly qualified ordinary facts whose half-open interval contains that instant; structural edges remain traversable. `history` instead exposes transaction and effective clocks together. |
-| `recall_semantic` | `scope`, non-empty `text` | `labels[]`, `effectiveAt`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall that always fuses exact and keyword candidates with expiring semantic activations. `effectiveAt` filters direct, activation, and structural ordinary facts. Sends only query text to the configured embedding provider and creates no activation when no facts resolve. |
+| `recall` | `scope` and exactly one of `text`, `iris[]` (1–20 unique node IRIs), `labels[]`, `around`, `history` | `effectiveAt` for non-history, non-catalog reads; selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `direction` (`both`\|`outgoing`\|`incoming`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, compact witness paths, revision history, or the Class/Property catalog. Text combines an exact phrase with bounded OR-keyword matching and never calls an embedding provider. `effectiveAt` returns only explicitly qualified ordinary facts whose half-open interval contains that instant; structural edges remain traversable. `history` instead exposes transaction and effective clocks together. |
+| `recall_semantic` | `scope`, non-empty `text` (at most 32 KiB UTF-8) | unique non-empty `labels[]`, `effectiveAt`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall that always fuses exact and keyword candidates with expiring semantic activations. `effectiveAt` filters direct, activation, and structural ordinary facts. Sends only query text to the configured embedding provider and creates no activation when no facts resolve. |
 | `write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`), `effective` (`null`) | Add set-valued triples or merge memberships. `effective` is an optional half-open world-time interval on ordinary state facts. One Episode if any fact changed. |
 | `revise` | `scope`, fact `target`, `replacement` | `spike`, `contradicts`, `reason`, `effective` (omitted inherits; `null` clears; object replaces) | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
 | `withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return a `withdrawn` count plus `withdrawnTargets`. |
@@ -427,21 +433,21 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 | `place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
 | `unify` | same-kind `source` and `target` node handles | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |
 
-Mutations and detailed recall include a `handles` bag. Detailed fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. Concise recall instead returns answer-bearing triples and selector-specific evidence without handles, ranking, memberships, or operation eligibility; it retains `spike`, truncation, around witness paths, history state/revisions, catalog nodes, and IRI lookup status. `write` and `revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
+Mutations and detailed recall include a `handles` bag. Detailed fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. Concise recall instead returns answer-bearing triples and selector-specific evidence without handles, ranking, memberships, or operation eligibility; it retains `spike`, truncation, around witness paths, history state/revisions, catalog nodes, and IRI lookup status. Paste only the returned `{kind, iri}` handle into a mutation, not the containing fact or node. Persisted literal endpoints also carry a `{kind:"node", iri}` handle; use it when a `place` batch must add or remove the literal's memberships for endpoint closure. `write` and `revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
 
-`recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. `effectiveAt` is rejected for catalog and `history` selectors. Neighborhood predicate/direction constraints and deterministic hub-aware ordering happen before the result limit. `iris` applies `limit` per requested IRI and reports `lookups[i].truncated`; `around` still uses one fact budget for the walk.
+`recall` rejects empty selectors and fields that do not apply to its selected mode. Omit selector-specific `hops`, `p`, `depth`, and `direction` outside that mode; their runtime defaults are intentionally not advertised as JSON Schema defaults, so hosts do not fill them into unrelated calls. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. `effectiveAt` is rejected for catalog and `history` selectors. Neighborhood predicate/direction constraints and deterministic hub-aware ordering happen before the result limit. `iris` applies `limit` per requested IRI and reports `lookups[i].truncated`; `around` still uses one fact budget for the walk.
 
 MCP annotations explicitly describe host-facing risk. Ordinary recall is read-only and closed-world. Semantic recall is additive, non-idempotent, and open-world because it contacts the configured provider and maintains activations. Write is additive and idempotent; place is destructive but idempotent; judge is destructive and non-idempotent. Revise, withdraw, and unify use conservative destructive, non-idempotent, closed-world hints. These hints help a host present consent UI, but Mindreader still validates every call.
 
 ### Writing values
 
-Subjects and entity objects use an explicit `kind` tag and require `iri` or `name`:
+Subjects and entity objects use an explicit `kind` tag and require `iri` or `name`. Node objects must not contain literal `value` or `datatype` fields:
 
 ```json
 { "kind": "node", "iri": "mindreader:element/alice", "labels": ["Element"] }
 ```
 
-Literal objects use the `literal` tag:
+Literal objects use the `literal` tag, require `value`, and must not contain node `iri`, `name`, or `labels` fields. Omitted `datatype` means `xsd:string`:
 
 ```json
 {
@@ -469,7 +475,7 @@ An exact correction pastes the selected current fact handle and supplies the rep
 
 On `revise`, omitting `effective` preserves the selected fact's complete effective interval, an explicit `null` clears temporal qualification, and an interval object replaces it. Structural and system relationships do not accept effective intervals.
 
-Withdrawal accepts either one pasteable fact `target`, or a `subject` node IRI with an optional predicate `p`. Subject and predicate slices are intentionally broad. Subject-wide withdrawal still protects structural and system-owned relationships and does not withdraw relationships whose endpoints are Classes or Properties.
+Withdrawal accepts either one pasteable fact `target`, or a `subject` node IRI with an optional predicate `p`. The forms are mutually exclusive, and `p` is invalid with `target`. Subject and predicate slices are intentionally broad. Subject-wide withdrawal still protects structural and system-owned relationships and does not withdraw relationships whose endpoints are Classes or Properties.
 
 `spike` is a commitment level on one exact fact along `Signal → Pattern → Insight → Knowledge`: raw evidence, a recurring observation, an interpretation, then a fact worth relying on. It is stored on the relationship, never labels the subject, and never creates another relationship. Do not auto-promote. Exact reassertion preserves an existing classification when `spike` is omitted and reclassifies only that fact when `spike` is explicit. Revision likewise preserves the retired fact's classification unless the replacement supplies one.
 
@@ -557,7 +563,7 @@ Learned bundles retain up to three strongly grounded direct facts instead of cac
 
 After direct and activation evidence identifies grounded anchor facts, semantic recall may add their visible one-hop `ASSERTS` neighbors as ephemeral structural context. It expands at most 16 anchors and 16 facts per anchor endpoint. For anchor evidence `A`, visible endpoint degree `d`, and the number `g` of bounded adjacent candidates sharing the same anchor and property, structural evidence is `A × 0.25 / √(d × g)`. This caps an unpenalized structural route at the strongest standalone keyword or activation contribution; any graph penalty makes it weaker. Only the strongest route to a structural fact is retained; structural evidence never boosts a fact that already has direct or activation evidence and cannot outrank its anchor. Expanded facts are returned normally but never enter activation bundles, refresh activations, or teach later queries. Scope, optional labels, current-fact checks, and endpoint closure apply during expansion; `ABOUT` remains excluded.
 
-An activation is an internal `SemanticActivation:TTL` node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. A query that resolves no facts returns an empty result without creating an activation. Every recalled activation that contributes at least one currently resolvable fact refreshes its TTL. A query with direct evidence converges into a sufficiently similar overlapping activation or creates a new one; an activation-only query does neither. Ranking revisions use a versioned activation label and index, so bundles learned under incompatible ranking behavior stop contributing without touching durable facts. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
+An activation is a versioned internal TTL node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. A query that resolves no facts returns an empty result without creating an activation. Every recalled activation that contributes at least one currently resolvable fact refreshes its TTL. A query with direct evidence converges into a sufficiently similar overlapping activation or creates a new one; an activation-only query does neither. Ranking revisions isolate incompatible learned bundles without touching durable facts. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
 
 The embedding provider, model, and dimensions define one vector space for the database. If that selection changes, Mindreader discards only the ephemeral activations and recreates their vector index; durable graph memory remains intact. Semantic search requires an embedding key, but all other tools remain usable without one.
 
@@ -685,7 +691,7 @@ docker compose up -d neo4j
 docker compose run --rm -T mindreader
 ```
 
-The second command waits for MCP input on stdin without allocating a pseudo-TTY. All serving-mode diagnostics are structured JSON on stderr so stdout remains reserved for MCP messages.
+The second command waits for MCP input on stdin without allocating a pseudo-TTY. Serving-mode diagnostics go to stderr; stdout remains reserved for MCP messages.
 
 ## Development
 

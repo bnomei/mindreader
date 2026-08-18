@@ -23,7 +23,7 @@ use mindreader::developer::service::{
 use mindreader::developer::Mindreader;
 use mindreader::operation_error;
 use neo4rs::{query, Graph};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1008,6 +1008,28 @@ async fn run() -> Result<u32> {
         format!(
             "inherited={inherited_revision} cleared={cleared_revision} at2023={temporal_2023_after_clear}"
         ),
+    );
+
+    let temporal_open_write = service
+        .write(WriteArgs {
+            facts: vec![WriteFact {
+                s: entity(format!("temporal-open-state-{tag}")),
+                p: format!("hasOpenEffectiveInterval{tag}"),
+                o: object(format!("temporal-open-value-{tag}")),
+                spike: None,
+                contradicts: false,
+                effective: Some(EffectiveInterval {
+                    from: None,
+                    to: None,
+                }),
+            }],
+            scope: vec![layer_a.clone()],
+        })
+        .await?;
+    report.check(
+        "qualified fully-open effective intervals serialize as empty objects",
+        temporal_open_write.pointer("/facts/0/effective") == Some(&json!({})),
+        &temporal_open_write,
     );
 
     let batch_token = format!("batch-{tag}");

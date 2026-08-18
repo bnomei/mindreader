@@ -38,7 +38,7 @@ Do not cascade recall modes. Retry once only for a plausible terminology or neig
 
 Every tool except `mindreader:unify` requires `scope`. `[]` selects global records only. A named scope sees global records plus records in any requested layer; multiple names form an OR union. Layers control visibility, not authorization. Changing a supplied scope ID selects a different layer.
 
-Reuse returned node IRIs for established identities and fact `target` handles for exact mutations. Never reconstruct a fact IRI or treat a fuzzy suggestion as identity.
+Reuse returned node IRIs for established identities and fact `target` handles for exact mutations. Paste only the returned `{kind, iri}` handle, not the containing fact or node. Never reconstruct a fact IRI or treat a fuzzy suggestion as identity.
 
 ## Recall
 
@@ -53,7 +53,7 @@ Use one mode that directly matches the need:
 | Inspect current and retired facts or revisions | `mindreader:recall` with `history` |
 | Match meaning after lexical recall is insufficient | `mindreader:recall_semantic` |
 
-`mindreader:recall` accepts exactly one selector. Use only fields that apply to it.
+`mindreader:recall` accepts exactly one selector. Use only fields that apply to it; omit selector-specific defaults such as `hops`, `depth`, and `direction` outside their mode.
 
 - `text` works best with concrete entity and relationship terms likely to occur in a stored triple.
 - `iris` accepts node IRIs, preserves input order, reports misses, and returns incident facts per lookup. Use `hops` only when top-level one-hop facts are also needed.
@@ -94,6 +94,8 @@ Recall searches explicit graph assertions, not source conversations or documents
 ### Write facts precisely
 
 Facts are set-valued. A different object or effective interval is another current fact; newer evidence is not automatically a replacement. Write compatible parallel values. An exact subject, predicate, object, effective qualification, and interval has one identity: reassertion merges named memberships or is a no-op.
+
+Each `facts[]` item has `s`, `p`, and `o`. `s` is always `kind:"node"` with an `iri` or `name`. For `o`, choose either a node with `iri` or `name`, or a literal with required `value` and optional `datatype`; never mix node and literal fields. Omit optional fields instead of filling unrelated defaults.
 
 Reuse established node and Property IRIs. Use names only when identity is unambiguous, and use the same predicate for the same concept.
 

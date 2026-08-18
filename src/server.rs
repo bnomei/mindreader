@@ -41,6 +41,12 @@ const INVOKE_TIMEOUT: Duration = Duration::from_secs(45);
 const RATE_LIMIT_PER_MINUTE: f64 = 120.0;
 /// Burst capacity of the same limiter (20 tokens).
 const RATE_LIMIT_BURST: f64 = 20.0;
+/// Scheme-qualified IRI prefix accepted by the runtime (`scheme:rest`).
+const IRI_PATTERN: &str = "^[A-Za-z][A-Za-z0-9+.-]*:";
+/// Exact fact handles are internal relationship IRIs returned by Mindreader.
+const FACT_IRI_PATTERN: &str = "^mindreader:relationship/";
+/// At least one non-whitespace character; stricter semantics remain runtime-validated.
+const NON_WHITESPACE_PATTERN: &str = r"\S";
 /// Protocol versions this process will negotiate; initialize rejects anything else.
 ///
 /// `2026-07-28` is preferred. `2025-11-25` is accepted so hosts that have not
@@ -83,6 +89,7 @@ fn scope_schema() -> serde_json::Value {
 fn layer_list_schema(description: &str) -> serde_json::Value {
     let mut schema = scope_schema();
     schema["description"] = Value::String(description.to_string());
+    schema["minItems"] = json!(1);
     schema
 }
 
@@ -94,7 +101,12 @@ fn target_schema_with_kinds(kinds: &[&str], description: &str) -> serde_json::Va
         "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": kinds },
-            "iri": { "type": "string", "minLength": 1 }
+            "iri": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": IRI_PATTERN,
+                "description": "Copy the scheme-qualified IRI from a returned handle; do not use a display name or reconstruct an IRI."
+            }
         },
         "required": ["kind", "iri"]
     })
@@ -115,10 +127,12 @@ fn node_target_schema(description: &str) -> serde_json::Value {
 
 /// Pasteable current fact handle (`kind=fact`) used by revise, withdraw, and results.
 fn fact_target_schema() -> serde_json::Value {
-    target_schema_with_kinds(
+    let mut schema = target_schema_with_kinds(
         &["fact"],
         "A pasteable current fact handle returned by recall, write, or revise.",
-    )
+    );
+    schema["properties"]["iri"]["pattern"] = json!(FACT_IRI_PATTERN);
+    schema
 }
 
 /// ASCII Neo4j label token; interpolated labels are still allowlisted at runtime.
@@ -137,7 +151,11 @@ fn predicate_list_schema(description: &str) -> serde_json::Value {
         "description": description,
         "minItems": 1,
         "uniqueItems": true,
-        "items": { "type": "string", "minLength": 1 }
+        "items": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": NON_WHITESPACE_PATTERN
+        }
     })
 }
 
@@ -149,8 +167,18 @@ fn entity_input_schema(description: &str) -> serde_json::Value {
         "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node"] },
-            "iri": { "type": "string", "minLength": 1 },
-            "name": { "type": "string", "minLength": 1 },
+            "iri": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": IRI_PATTERN,
+                "description": "Existing scheme-qualified node identity. Omit when minting from name."
+            },
+            "name": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": NON_WHITESPACE_PATTERN,
+                "description": "Node display name and minting input when iri is omitted."
+            },
             "labels": { "type": "array", "uniqueItems": true, "items": label_schema() }
         },
         "required": ["kind"]
@@ -165,11 +193,34 @@ fn object_input_schema(description: &str) -> serde_json::Value {
         "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node", "literal"] },
-            "iri": { "type": "string", "minLength": 1 },
-            "name": { "type": "string", "minLength": 1 },
-            "labels": { "type": "array", "uniqueItems": true, "items": label_schema() },
-            "value": { "type": "string" },
-            "datatype": { "type": "string", "minLength": 1, "default": "xsd:string" }
+            "iri": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": IRI_PATTERN,
+                "description": "kind=node only: existing scheme-qualified identity. Omit when minting from name."
+            },
+            "name": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": NON_WHITESPACE_PATTERN,
+                "description": "kind=node only: display name and minting input when iri is omitted."
+            },
+            "labels": {
+                "type": "array",
+                "uniqueItems": true,
+                "description": "kind=node only: optional node labels.",
+                "items": label_schema()
+            },
+            "value": {
+                "type": "string",
+                "description": "kind=literal only: required lexical value."
+            },
+            "datatype": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": NON_WHITESPACE_PATTERN,
+                "description": "kind=literal only: optional datatype; omission means xsd:string."
+            }
         },
         "required": ["kind"]
     })
@@ -800,6 +851,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             "text": {
                 "type": "string",
                 "minLength": 1,
+                "pattern": NON_WHITESPACE_PATTERN,
                 "description": "Lexical fact query. Use concrete entity and action terms; do not embed parameter syntax such as effectiveAt in the text. Use only when text is the selected recall mode."
             },
             "iris": {
@@ -808,7 +860,11 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
                 "minItems": 1,
                 "maxItems": 20,
                 "uniqueItems": true,
-                "items": { "type": "string", "minLength": 1 }
+                "items": {
+                    "type": "string",
+                    "minLength": 1,
+                    "pattern": IRI_PATTERN
+                }
             },
             "labels": {
                 "type": "array",
@@ -820,31 +876,30 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             "around": {
                 "type": "string",
                 "minLength": 1,
+                "pattern": IRI_PATTERN,
                 "description": "Starting node IRI for bounded graph recall."
             },
             "hops": {
                 "type": "integer",
                 "description": "IRI mode only. 0 still returns incident facts on lookups[i].facts. 1 also fills top-level facts[] when detail is detailed. Concise IRI recall keeps its answer in lookups without duplicate top-level facts.",
-                "enum": [0, 1],
-                "default": 0
+                "enum": [0, 1]
             },
             "p": predicate_list_schema("Around mode only: exact predicate names or IRIs to filter before limiting. Omit this filter until the stored predicate vocabulary is known."),
             "depth": {
                 "type": "integer",
                 "description": "Around mode only: traversal depth.",
                 "minimum": 1,
-                "maximum": 3,
-                "default": 1
+                "maximum": 3
             },
             "direction": {
                 "type": "string",
                 "description": "Around mode only: require every traversed edge to follow this direction from the start node.",
-                "enum": ["both", "outgoing", "incoming"],
-                "default": "both"
+                "enum": ["both", "outgoing", "incoming"]
             },
             "history": {
                 "type": "string",
                 "minLength": 1,
+                "pattern": IRI_PATTERN,
                 "description": "One node or exact fact IRI. Returns its current and historical facts plus revision events."
             },
             "effectiveAt": {
@@ -875,6 +930,8 @@ fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
             "text": {
                 "type": "string",
                 "minLength": 1,
+                "maxLength": MAX_SEMANTIC_TEXT_BYTES,
+                "pattern": NON_WHITESPACE_PATTERN,
                 "description": format!("Conceptual query sent to the configured embedding provider; maximum {MAX_SEMANTIC_TEXT_BYTES} UTF-8 bytes.")
             },
             "labels": {
@@ -963,6 +1020,7 @@ fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 20,
+                "uniqueItems": true,
                 "description": "Atomic, input-ordered ratings. Duplicate targets are invalid; any failure rolls back every rating.",
                 "items": {
                     "type": "object",
@@ -995,6 +1053,7 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
                 "description": "Atomic membership edits. Duplicate targets, add/remove overlap, or invalid final endpoint closure rejects the batch. When moving a fact to a layer its endpoint lacks, include that endpoint's returned node handle in the same batch; persisted literals also use their returned kind=node handle here.",
                 "minItems": 1,
                 "maxItems": 20,
+                "uniqueItems": true,
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -1017,8 +1076,8 @@ fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "source": node_handle_schema("Same-kind node that will be permanently absorbed."),
-            "target": node_handle_schema("Same-kind surviving node whose identity and name remain.")
+            "source": node_handle_schema("Same-kind node that will be permanently absorbed and removed."),
+            "target": node_handle_schema("Same-kind surviving node whose IRI and name remain. Review this direction before calling.")
         },
         "required": ["source", "target"]
     }))
@@ -1394,7 +1453,8 @@ impl ServerHandler for Mindreader {
 mod tests {
     use super::{
         classify_tool_error, map_connect_error, map_tool_result, require_supported_protocol,
-        structured_error, Mindreader, TokenBucket,
+        structured_error, Mindreader, TokenBucket, FACT_IRI_PATTERN, IRI_PATTERN,
+        MAX_SEMANTIC_TEXT_BYTES,
     };
     use crate::config::Config;
     use crate::domain::DomainError;
@@ -1752,6 +1812,54 @@ mod tests {
                 .is_some_and(|description| description.contains("final named membership")
                     && description.contains("global"))
         );
+    }
+
+    #[test]
+    fn input_schemas_do_not_prompt_inapplicable_defaults_or_mixed_object_fields() {
+        let recall = tool_schema("recall");
+        for field in ["hops", "depth", "direction"] {
+            assert!(
+                recall["properties"][field].get("default").is_none(),
+                "selector-only {field} must not advertise a default that hosts may send with another selector"
+            );
+        }
+        assert_eq!(recall["properties"]["around"]["pattern"], IRI_PATTERN);
+        assert_eq!(
+            recall["properties"]["iris"]["items"]["pattern"],
+            IRI_PATTERN
+        );
+
+        let write = tool_schema("write");
+        let object = &write["properties"]["facts"]["items"]["properties"]["o"];
+        assert!(object["properties"]["datatype"].get("default").is_none());
+        for field in ["iri", "name", "labels", "value", "datatype"] {
+            let description = object["properties"][field]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("object.{field} missing description"));
+            assert!(
+                description.contains("kind="),
+                "object.{field} must identify its applicable kind"
+            );
+        }
+        let revise = tool_schema("revise");
+        assert_eq!(
+            revise["properties"]["target"]["properties"]["iri"]["pattern"],
+            FACT_IRI_PATTERN
+        );
+
+        let semantic = tool_schema("recall_semantic");
+        assert_eq!(
+            semantic["properties"]["text"]["maxLength"],
+            MAX_SEMANTIC_TEXT_BYTES
+        );
+
+        let place = tool_schema("place");
+        for field in ["add", "remove"] {
+            assert_eq!(
+                place["properties"]["edits"]["items"]["properties"][field]["minItems"],
+                1
+            );
+        }
     }
 
     #[test]

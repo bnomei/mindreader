@@ -3,16 +3,19 @@ name = "mindreader"
 version = "0.5.0"
 edition = "2021"
 autobins = false
-authors = ["Bruno Meilick"]
-categories = ["command-line-utilities", "development-tools"]
-description = "Agent-driven durable Neo4j graph memory MCP server"
+autobenches = false
+default-run = "mindreader"
+categories = [
+  "artificial-intelligence",
+  "command-line-utilities",
+  "database",
+  "development-tools",
+]
+description = "Selective durable graph memory MCP server for AI agents, backed by Neo4j"
 documentation = "https://docs.rs/mindreader"
-homepage = "https://github.com/bnomei/mindreader"
 include = [
   "/src/**",
   "/benches/**",
-  "/Cargo.toml",
-  "/Cargo.lock",
   "/README.md",
   "/LICENSE",
   "/CHANGELOG.md",
@@ -22,7 +25,7 @@ include = [
   "/scripts/mcp_handshake_probe.py",
   "/skills/using-mindreader/**",
 ]
-keywords = ["mcp", "neo4j", "knowledge-graph", "memory", "semantic-search"]
+keywords = ["mcp", "neo4j", "knowledge-graph", "agent-memory", "semantic-search"]
 repository = "https://github.com/bnomei/mindreader"
 license = "MIT"
 readme = "README.md"
@@ -34,6 +37,9 @@ developer-tools = []
 
 [profile.dev]
 debug = "line-tables-only"
+
+[lints.rust]
+unsafe_code = "forbid"
 
 [lib]
 name = "mindreader"

@@ -293,7 +293,7 @@ pub struct EntityInput {
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ObjectInput {
-    /// `"node"` or `"literal"`; mixed fields fail at [`ObjectValue::from_input`].
+    /// `"node"` or `"literal"`; mixed fields fail during input validation.
     pub kind: String,
     /// Node IRI when `kind=node`; forbidden on literals.
     #[serde(default)]

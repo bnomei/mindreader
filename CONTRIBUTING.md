@@ -19,7 +19,7 @@ Build artifacts stay in the repository's normal `target/` directory. When Cargo'
 
 Mindreader supports only a fresh database for the current graph model. It records a model marker and rejects an unversioned non-empty database or a mismatched marker.
 
-The current graph model is version 6. It stores required dynamic layer membership arrays and numeric shared judgment weights on nodes and relationships, stable relationship IRIs, expiring semantic activations backed by a vector index, and a synchronous whole-name merge-candidate index. There is no migration from earlier versions; recreate the Neo4j database or volume.
+The current graph model is version 9. It stores dynamic layer memberships, numeric shared judgment weights, per-fact Spike classifications, stable relationship IRIs, optional state effective intervals, exact revision history, expiring semantic activations backed by a vector index, and synchronous whole-name merge candidates. There is no migration from earlier versions; recreate the Neo4j database or volume.
 
 When introducing an incompatible model change, bump the model version, keep fresh bootstrap idempotent, document that operators must recreate the Neo4j database or volume, and do not add data backfills or compatibility migrations.
 
@@ -29,7 +29,7 @@ When introducing an incompatible model change, bump the model version, keep fres
 - Update `CHANGELOG.md` and keep `Cargo.toml`, `mcp.json`,
   `npm/mindreader/package.json`, and the pinned README MCP example on the same version.
 - Push a `v<version>` tag only after CI passes. The release workflow validates the tagged commit,
-  verifies the crates.io package, builds and smoke-tests every platform archive, then publishes
+  verifies the crates.io package, builds and packages every platform archive, then publishes
   GitHub, crates.io, GHCR, and npm releases.
 - Configure the repository's `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN` secrets before releasing.
   Missing registry credentials fail the release instead of silently skipping a required channel.

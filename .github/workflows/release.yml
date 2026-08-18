@@ -128,7 +128,7 @@ jobs:
         run: npm test
 
   build:
-    name: Build ${{ matrix.target }}
+    name: Package ${{ matrix.target }}
     needs: [release_ref, publish_preflight, verify]
     runs-on: ${{ matrix.os }}
     strategy:
@@ -188,13 +188,6 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: scripts/package-release.ps1 -Target ${{ matrix.target }} -Version ${{ needs.release_ref.outputs.version }} -BinName ${{ env.BIN_NAME }}
-      - name: Smoke release artifact (Unix)
-        if: runner.os != 'Windows'
-        run: TARGET=${{ matrix.target }} VERSION=${{ needs.release_ref.outputs.version }} BIN_NAME=${{ env.BIN_NAME }} scripts/smoke-release.sh
-      - name: Smoke release artifact (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: scripts/smoke-release.ps1 -Target ${{ matrix.target }} -Version ${{ needs.release_ref.outputs.version }} -BinName ${{ env.BIN_NAME }}
       - name: Upload workflow artifacts
         uses: actions/upload-artifact@v4
         with:

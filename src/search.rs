@@ -167,32 +167,29 @@ pub fn validate_recall_args(args: &RecallArgs) -> Result<()> {
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let selectors = [
-        text.is_some(),
-        iris > 0,
-        labels > 0,
-        around.is_some(),
-        history.is_some(),
+        ("text", text.is_some()),
+        ("iris", iris > 0),
+        ("labels", labels > 0),
+        ("around", around.is_some()),
+        ("history", history.is_some()),
     ]
     .into_iter()
-    .filter(|selected| *selected)
-    .count();
-    if selectors != 1 {
+    .filter_map(|(name, selected)| selected.then_some(name))
+    .collect::<Vec<_>>();
+    if selectors.is_empty() {
         return Err(DomainError::InvalidInput(
-            "recall requires exactly one of text, iris, labels, around, or history".into(),
+            "recall requires one selector: text, iris, labels, around, or history".into(),
         )
         .into());
     }
-    let selector = if text.is_some() {
-        "text"
-    } else if iris > 0 {
-        "iris"
-    } else if labels > 0 {
-        "labels"
-    } else if around.is_some() {
-        "around"
-    } else {
-        "history"
-    };
+    if selectors.len() > 1 {
+        return Err(DomainError::InvalidInput(format!(
+            "recall selectors are mutually exclusive; received {}; keep only one of text, iris, labels, around, or history",
+            selectors.join(", ")
+        ))
+        .into());
+    }
+    let selector = selectors[0];
     crate::payload::Detail::parse(args.detail.as_deref())?;
     if selector != "iris" && args.hops.is_some() {
         return Err(DomainError::InvalidInput(format!(
@@ -922,11 +919,17 @@ mod tests {
             limit: None,
             effective_at: None,
         };
-        assert!(validate_recall_args(&args).is_err());
+        assert_eq!(
+            validate_recall_args(&args).unwrap_err().to_string(),
+            "recall requires one selector: text, iris, labels, around, or history"
+        );
         args.text = Some("Alice".into());
         assert!(validate_recall_args(&args).is_ok());
         args.around = Some("mindreader:element/alice".into());
-        assert!(validate_recall_args(&args).is_err());
+        assert_eq!(
+            validate_recall_args(&args).unwrap_err().to_string(),
+            "recall selectors are mutually exclusive; received text, around; keep only one of text, iris, labels, around, or history"
+        );
         args.around = None;
         args.hops = Some(2);
         assert!(validate_recall_args(&args).is_err());

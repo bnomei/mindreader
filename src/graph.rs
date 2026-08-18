@@ -755,9 +755,7 @@ pub fn node_json(node: &Node) -> Result<Value> {
     }
     obj["scope"] = json!(node.get::<Vec<String>>("layers")?);
     obj["weight"] = json!(node_weight(node)?);
-    if !is_literal {
-        obj["target"] = json!({ "kind": "node", "iri": iri });
-    }
+    obj["target"] = json!({ "kind": "node", "iri": iri });
     Ok(obj)
 }
 
@@ -786,23 +784,30 @@ pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Result<Value> {
         obj["spike"] = json!(v);
     }
     obj["effective"] = if rel.get::<bool>("effectiveQualified").unwrap_or(false) {
-        let from = rel
+        let mut effective = serde_json::Map::new();
+        if let Some(from) = rel
             .get::<DateTime<FixedOffset>>("effectiveFrom")
             .ok()
             .map(|value| {
                 value
                     .with_timezone(&Utc)
                     .to_rfc3339_opts(SecondsFormat::AutoSi, true)
-            });
-        let to = rel
+            })
+        {
+            effective.insert("from".into(), json!(from));
+        }
+        if let Some(to) = rel
             .get::<DateTime<FixedOffset>>("effectiveTo")
             .ok()
             .map(|value| {
                 value
                     .with_timezone(&Utc)
                     .to_rfc3339_opts(SecondsFormat::AutoSi, true)
-            });
-        json!({ "from": from, "to": to })
+            })
+        {
+            effective.insert("to".into(), json!(to));
+        }
+        Value::Object(effective)
     } else {
         Value::Null
     };
@@ -1279,6 +1284,7 @@ pub fn endpoint_json(node: &Node) -> Result<Value> {
             "datatype": datatype,
             "scope": node.get::<Vec<String>>("layers")?,
             "weight": node_weight(node)?,
+            "target": { "kind": "node", "iri": iri },
         }));
     }
     Ok(json!({
@@ -1342,24 +1348,37 @@ pub fn spike_rank(label: Option<&str>) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        fact_lock_params, fact_lock_specs, lock_key, node_json, rel_json, resolved_node_parts,
-        safe_label, safe_rel, same_string_members, should_replace_embedding_space, spike_rank,
-        validate_model_version, NodeSpec, SpaceReplace, MODEL_VERSION,
+        endpoint_json, fact_lock_params, fact_lock_specs, lock_key, node_json, rel_json,
+        resolved_node_parts, safe_label, safe_rel, same_string_members,
+        should_replace_embedding_space, spike_rank, validate_model_version, NodeSpec, SpaceReplace,
+        MODEL_VERSION,
     };
     use crate::config::EmbeddingSpace;
     use neo4rs::{
-        BoltInteger, BoltList, BoltMap, BoltNode, BoltRelation, BoltString, BoltType, Node,
-        Relation,
+        BoltBoolean, BoltInteger, BoltList, BoltMap, BoltNode, BoltRelation, BoltString, BoltType,
+        Node, Relation,
     };
 
     fn node_with(properties: impl IntoIterator<Item = (&'static str, BoltType)>) -> Node {
+        node_with_labels(&["Entity"], properties)
+    }
+
+    fn node_with_labels(
+        labels: &[&str],
+        properties: impl IntoIterator<Item = (&'static str, BoltType)>,
+    ) -> Node {
         let mut map = BoltMap::new();
         for (key, value) in properties {
             map.put(BoltString::from(key), value);
         }
         Node::new(BoltNode::new(
             BoltInteger::new(1),
-            BoltList::from(vec![BoltType::String(BoltString::from("Entity"))]),
+            BoltList::from(
+                labels
+                    .iter()
+                    .map(|label| BoltType::String(BoltString::from(*label)))
+                    .collect::<Vec<_>>(),
+            ),
             map,
         ))
     }
@@ -1434,6 +1453,26 @@ mod tests {
         ]);
         assert_eq!(node_json(&complete).unwrap()["weight"], -3);
 
+        let literal = node_with_labels(
+            &["Entity", "Literal"],
+            [
+                (
+                    "iri",
+                    BoltType::String(BoltString::from("mindreader:literal/strict")),
+                ),
+                ("value", BoltType::String(BoltString::from("strict"))),
+                ("datatype", BoltType::String(BoltString::from("xsd:string"))),
+                ("layers", BoltType::List(BoltList::new())),
+                ("weight", BoltType::Integer(BoltInteger::new(0))),
+            ],
+        );
+        let literal_handle = serde_json::json!({
+            "kind": "node",
+            "iri": "mindreader:literal/strict"
+        });
+        assert_eq!(node_json(&literal).unwrap()["target"], literal_handle);
+        assert_eq!(endpoint_json(&literal).unwrap()["target"], literal_handle);
+
         let relation = relation_with([
             (
                 "iri",
@@ -1451,6 +1490,30 @@ mod tests {
             rel_json(&relation, "mindreader:element/a", "mindreader:element/b").unwrap();
         assert_eq!(serialized["weight"], -4);
         assert_eq!(serialized["spike"], "Insight");
+
+        let open_effective = relation_with([
+            (
+                "iri",
+                BoltType::String(BoltString::from("mindreader:relationship/open")),
+            ),
+            (
+                "propertyIri",
+                BoltType::String(BoltString::from("mindreader:property/open")),
+            ),
+            ("layers", BoltType::List(BoltList::new())),
+            ("weight", BoltType::Integer(BoltInteger::new(0))),
+            (
+                "effectiveQualified",
+                BoltType::Boolean(BoltBoolean::new(true)),
+            ),
+        ]);
+        let serialized = rel_json(
+            &open_effective,
+            "mindreader:element/a",
+            "mindreader:element/b",
+        )
+        .unwrap();
+        assert_eq!(serialized["effective"], serde_json::json!({}));
     }
 
     #[test]

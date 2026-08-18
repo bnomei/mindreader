@@ -19,7 +19,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Application error with preserved sources and retry-relevant variants.
 #[derive(Debug, Error)]
 pub enum Error {
-    /// Wire or graph-precondition failure from [`crate::domain::DomainError`].
+    /// Wire or graph-precondition failure from the internal domain validator.
     #[error(transparent)]
     Domain(#[from] DomainError),
     /// Driver-level Neo4j failure; transient kinds may be retried.

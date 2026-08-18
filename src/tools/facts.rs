@@ -18,6 +18,7 @@ use crate::graph::{
     fact_text, fetch_all_txn, fetch_one, fetch_one_txn, merge_literal_in_txn, merge_node_in_txn,
     node_json, rel_json, safe_rel, Episode, MergedNode, NodeSpec,
 };
+use crate::iri::is_iri;
 pub(super) use crate::layers::normalize_scope as normalize_layers;
 use crate::merge::merge_suggestions_in_txn;
 use crate::payload::finish_mutation;
@@ -138,8 +139,21 @@ pub(super) fn validate_target(target: &TargetArgs) -> Result<()> {
     if !matches!(target.kind.as_str(), "node" | "fact") {
         return Err(DomainError::InvalidInput("target.kind must be node or fact".into()).into());
     }
-    if target.iri.trim().is_empty() {
-        return Err(DomainError::InvalidInput("target.iri cannot be empty".into()).into());
+    let iri = target.iri.trim();
+    if !is_iri(iri) {
+        return Err(DomainError::InvalidInput(format!(
+            "target.iri must be a scheme-qualified IRI, not {:?}",
+            target.iri
+        ))
+        .into());
+    }
+    let fact_iri = iri.starts_with("mindreader:relationship/");
+    if (target.kind == "fact") != fact_iri {
+        return Err(DomainError::InvalidInput(format!(
+            "target kind {:?} does not match IRI {:?}; paste the complete returned {{kind, iri}} handle",
+            target.kind, target.iri
+        ))
+        .into());
     }
     Ok(())
 }
@@ -166,6 +180,41 @@ pub(super) fn validate_write_args(args: &WriteArgs) -> Result<()> {
             "write facts must contain between 1 and {MAX_WRITE_FACTS} items"
         ))
         .into());
+    }
+    Ok(())
+}
+
+/// Validate the public withdrawal selector shape before graph work.
+pub(super) fn validate_withdraw_args(args: &WithdrawArgs) -> Result<()> {
+    match (&args.target, &args.subject) {
+        (Some(_), Some(_)) => {
+            return Err(DomainError::InvalidInput(
+                "withdraw target and subject are mutually exclusive; send target only, or subject with optional p"
+                    .into(),
+            )
+            .into())
+        }
+        (None, None) => {
+            return Err(DomainError::InvalidInput(
+                "withdraw requires target, or subject with optional p".into(),
+            )
+            .into())
+        }
+        _ => {}
+    }
+    if args.target.is_some() && args.p.is_some() {
+        return Err(DomainError::InvalidInput(
+            "withdraw p applies only with subject; omit p when target is supplied".into(),
+        )
+        .into());
+    }
+    if let Some(target) = &args.target {
+        validate_target(target)?;
+        if target.kind != "fact" {
+            return Err(
+                DomainError::InvalidInput("withdraw target.kind must be fact".into()).into(),
+            );
+        }
     }
     Ok(())
 }
@@ -1775,6 +1824,7 @@ fn object_input_from_node(node: &Node) -> Result<ObjectInput> {
 
 /// MCP `revise`: resolve a fact IRI, then membership-selective SUPERSEDES.
 pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
+    validate_target(&args.target)?;
     if args.target.kind != "fact" {
         return Err(DomainError::InvalidInput("revise target.kind must be fact".into()).into());
     }
@@ -1839,21 +1889,9 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
 
 /// MCP `withdraw`: soft-withdraw by fact IRI or subject (optional predicate).
 pub async fn memory_withdraw(graph: &Graph, args: WithdrawArgs) -> Result<Value> {
-    let has_target = args.target.is_some();
-    let has_subject = args.subject.is_some();
-    if has_target == has_subject {
-        return Err(DomainError::InvalidInput(
-            "withdraw requires exactly one of target or subject".into(),
-        )
-        .into());
-    }
+    validate_withdraw_args(&args)?;
     let layers = normalize_layers(args.scope.clone())?;
     let withdrawal = if let Some(ref target) = args.target {
-        if target.kind != "fact" {
-            return Err(
-                DomainError::InvalidInput("withdraw target.kind must be fact".into()).into(),
-            );
-        }
         let (s, p, o, _) = load_current_fact(graph, &target.iri, &layers).await?;
         WithdrawalPlan {
             target: WithdrawalSelector {

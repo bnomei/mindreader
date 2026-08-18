@@ -26,9 +26,9 @@ pub use recall::{
 use facts::{
     effective_weight, merge_memberships, plan_fact_membership_changes, prepare_write_fact,
     reject_system_owned_predicate, remove_memberships, revision_fact_lock_requests,
-    select_revision_current, validate_write_args, withdrawal_fact_lock_requests,
-    write_fact_lock_requests, CurrentFact, FactMembershipChange, LAYERS_PROPERTY, MAX_WRITE_FACTS,
-    PREDICATE_USAGE_PROPERTY,
+    select_revision_current, validate_withdraw_args, validate_write_args,
+    withdrawal_fact_lock_requests, write_fact_lock_requests, CurrentFact, FactMembershipChange,
+    LAYERS_PROPERTY, MAX_WRITE_FACTS, PREDICATE_USAGE_PROPERTY,
 };
 #[cfg(test)]
 use judge::validate_judge_args;
@@ -41,14 +41,16 @@ use recall::{
 };
 #[cfg(test)]
 mod tests {
+    use super::facts::validate_target;
     use super::{
         effective_weight, merge_memberships, plan_fact_membership_changes, prepare_write_fact,
         recall_around_query, reject_system_owned_predicate, remove_memberships,
         revision_fact_lock_requests, select_revision_current, validate_judge_args,
-        validate_write_args, withdrawal_fact_lock_requests, write_fact_lock_requests, CurrentFact,
-        FactMembershipChange, JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit, RecallDirection,
-        ReviseArgs, TargetArgs, WriteArgs, WriteFact, HUB_DEGREE_THRESHOLD, LAYERS_PROPERTY,
-        MAX_WRITE_FACTS, PREDICATE_USAGE_PROPERTY, RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
+        validate_withdraw_args, validate_write_args, withdrawal_fact_lock_requests,
+        write_fact_lock_requests, CurrentFact, FactMembershipChange, JudgeArgs, JudgeRating,
+        PlaceArgs, PlaceEdit, RecallDirection, ReviseArgs, TargetArgs, WithdrawArgs, WriteArgs,
+        WriteFact, HUB_DEGREE_THRESHOLD, LAYERS_PROPERTY, MAX_WRITE_FACTS,
+        PREDICATE_USAGE_PROPERTY, RECALL_IRI_FACTS_QUERY, RECALL_IRI_NODES_QUERY,
     };
     use crate::domain::EffectiveUpdate;
     use crate::domain::{DomainError, EntityInput, ObjectInput};
@@ -424,6 +426,53 @@ mod tests {
     }
 
     #[test]
+    fn withdraw_rejects_ambiguous_or_inapplicable_selector_fields() {
+        let target = TargetArgs {
+            kind: "fact".into(),
+            iri: "mindreader:relationship/fact".into(),
+        };
+        let subject = EntityInput {
+            kind: "node".into(),
+            iri: Some("mindreader:element/alice".into()),
+            name: None,
+            labels: vec![],
+        };
+        let valid = WithdrawArgs {
+            scope: vec![],
+            target: Some(target.clone()),
+            subject: None,
+            p: None,
+            reason: None,
+        };
+        assert!(validate_withdraw_args(&valid).is_ok());
+
+        let target_and_subject = WithdrawArgs {
+            subject: Some(subject.clone()),
+            ..valid.clone()
+        };
+        assert!(validate_withdraw_args(&target_and_subject).is_err());
+
+        let target_and_predicate = WithdrawArgs {
+            p: Some("worksOn".into()),
+            ..valid
+        };
+        let error = validate_withdraw_args(&target_and_predicate).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "withdraw p applies only with subject; omit p when target is supplied"
+        );
+
+        let subject_only = WithdrawArgs {
+            scope: vec![],
+            target: None,
+            subject: Some(subject),
+            p: Some("worksOn".into()),
+            reason: None,
+        };
+        assert!(validate_withdraw_args(&subject_only).is_ok());
+    }
+
+    #[test]
     fn target_args_accept_only_pasteable_handles() {
         let node_handle = serde_json::json!({
             "kind": "node",
@@ -450,6 +499,22 @@ mod tests {
         let node_target: TargetArgs = serde_json::from_value(node_handle).unwrap();
         assert_eq!(node_target.kind, "node");
         assert_eq!(node_target.iri, "mindreader:element/alice");
+        assert!(validate_target(&node_target).is_ok());
+        assert!(validate_target(&TargetArgs {
+            kind: "fact".into(),
+            iri: "not-an-iri".into(),
+        })
+        .is_err());
+        assert!(validate_target(&TargetArgs {
+            kind: "node".into(),
+            iri: "mindreader:relationship/abc".into(),
+        })
+        .is_err());
+        assert!(validate_target(&TargetArgs {
+            kind: "fact".into(),
+            iri: "mindreader:element/alice".into(),
+        })
+        .is_err());
         assert!(serde_json::from_value::<TargetArgs>(expanded_node).is_err());
         assert!(serde_json::from_value::<TargetArgs>(expanded_fact).is_err());
     }
