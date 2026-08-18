@@ -1,4 +1,9 @@
-//! Private operation-focused facade for graph mutations and closed-world recall.
+//! Operation facade for graph mutations and closed-world recall selectors.
+//!
+//! [`service`](crate::service) and MCP call through this module into
+//! `facts` (write/revise/withdraw), `judge`, `place`, and `recall`
+//! (`iris`/`around`/`history`/catalog). Ranked text/label search and semantic
+//! fusion live in sibling modules, not here.
 
 mod facts;
 mod judge;
@@ -6,9 +11,11 @@ mod place;
 mod recall;
 
 pub use facts::{
-    memory_revise, memory_withdraw, memory_write, JudgeArgs, JudgeRating, PlaceArgs, PlaceEdit,
-    ReviseArgs, TargetArgs, WithdrawArgs, WriteArgs, WriteFact,
+    memory_revise, memory_withdraw, memory_write, JudgeArgs, PlaceArgs, ReviseArgs, WithdrawArgs,
+    WriteArgs,
 };
+#[cfg(any(feature = "developer-tools", test))]
+pub use facts::{JudgeRating, PlaceEdit, TargetArgs, WriteFact};
 pub use judge::memory_judge;
 pub use place::memory_place;
 pub use recall::{

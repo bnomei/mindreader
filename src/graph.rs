@@ -42,6 +42,7 @@ pub enum SpaceReplace {
     /// Drop the activation index and stored activations, then rebuild for this process.
     Allow,
     /// Fail closed when the stored provider/model/dimension triple does not match.
+    #[cfg(any(feature = "developer-tools", test))]
     Refuse,
 }
 
@@ -273,6 +274,7 @@ pub(crate) fn should_replace_embedding_space(
     }
     match policy {
         SpaceReplace::Allow => Ok(true),
+        #[cfg(any(feature = "developer-tools", test))]
         SpaceReplace::Refuse => Err(Error::EmbeddingSpace(format!(
             "database embedding space {provider}/{model}/{dimensions} is incompatible with {}/{}/{}; refuse to replace it",
             incoming.provider, incoming.model, incoming.dimensions
@@ -1209,7 +1211,7 @@ fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
     .param("note", note.map(|s| s.to_string()))
 }
 
-/// Map the created Episode row; tool is caller-attributed, not stored on the row.
+/// Map the created Episode; `tool` is taken from the caller because RETURN yields only `iri`/`at`.
 fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
     Ok(Episode {
         iri: row.get::<String>("iri")?,

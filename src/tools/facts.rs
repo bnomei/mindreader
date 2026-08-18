@@ -1,12 +1,12 @@
-//! Graph mutations and closed-world `recall` walks behind MCP handlers.
+//! Set-valued `write`, membership-selective `revise`, and soft `withdraw`.
 //!
-//! MCP `write`, `revise`, `withdraw`, `judge`, and `place` live here, plus
-//! `recall` selectors `iris`, `around`, `history`, and the Class/Property
-//! catalog. Writes are set-valued; `revise` records `SUPERSEDES` in one
-//! transaction; withdrawal is soft (`validTo`); `place` keeps endpoint
-//! closure. Class/Property records stay global (`layers=[]`, `stub=false`).
-//! `CONTRADICTS` and `SUPERSEDES` are system-owned. A state change records
-//! exactly one Episode.
+//! Also owns the shared MCP argument types reused by `judge` and `place`.
+//! Exact fact identity (subject, property, object, effective qualification and
+//! interval) merges memberships on reassert; other objects or intervals stay
+//! current. `revise` moves only the requested memberships and records
+//! `SUPERSEDES` in the same transaction. Withdrawal sets `validTo` and never
+//! hard-deletes. `CONTRADICTS` and `SUPERSEDES` are system-owned. Any real
+//! change records exactly one Episode; all-noop rolls back with `episode: null`.
 
 use crate::domain::{
     DomainError, EffectiveInterval, EffectiveUpdate, EntityInput, EntityRef,

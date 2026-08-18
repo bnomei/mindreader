@@ -1,12 +1,10 @@
-//! Graph mutations and closed-world `recall` walks behind MCP handlers.
+//! Closed-world `recall` walks: `iris`, `around`, `history`, and the schema catalog.
 //!
-//! MCP `write`, `revise`, `withdraw`, `judge`, and `place` live here, plus
-//! `recall` selectors `iris`, `around`, `history`, and the Class/Property
-//! catalog. Writes are set-valued; `revise` records `SUPERSEDES` in one
-//! transaction; withdrawal is soft (`validTo`); `place` keeps endpoint
-//! closure. Class/Property records stay global (`layers=[]`, `stub=false`).
-//! `CONTRADICTS` and `SUPERSEDES` are system-owned. A state change records
-//! exactly one Episode.
+//! Ranked text/label search lives in [`crate::search`]; this module handles
+//! input-ordered IRI lookups, hub-aware neighborhood paths, revision/history
+//! envelopes (including Episode `selectedScope` visibility), and Class/Property
+//! catalog listing. Class and Property nodes stay global (`layers=[]`,
+//! `stub=false`). These paths are read-only and never change judgment weights.
 
 use super::facts::{normalize_layers, serialized_scope};
 use crate::domain::{normalize_rfc3339, DomainError};

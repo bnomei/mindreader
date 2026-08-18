@@ -1,12 +1,9 @@
-//! Graph mutations and closed-world `recall` walks behind MCP handlers.
+//! Explicit shared weight ratings for visible current nodes and facts.
 //!
-//! MCP `write`, `revise`, `withdraw`, `judge`, and `place` live here, plus
-//! `recall` selectors `iris`, `around`, `history`, and the Class/Property
-//! catalog. Writes are set-valued; `revise` records `SUPERSEDES` in one
-//! transaction; withdrawal is soft (`validTo`); `place` keeps endpoint
-//! closure. Class/Property records stay global (`layers=[]`, `stub=false`).
-//! `CONTRADICTS` and `SUPERSEDES` are system-owned. A state change records
-//! exactly one Episode.
+//! Each rating changes weight by exactly `+1` or `-1`. Batches are 1–20 unique
+//! targets in one atomic transaction and one Episode. Retrieval never changes
+//! weight; weights do not decay. Search uses weight only within the same Spike
+//! category.
 
 use super::facts::{
     is_transient_neo4j_error, normalize_layers, validate_target, JudgeArgs, JudgeRating,

@@ -246,6 +246,7 @@ pub struct NodeHandle {
 
 impl NodeHandle {
     /// Build a `{kind: node, iri}` handle; IRI checks happen in [`Self::iri`].
+    #[cfg(feature = "developer-tools")]
     pub fn from_iri(iri: impl Into<String>) -> Self {
         Self {
             kind: "node".into(),
@@ -463,9 +464,13 @@ pub fn literal_iri(value: &str, datatype: &str) -> String {
 /// Epistemic fact classification used in retrieval ranking (Knowledge highest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpikeRank {
+    /// Lowest ranked ordinary assertion.
     Signal,
+    /// Recurring observation above a lone signal.
     Pattern,
+    /// Interpreted finding above a pattern.
     Insight,
+    /// Highest ranked asserted knowledge.
     Knowledge,
 }
 
@@ -496,11 +501,14 @@ impl SpikeRank {
     }
 }
 
-/// Withdrawal width: one fact, all facts for a predicate, or a whole subject.
+/// Soft-withdrawal width for `withdraw`: one fact, a predicate slice, or a subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WithdrawalScope {
+    /// Soft-withdraw only the selected fact handle (`validTo`).
     Fact,
+    /// Soft-withdraw every current fact for that subject and predicate.
     Predicate,
+    /// Soft-withdraw every current ordinary fact for that subject.
     Subject,
 }
 

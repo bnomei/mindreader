@@ -32,7 +32,8 @@ impl ToolOutput {
         }
     }
 
-    /// Consume the validated payload at the MCP adapter boundary.
+    /// Consume the validated payload in developer tools that inspect raw JSON.
+    #[cfg(feature = "developer-tools")]
     pub fn into_value(self) -> Value {
         self.0
     }

@@ -1,12 +1,10 @@
-//! Graph mutations and closed-world `recall` walks behind MCP handlers.
+//! Auditable layer-membership edits for visible nodes and current facts.
 //!
-//! MCP `write`, `revise`, `withdraw`, `judge`, and `place` live here, plus
-//! `recall` selectors `iris`, `around`, `history`, and the Class/Property
-//! catalog. Writes are set-valued; `revise` records `SUPERSEDES` in one
-//! transaction; withdrawal is soft (`validTo`); `place` keeps endpoint
-//! closure. Class/Property records stay global (`layers=[]`, `stub=false`).
-//! `CONTRADICTS` and `SUPERSEDES` are system-owned. A state change records
-//! exactly one Episode.
+//! Request `scope` is visibility only; each edit’s `add`/`remove` changes the
+//! stored `layers` property. Emptying a named membership list makes the record
+//! global (`[]`), which is not soft withdrawal. Batches are 1–20 unique targets
+//! in one transaction; endpoint closure is checked against the batch’s final
+//! memberships. At most one Episode is recorded when anything changes.
 
 use super::facts::{
     is_transient_neo4j_error, normalize_layers, validate_target, PlaceArgs, TargetArgs,

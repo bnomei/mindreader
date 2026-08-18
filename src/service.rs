@@ -55,11 +55,6 @@ impl MemoryService {
         }
     }
 
-    /// Borrow the Neo4j handle for smoke, bench, and diagnostics.
-    pub fn graph(&self) -> &Graph {
-        &self.graph
-    }
-
     /// Side-effectful embedding fusion for MCP `recall_semantic`.
     pub async fn recall_semantic(&self, args: SemanticSearchArgs) -> Result<ToolOutput> {
         let result = semantic::memory_semantic_search(

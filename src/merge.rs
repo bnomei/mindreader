@@ -63,6 +63,7 @@ pub struct UnifyArgs {
 
 impl UnifyArgs {
     /// Build unify arguments from two node IRIs (smoke, bench, and in-process callers).
+    #[cfg(feature = "developer-tools")]
     pub fn from_iris(source: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
             source: NodeHandle::from_iri(source),

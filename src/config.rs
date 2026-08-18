@@ -191,7 +191,9 @@ struct FileConfig {
 /// Which remote embedding API is selected at runtime.
 #[derive(Clone, PartialEq, Eq)]
 pub enum EmbeddingProviderKind {
+    /// OpenAI embeddings when `OPENAI_API_KEY` is present.
     OpenAi,
+    /// xAI embeddings when selected after OpenAI is unset.
     XAi,
 }
 
@@ -346,6 +348,7 @@ impl Config {
     ///
     /// Intended for diagnostics and isolated integration tests that must not
     /// reuse the operator's normal configuration directory.
+    #[cfg(feature = "developer-tools")]
     pub fn from_directory(config_dir: impl Into<PathBuf>) -> Result<Self> {
         Self::from_dir(config_dir.into())
     }

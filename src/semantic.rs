@@ -98,6 +98,7 @@ impl SemanticRuntime {
     }
 
     /// Construct a runtime with an explicit provider (tests and smoke fixtures).
+    #[cfg(feature = "developer-tools")]
     pub fn new(provider: Arc<dyn EmbeddingProvider>, config: SemanticConfig) -> Self {
         Self { provider, config }
     }

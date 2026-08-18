@@ -23,7 +23,7 @@ mod search;
 mod semantic;
 mod server;
 mod service;
-/// Graph mutations and closed-world `recall` walks used by [`service`].
+/// Mutation and closed-world recall operations used by [`service`].
 mod tools;
 mod vocabulary;
 
