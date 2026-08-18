@@ -3,7 +3,7 @@
 //! Graph ranking and lock latency live in `mindreader-bench`.
 
 use divan::{counter::ItemsCount, Bencher};
-use mindreader::embeddings::normalize_vector;
+use mindreader::developer::embeddings::normalize_vector;
 
 const DIMENSIONS: &[usize] = &[3, 256, 512, 1536, 3072, 4096];
 

@@ -6,21 +6,21 @@
 //! provider and never calls a remote service.
 
 use async_trait::async_trait;
-use mindreader::config::{Config, EmbeddingSpace, SemanticConfig};
-use mindreader::domain::{EntityInput, ObjectInput};
-use mindreader::embeddings::{normalize_vector, EmbeddingProvider};
-use mindreader::error::{Context, Result};
-use mindreader::graph::{
+use mindreader::developer::config::{Config, EmbeddingSpace, SemanticConfig};
+use mindreader::developer::domain::{EntityInput, ObjectInput};
+use mindreader::developer::embeddings::{normalize_vector, EmbeddingProvider};
+use mindreader::developer::error::{Context, Error, Result};
+use mindreader::developer::graph::{
     self, acquire_fact_locks_in_txn, fetch_one, merge_node_in_txn, require_embedding_space,
     MergedNode, NodeSpec,
 };
-use mindreader::operation_error;
-use mindreader::semantic::SemanticRuntime;
-use mindreader::service::{
+use mindreader::developer::semantic::SemanticRuntime;
+use mindreader::developer::service::{
     JudgeArgs, JudgeRating, MemoryService, PlaceArgs, PlaceEdit, RecallArgs, ReviseArgs,
-    SemanticSearchArgs, TargetArgs, UnifyArgs, WithdrawArgs, WriteArgs, WriteFact,
+    SemanticSearchArgs, TargetArgs, ToolOutput, UnifyArgs, WithdrawArgs, WriteArgs, WriteFact,
 };
-use mindreader::Mindreader;
+use mindreader::developer::Mindreader;
+use mindreader::operation_error;
 use neo4rs::{query, Graph};
 use serde_json::Value;
 use std::process::ExitCode;
@@ -294,6 +294,7 @@ async fn search(service: &MemoryService, scope: Vec<String>, text: &str) -> Resu
             limit: Some(100),
         })
         .await
+        .map(ToolOutput::into_value)
 }
 
 /// MERGE one entity in its own transaction (lock/concurrency fixtures).
@@ -452,12 +453,7 @@ async fn run() -> Result<u32> {
         model: "deterministic".into(),
         dimensions: 3,
     };
-    graph::bootstrap(
-        &graph,
-        Some(&embedding_space),
-        mindreader::graph::SpaceReplace::Refuse,
-    )
-    .await?;
+    graph::bootstrap(&graph, Some(&embedding_space), graph::SpaceReplace::Refuse).await?;
     let stats = bootstrap_state(&graph).await?;
     report.check(
         "bootstrap records the current graph and embedding models",
@@ -722,7 +718,7 @@ async fn run() -> Result<u32> {
                 .pointer(&format!("/facts/{index}/o/iri"))
                 .and_then(Value::as_str)
                 .ok_or_else(|| operation_error!("batch fact {index} missing object"))?;
-            Ok::<_, mindreader::error::Error>((subject.to_string(), object.to_string()))
+            Ok::<_, Error>((subject.to_string(), object.to_string()))
         })
         .collect::<Result<Vec<_>>>()?;
     let batch_noop = service
@@ -1853,21 +1849,16 @@ async fn run() -> Result<u32> {
         })
         .await?;
     report.check(
-        "recall hops 0 still returns incident fact handles, concise detail, and history walks a fact",
-        hops0.get("mode").and_then(Value::as_str) == Some("iris")
-            && hops0
-                .get("facts")
-                .and_then(Value::as_array)
-                .is_some_and(Vec::is_empty)
-            && hops0
-                .pointer("/lookups/0/facts")
-                .and_then(Value::as_array)
-                .is_some_and(|facts| !facts.is_empty())
+        "concise IRI recall returns answer-only incident facts and history walks a fact",
+        hops0
+            .pointer("/lookups/0/facts")
+            .and_then(Value::as_array)
+            .is_some_and(|facts| !facts.is_empty())
             && hops0.get("detail").and_then(Value::as_str) == Some("concise")
-            && hops0
-                .pointer("/handles/facts")
-                .and_then(Value::as_array)
-                .is_some_and(|facts| !facts.is_empty())
+            && hops0.pointer("/lookups/0/facts/0/target").is_none()
+            && hops0.get("handles").is_none()
+            && hops0.get("mode").is_none()
+            && hops0.get("scope").is_none()
             && history.get("mode").and_then(Value::as_str) == Some("history")
             && history
                 .get("facts")
@@ -2094,7 +2085,7 @@ async fn run() -> Result<u32> {
             depth: None,
             direction: None,
             history: None,
-            detail: Some("concise".into()),
+            detail: Some("detailed".into()),
             limit: Some(20),
         })
         .await?;
@@ -2140,7 +2131,7 @@ async fn run() -> Result<u32> {
             depth: None,
             direction: None,
             history: None,
-            detail: Some("concise".into()),
+            detail: Some("detailed".into()),
             limit: Some(20),
         })
         .await?;
@@ -2149,7 +2140,7 @@ async fn run() -> Result<u32> {
             scope: vec![layer_a.clone()],
             text: cold_query,
             labels: None,
-            detail: Some("concise".into()),
+            detail: Some("detailed".into()),
             limit: Some(20),
         })
         .await?;

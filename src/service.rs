@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::Result;
 use crate::merge;
 pub use crate::merge::UnifyArgs;
+use crate::payload::ToolOutput;
 pub use crate::search::RecallArgs;
 use crate::search::{self, is_schema_catalog_labels, validate_recall_args, SearchArgs};
 pub use crate::semantic::SemanticSearchArgs;
@@ -63,18 +64,19 @@ impl MemoryService {
     }
 
     /// Side-effectful embedding fusion for MCP `recall_semantic`.
-    pub async fn recall_semantic(&self, args: SemanticSearchArgs) -> Result<Value> {
-        semantic::memory_semantic_search(
+    pub async fn recall_semantic(&self, args: SemanticSearchArgs) -> Result<ToolOutput> {
+        let result = semantic::memory_semantic_search(
             &self.graph,
             self.semantic.as_ref(),
             self.secrets_path.clone(),
             args,
         )
-        .await
+        .await?;
+        ToolOutput::from_value(result)
     }
 
-    /// MCP `recall`: dispatch one closed-world selector to search, catalog, or walk.
-    pub async fn recall(&self, args: RecallArgs) -> Result<Value> {
+    /// MCP `recall`: dispatch one closed-world selector (`text`, `iris`, `labels`, `around`, or `history`).
+    pub async fn recall(&self, args: RecallArgs) -> Result<ToolOutput> {
         validate_recall_args(&args)?;
         let scope = args.scope.clone();
         let detail = crate::payload::Detail::parse(args.detail.as_deref())?;
@@ -186,36 +188,36 @@ impl MemoryService {
         if has_iris && detail == crate::payload::Detail::Concise {
             crate::payload::omit_iris_top_level_facts(&mut result);
         }
-        crate::payload::finish_recall(result, &scope, detail)
+        ToolOutput::from_value(crate::payload::finish_recall(result, &scope, detail)?)
     }
 
     /// MCP `write`: batched set-valued triples under one `scope`.
-    pub async fn write(&self, args: WriteArgs) -> Result<Value> {
-        tools::memory_write(&self.graph, args).await
+    pub async fn write(&self, args: WriteArgs) -> Result<ToolOutput> {
+        ToolOutput::from_value(tools::memory_write(&self.graph, args).await?)
     }
 
     /// MCP `revise`: membership-selective correction of one fact handle.
-    pub async fn revise(&self, args: ReviseArgs) -> Result<Value> {
-        tools::memory_revise(&self.graph, args).await
+    pub async fn revise(&self, args: ReviseArgs) -> Result<ToolOutput> {
+        ToolOutput::from_value(tools::memory_revise(&self.graph, args).await?)
     }
 
     /// MCP `withdraw`: soft-withdraw a fact handle or a subject/predicate slice.
-    pub async fn withdraw(&self, args: WithdrawArgs) -> Result<Value> {
-        tools::memory_withdraw(&self.graph, args).await
+    pub async fn withdraw(&self, args: WithdrawArgs) -> Result<ToolOutput> {
+        ToolOutput::from_value(tools::memory_withdraw(&self.graph, args).await?)
     }
 
     /// MCP `judge`: sequential ±1 ratings on node or fact handles.
-    pub async fn judge(&self, args: JudgeArgs) -> Result<Value> {
-        tools::memory_judge(&self.graph, args).await
+    pub async fn judge(&self, args: JudgeArgs) -> Result<ToolOutput> {
+        ToolOutput::from_value(tools::memory_judge(&self.graph, args).await?)
     }
 
     /// MCP `place`: change stored memberships; `scope` is visibility only.
-    pub async fn place(&self, args: PlaceArgs) -> Result<Value> {
-        tools::memory_place(&self.graph, args).await
+    pub async fn place(&self, args: PlaceArgs) -> Result<ToolOutput> {
+        ToolOutput::from_value(tools::memory_place(&self.graph, args).await?)
     }
 
     /// MCP `unify`: permanent same-kind merge with no visibility filter.
-    pub async fn unify(&self, args: UnifyArgs) -> Result<Value> {
-        merge::memory_unify(&self.graph, args).await
+    pub async fn unify(&self, args: UnifyArgs) -> Result<ToolOutput> {
+        ToolOutput::from_value(merge::memory_unify(&self.graph, args).await?)
     }
 }

@@ -23,6 +23,8 @@ pub fn is_iri(value: &str) -> bool {
 }
 
 /// Normalize a display name into a path-safe slug, optionally lowercased.
+///
+/// A `mindreader:{kind}/…` value keeps only the path after `/`.
 pub fn slugify(name: &str, lower: bool) -> String {
     let mut s = name.trim().to_string();
     if let Some(rest) = s.strip_prefix("mindreader:") {
@@ -89,15 +91,6 @@ pub fn property_iri(p: &str) -> String {
     }
 }
 
-/// Resolve a class local name or IRI to a class IRI.
-pub fn class_iri(name_or_iri: &str) -> String {
-    if is_iri(name_or_iri) {
-        name_or_iri.to_string()
-    } else {
-        mint_iri("class", name_or_iri, false)
-    }
-}
-
 /// Whether minting for this kind lowercases the slug by default.
 pub fn default_lower_for_kind(kind: &str) -> bool {
     matches!(kind, "element" | "literal" | "episode")
@@ -115,7 +108,9 @@ pub fn label_for_kind(kind: &str) -> Option<&'static str> {
     })
 }
 
-/// Identity kind from Neo4j labels. Used for IRI minting and same-kind unify.
+/// Identity kind from Neo4j labels for IRI minting and same-kind unify.
+///
+/// Class wins over Property over Element. Literal and Episode are not identity kinds.
 pub fn identity_kind_from_labels<I, S>(labels: I) -> Option<&'static str>
 where
     I: IntoIterator<Item = S>,

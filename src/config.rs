@@ -9,6 +9,7 @@ use crate::{
     config_error,
     error::{Context, Result},
 };
+#[cfg(not(unix))]
 use directories::BaseDirs;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -207,8 +208,11 @@ impl EmbeddingProviderKind {
 /// Fully resolved embedding credentials and model settings ready for HTTP use.
 #[derive(Clone)]
 pub struct SelectedEmbedding {
+    /// Which embedding provider won at load (OpenAI if `OPENAI_API_KEY` is set).
     pub provider: EmbeddingProviderKind,
+    /// Remote model id from that provider's `config.toml` section.
     pub model: String,
+    /// Output width that must match the Neo4j activation index.
     pub dimensions: usize,
     /// Bearer token from secrets or the process environment; never logged.
     pub api_key: String,
@@ -230,16 +234,21 @@ impl SelectedEmbedding {
 pub struct EmbeddingSpace {
     /// Provider id stored on the marker (`openai`, `xai`, or a fixture such as `smoke`).
     pub provider: String,
+    /// Model id stored on the Neo4j embedding-space marker.
     pub model: String,
+    /// Index width on the marker; must match the live embedding provider.
     pub dimensions: usize,
 }
 
 /// Runtime configuration assembled from `config.toml`, secrets, and the process environment.
 #[derive(Clone)]
 pub struct Config {
+    /// Bolt URI from `config.toml` (not rewritten).
     pub uri: String,
+    /// Neo4j auth user from `config.toml`; password stays secret-only.
     pub user: String,
     password: Option<String>,
+    /// Semantic activation TTL, neighbor recall, and RRF fusion tunables.
     pub semantic: SemanticConfig,
     /// Present only when an embedding API key was resolved.
     pub embedding: Option<SelectedEmbedding>,
@@ -247,10 +256,27 @@ pub struct Config {
     pub config_dir: PathBuf,
 }
 
-/// Resolve the platform config directory (`…/mindreader`), creating nothing yet.
+/// Resolve the XDG config directory on Unix (`…/mindreader`), creating nothing yet.
+#[cfg(unix)]
 pub fn config_dir() -> Result<PathBuf> {
-    let base =
-        BaseDirs::new().ok_or_else(|| config_error!("cannot resolve the OS config directory"))?;
+    if let Some(root) = env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        return Ok(root.join("mindreader"));
+    }
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| config_error!("cannot resolve HOME for the Mindreader config directory"))?;
+    Ok(home.join(".config/mindreader"))
+}
+
+/// Resolve the native non-Unix config directory (`…/mindreader`).
+#[cfg(not(unix))]
+pub fn config_dir() -> Result<PathBuf> {
+    let base = BaseDirs::new()
+        .ok_or_else(|| config_error!("cannot resolve the Mindreader config directory"))?;
     Ok(base.config_dir().join("mindreader"))
 }
 

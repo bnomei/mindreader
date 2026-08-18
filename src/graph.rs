@@ -1,10 +1,10 @@
-//! Neo4j connection, bootstrap, query helpers, and persistence primitives.
+//! Neo4j driver setup, bootstrap, and persistence primitives for the inspectable graph.
 //!
-//! Owns driver setup, model-version markers, full-text indexes, safe label and
-//! relationship allowlisting, node/relationship JSON serialization, in-txn
-//! MERGE helpers, fact locks, and Episode provenance. Bootstrap is idempotent
-//! for the current model marker; incompatible or unversioned non-empty
-//! databases fail with reset guidance rather than migrating data.
+//! Owns the model marker, embedding-space marker, full-text and activation vector
+//! indexes, Cypher identifier allowlisting, agent-facing node/fact JSON, in-txn
+//! MERGE, FactLock writer order, and Episode provenance. Bootstrap is idempotent
+//! for the current model marker; incompatible or unversioned non-empty databases
+//! fail closed with reset guidance rather than migrating data.
 
 use crate::config::{Config, EmbeddingSpace};
 use crate::domain::literal_iri;
@@ -12,6 +12,7 @@ use crate::iri::{
     default_lower_for_kind, identity_kind_from_labels, kind_for_label, kind_from_iri,
     label_for_kind, mint_iri, name_from_iri, property_iri, split_camel_case,
 };
+use crate::vocabulary::SEARCHABLE_RELATIONSHIPS;
 use crate::{
     error::{Context, Error, Result},
     graph_error,
@@ -21,51 +22,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use uuid::Uuid;
-
-/// Fixed relationship types known to the schema (including system-owned edges).
-pub const FIXED_RELS: &[&str] = &[
-    "INSTANCE_OF",
-    "SUBCLASS_OF",
-    "SUBPROPERTY_OF",
-    "DOMAIN",
-    "RANGE",
-    "ASSERTS",
-    "ABOUT",
-    "EVIDENCE_FOR",
-    "DERIVED_FROM",
-    "SUPPORTS",
-    "CONTRADICTS",
-    "SUPERSEDES",
-];
-
-/// Structural relationship types that map property IRIs to first-class edge types.
-pub const STRUCTURAL: &[&str] = &[
-    "INSTANCE_OF",
-    "SUBCLASS_OF",
-    "SUBPROPERTY_OF",
-    "DOMAIN",
-    "RANGE",
-    "ABOUT",
-    "EVIDENCE_FOR",
-    "DERIVED_FROM",
-    "SUPPORTS",
-    "CONTRADICTS",
-    "SUPERSEDES",
-];
-
-/// Relationship types included in the wakeup full-text fact index.
-pub const WAKEUP_RELS: &[&str] = &[
-    "ASSERTS",
-    "ABOUT",
-    "INSTANCE_OF",
-    "SUBCLASS_OF",
-    "SUBPROPERTY_OF",
-    "DOMAIN",
-    "RANGE",
-    "EVIDENCE_FOR",
-    "DERIVED_FROM",
-    "SUPPORTS",
-];
 
 const LABEL_OK: &str = "label";
 
@@ -104,7 +60,10 @@ pub async fn connect(cfg: &Config) -> Result<Graph> {
         .context(format!("configure Neo4j endpoint {}", cfg.uri))
 }
 
-/// Ensure model marker, constraints, indexes, and seed schema for an empty or current database.
+/// Ensure model marker, constraints, indexes, seed catalog, and embedding space for an empty or current-version database.
+///
+/// Fails closed on an incompatible model marker or unversioned non-empty graph.
+/// When an embedding space is configured, applies `space_replace` instead of migrating activations.
 pub async fn bootstrap(
     graph: &Graph,
     embedding: Option<&EmbeddingSpace>,
@@ -396,6 +355,7 @@ async fn ensure_semantic_index(
         embedding,
     )?;
     if replace {
+        // Drop the v4 vector index, then DETACH DELETE label SemanticActivation so an old embedding space cannot leak.
         graph
             .run(query(&format!("DROP INDEX {SEMANTIC_INDEX} IF EXISTS")))
             .await
@@ -645,7 +605,7 @@ async fn verify_required_fulltext_indexes(graph: &Graph) -> Result<()> {
         let (expected_labels_or_types, expected_properties): (&[&str], &[&str]) =
             match *required_name {
                 "wakeup_nodes" => (&["Entity"], WAKEUP_NODE_PROPERTIES),
-                "wakeup_facts" => (WAKEUP_RELS, &["factText"]),
+                "wakeup_facts" => (SEARCHABLE_RELATIONSHIPS, &["factText"]),
                 MERGE_CANDIDATE_INDEX => (&["Entity"], &["mergeName"]),
                 _ => unreachable!("required full-text index catalog is exhaustive"),
             };
@@ -713,30 +673,13 @@ pub fn safe_rel(rel: &str) -> Result<String> {
     Ok(up)
 }
 
-/// Map a property name/IRI to a structural relationship type when applicable.
-pub fn structural_rel_for(property: &str) -> Option<String> {
-    let iri = property_iri(property);
-    let name = name_from_iri(&iri);
-    let candidate = name.to_ascii_uppercase();
-    if STRUCTURAL.contains(&candidate.as_str()) {
-        return Some(candidate);
-    }
-    if STRUCTURAL
-        .iter()
-        .any(|s| iri == format!("mindreader:property/{s}"))
-    {
-        return Some(name.to_ascii_uppercase());
-    }
-    None
-}
-
-/// Run a graph-level query and return its first row.
+/// First row of a graph-level query. Must not run while a transaction is open on this connection.
 pub async fn fetch_one(graph: &Graph, q: neo4rs::Query) -> Result<Option<Row>> {
     let mut stream = graph.execute(q).await?;
     Ok(stream.next().await?)
 }
 
-/// Run a graph-level query and collect every row.
+/// Every row of a graph-level query. Must not run while a transaction is open on this connection.
 pub async fn fetch_all(graph: &Graph, q: neo4rs::Query) -> Result<Vec<Row>> {
     let mut stream = graph.execute(q).await?;
     let mut rows = Vec::new();
@@ -755,7 +698,7 @@ pub async fn fetch_one_txn(txn: &mut Txn, q: neo4rs::Query) -> Result<Option<Row
     Ok(stream.next(txn.handle()).await?)
 }
 
-/// Execute a query through an existing transaction and exhaust its row stream.
+/// Exhaust a transactional query. The row stream must keep `txn.handle()`; do not issue graph-level queries until the txn ends.
 pub async fn fetch_all_txn(txn: &mut Txn, q: neo4rs::Query) -> Result<Vec<Row>> {
     let mut stream = txn.execute(q).await?;
     let mut rows = Vec::new();
@@ -775,7 +718,7 @@ fn relation_weight(rel: &Relation) -> Result<i64> {
     Ok(rel.get::<i64>("weight")?)
 }
 
-/// Serialize a graph node as agent-facing JSON (`kind=node`, signed `weight`).
+/// Serialize a node as agent-facing JSON: signed weight, scope from layers; literals use `kind=literal`.
 pub fn node_json(node: &Node) -> Result<Value> {
     let labels: Vec<String> = node
         .labels()
@@ -815,7 +758,9 @@ pub fn node_json(node: &Node) -> Result<Value> {
     Ok(obj)
 }
 
-/// Serialize a current edge as a fact (`kind=fact`) with endpoint IRIs.
+/// Serialize a relationship as `kind=fact` with endpoint IRIs, scope, Spike, and signed weight.
+///
+/// Callers must pass a current edge; this helper does not check `validTo`.
 pub fn rel_json(rel: &Relation, from: &str, to: &str) -> Result<Value> {
     if from.is_empty() || to.is_empty() {
         return Err(graph_error!("fact endpoints must have non-empty IRIs"));
@@ -888,6 +833,7 @@ pub fn path_to_json(path: &Path) -> Result<(Vec<Value>, Vec<Value>, Vec<String>)
         if abs == 0 || abs > rels.len() || next >= nodes.len() || cursor >= nodes.len() {
             return Err(graph_error!("Neo4j returned out-of-range path indices"));
         }
+        // Neo4j path indices are signed: negative means the unbounded rel is stored reversed.
         let (from_i, to_i) = if rel_signed >= 0 {
             (cursor, next)
         } else {
@@ -906,8 +852,11 @@ pub fn path_to_json(path: &Path) -> Result<(Vec<Value>, Vec<Value>, Vec<String>)
 /// Result of merging an entity or literal inside a transaction.
 #[derive(Debug, Clone)]
 pub struct MergedNode {
+    /// Stored node identity after MERGE; callers use this as the subject/object handle.
     pub iri: String,
+    /// Display name coalesced onto the node; literals use the literal value.
     pub name: String,
+    /// Identity and extra labels excluding `Entity`; Class/Property stay catalog kinds.
     pub labels: Vec<String>,
     /// True when this MERGE created the node in the current transaction.
     pub created: bool,
@@ -920,7 +869,9 @@ pub struct MergedNode {
 pub struct NodeSpec {
     /// Existing IRI when known; otherwise a name is required to mint one.
     pub iri: Option<String>,
+    /// Display name used to mint an IRI when `iri` is absent; required unless `iri` is set.
     pub name: Option<String>,
+    /// Extra labels merged with the inferred kind label; `Entity` is stripped before MERGE.
     pub labels: Vec<String>,
 }
 
@@ -993,6 +944,7 @@ pub async fn merge_node_in_txn(
     extra_labels: &[String],
 ) -> Result<MergedNode> {
     let (iri, name, labels) = resolved_node_parts(spec, default_kind, extra_labels)?;
+    // UUID create-marker is the only reliable created bit: APOC MERGE cannot return ON CREATE vs ON MATCH.
     let creation_marker = Uuid::new_v4().to_string();
     // Class/Property MERGE always forces stub=false and layers=[] so catalog nodes stay global.
     let row = fetch_one_txn(
@@ -1144,7 +1096,7 @@ pub(crate) fn fact_lock_specs(facts: &[(String, String, String)]) -> Vec<FactLoc
     locks
 }
 
-/// Parameter maps for the ordered `MERGE` of `FactLock` nodes.
+/// Bolt maps for ordered FactLock MERGE; key order is the lock order.
 fn fact_lock_params(locks: &[FactLockSpec]) -> Vec<HashMap<String, String>> {
     locks
         .iter()
@@ -1235,7 +1187,7 @@ fn episode_query(iri: &str, tool: &str, note: Option<&str>) -> neo4rs::Query {
     .param("note", note.map(|s| s.to_string()))
 }
 
-/// Decode the Episode identity returned by [`episode_query`].
+/// Map the created Episode row; tool is caller-attributed, not stored on the row.
 fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
     Ok(Episode {
         iri: row.get::<String>("iri")?,
@@ -1244,7 +1196,7 @@ fn episode_from_row(row: &Row, tool: &str) -> Result<Episode> {
     })
 }
 
-/// Create one Episode node in the caller's transaction and return its identity.
+/// Mint one global Episode (`layers=[]`) in the caller's transaction. Callers must not invoke this for no-op mutations.
 pub async fn create_episode_in_txn(
     txn: &mut Txn,
     tool: &str,
@@ -1257,19 +1209,6 @@ pub async fn create_episode_in_txn(
         .await?
         .ok_or_else(|| graph_error!("failed to create episode"))?;
     episode_from_row(&row, tool)
-}
-
-/// Load an entity by IRI without layer filtering.
-pub async fn get_node(graph: &Graph, iri: &str) -> Result<Option<Node>> {
-    let row = fetch_one(
-        graph,
-        query("MATCH (n:Entity {iri: $iri}) RETURN n").param("iri", iri.to_string()),
-    )
-    .await?;
-    Ok(match row {
-        Some(r) => Some(r.get("n")?),
-        None => None,
-    })
 }
 
 /// Build relationship `factText` for full-text indexing from subject, property, and object.
@@ -1351,6 +1290,7 @@ pub fn fact_envelope(
         .get("weight")
         .and_then(Value::as_i64)
         .ok_or_else(|| graph_error!("fact relationship is missing its numeric weight"))?;
+    // Envelope is current-only; retracted facts must never enter this helper.
     Ok(json!({
         "target": { "kind": "fact", "iri": iri },
         "s": subject,

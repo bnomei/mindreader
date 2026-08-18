@@ -186,10 +186,13 @@ impl NodeHandle {
 pub struct EntityInput {
     /// Must be `"node"`; literals use [`ObjectInput`].
     pub kind: String,
+    /// Optional scheme-qualified node IRI; when omitted, `name` is minted.
     #[serde(default)]
     pub iri: Option<String>,
+    /// Display name used to mint an IRI when `iri` is absent.
     #[serde(default)]
     pub name: Option<String>,
+    /// Extra Neo4j labels; identity kind still prefers Class/Property/Element.
     #[serde(default)]
     pub labels: Vec<String>,
 }
@@ -200,10 +203,13 @@ pub struct EntityInput {
 pub struct ObjectInput {
     /// `"node"` or `"literal"`; mixed fields fail at [`ObjectValue::from_input`].
     pub kind: String,
+    /// Node IRI when `kind=node`; forbidden on literals.
     #[serde(default)]
     pub iri: Option<String>,
+    /// Node display name when `kind=node`; forbidden on literals.
     #[serde(default)]
     pub name: Option<String>,
+    /// Extra Neo4j labels when `kind=node`; forbidden on literals.
     #[serde(default)]
     pub labels: Vec<String>,
     /// Literal lexical form; forbidden on `kind=node`.
@@ -255,7 +261,9 @@ impl EntityRef {
 /// Validated fact object: a node reference or a typed literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectValue {
+    /// Validated node object after `kind=node` checks.
     Entity(EntityRef),
+    /// Typed literal; identity is the deterministic literal IRI.
     Literal { value: String, datatype: String },
 }
 
@@ -371,7 +379,7 @@ pub enum SpikeRank {
 }
 
 impl SpikeRank {
-    /// Parse an optional Spike label; omitted means the subject is unranked.
+    /// Parse an optional Spike label; omitted means the fact is unranked.
     pub fn parse(value: Option<String>) -> Result<Option<Self>, DomainError> {
         value
             .map(|value| match value.as_str() {

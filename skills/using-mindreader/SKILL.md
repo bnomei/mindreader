@@ -29,7 +29,7 @@ Always call tools by the host-exposed fully qualified name; never emit a bare to
 ## Default workflow
 
 1. Choose the work's narrowest applicable `scope`.
-2. At an autonomous recall trigger, reuse facts, node IRIs, and `target` handles already in context. Otherwise make one recall using the selector that directly matches the need.
+2. At an autonomous recall trigger, reuse facts, node IRIs, and `target` handles already in context. Otherwise make one recall using the selector that directly matches the need. Use `detail:"concise"` for answer-only reading and `detail:"detailed"` when a later operation or audit may need handles, memberships, ranking, or eligibility.
 3. Do the work. As durable knowledge emerges, reduce it to precise supported triples rather than conversation excerpts.
 4. At an autonomous capture or maintenance trigger, choose the smallest correct mutation and batch related items.
 5. Preserve returned handles, trust a successful structured result, and stop.
@@ -39,7 +39,7 @@ Add work only when it can change the decision:
 - Skip recall before an idempotent exact write when the fact, identities, predicate, and scope are already unambiguous. Recall before corrections, withdrawals, identity-sensitive changes, or when current state matters.
 - Do not cascade lexical, semantic, catalog, IRI, and neighborhood recalls. Stop when one result is sufficient.
 - Inspect a nonempty review queue only when its candidates are relevant and you may act on them. Never create follow-up work solely because a queue exists.
-- Verify a successful mutation only when the response does not establish the postcondition, the change is broad or consequential, or the commit outcome is unknown.
+- Verify a successful mutation only when the response does not establish the postcondition or the change is broad or consequential.
 - Judge only retrievals that materially helped or misled. Do not rate every result or recall solely to create a rating.
 
 ## Scope and identity
@@ -98,13 +98,13 @@ Before writing, ask internally: will this matter beyond the current turn, can it
 
 Class/Property records and schema-definition edges are global.
 
-## Handle outcomes
+## Handle results
 
 Successful mutations include `ok: true`, `noop`, and `episode`; scoped tools echo `scope`. `mindreader:judge` and `mindreader:place` add an input-ordered `items` list and `summary`. An all-noop mutation returns `episode: null`. Preserve returned `handles`; after `mindreader:revise`, use `target` or `handles.current`, not `previousTarget` or `handles.retired`.
 
-Recoverable failures return `ok: false`, `reason`, `message`, `retryable`, and `outcome`:
+Recoverable failures return `ok: false`, `reason`, `message`, and `retryable`:
 
-- Retry only when `retryable: true` and `outcome: "not_applied"`, honoring `retryAfterMs`.
-- If `outcome: "unknown"`, do not repeat the mutation. Make one targeted recall when the postcondition is observable; otherwise report uncertainty. Never repeat `mindreader:judge` or `mindreader:unify` merely because their effect cannot be confirmed.
+- Retry only when `retryable: true`, honoring `retryAfterMs`.
+- Never repeat `mindreader:judge` or `mindreader:unify` after a non-retryable failure merely because their effect cannot be confirmed.
 - Fix invalid input or failed preconditions instead of retrying unchanged.
 - Treat every batch as atomic; after an error, never assume earlier items applied.

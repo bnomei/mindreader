@@ -2,18 +2,70 @@
 //!
 //! Visibility is not mutability: a global record is visible in every `scope`
 //! but mutable only when the request is `scope: []`. `handles` is a paste bag
-//! of unused-role-safe `{kind, iri}` values. `concise` thins endpoints and
-//! drops `about`; `detailed` keeps the full envelope.
+//! of unused-role-safe `{kind, iri}` values. `concise` returns answer-bearing
+//! graph content; `detailed` keeps the operation and audit envelope.
 
 use crate::domain::DomainError;
 use crate::error::Result;
+use crate::layers::record_is_mutable;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+use std::fmt;
+use std::ops::Deref;
 
-/// Recall payload verbosity. Default is the current full envelope.
+/// Validated object returned by the application boundary to an adapter.
+///
+/// Graph operations may assemble JSON internally, but adapters never need to
+/// handle a scalar or array result shape.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ToolOutput(Value);
+
+impl ToolOutput {
+    /// Accept an assembled tool payload only when its wire root is an object.
+    pub fn from_value(value: Value) -> Result<Self> {
+        if value.is_object() {
+            Ok(Self(value))
+        } else {
+            Err(crate::operation_error!(
+                "tool output must be a JSON object, got {value}"
+            ))
+        }
+    }
+
+    /// Consume the validated payload at the MCP adapter boundary.
+    pub fn into_value(self) -> Value {
+        self.0
+    }
+
+    /// Consume the validated root object without another shape check in adapters.
+    pub fn into_object(self) -> Map<String, Value> {
+        match self.0 {
+            Value::Object(object) => object,
+            _ => unreachable!("ToolOutput construction enforces an object root"),
+        }
+    }
+}
+
+impl Deref for ToolOutput {
+    type Target = Value;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl fmt::Display for ToolOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+/// Recall payload verbosity. Omitted/`detailed` is the full envelope.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
+    /// Operation and audit envelope, including pasteable handles and mutability.
     Detailed,
+    /// Answer-bearing graph content without handles, ranking, memberships, or eligibility.
     Concise,
 }
 
@@ -36,20 +88,6 @@ impl Detail {
             Self::Detailed => "detailed",
             Self::Concise => "concise",
         }
-    }
-}
-
-/// Named memberships are mutable only in a named request that intersects them.
-/// Global records (`[]`) are mutable only when the request is `scope: []`.
-pub fn record_mutable(memberships: &[String], request_scope: &[String]) -> bool {
-    if memberships.is_empty() {
-        request_scope.is_empty()
-    } else if request_scope.is_empty() {
-        false
-    } else {
-        memberships
-            .iter()
-            .any(|layer| request_scope.iter().any(|requested| requested == layer))
     }
 }
 
@@ -87,7 +125,7 @@ pub fn decorate_fact(fact: &mut Value, request_scope: &[String], current: bool) 
         .ok_or_else(|| crate::operation_error!("fact is missing its integer weight"))?;
     fact["current"] = json!(current);
     fact["rateable"] = json!(current);
-    fact["mutable"] = json!(current && record_mutable(&memberships, request_scope));
+    fact["mutable"] = json!(current && record_is_mutable(&memberships, request_scope));
     Ok(())
 }
 
@@ -99,7 +137,7 @@ pub fn decorate_node(node: &mut Value, request_scope: &[String]) -> Result<()> {
     }
     let memberships = memberships_of(node)?;
     node["rateable"] = json!(true);
-    node["mutable"] = json!(record_mutable(&memberships, request_scope));
+    node["mutable"] = json!(record_is_mutable(&memberships, request_scope));
     Ok(())
 }
 
@@ -366,7 +404,7 @@ fn required_field(value: &Value, field: &str, context: &str) -> Result<Value> {
         .ok_or_else(|| crate::operation_error!("{context} is missing {field}"))
 }
 
-/// Concise endpoint: keep identity and pasteable target; drop labels, weight, and memberships.
+/// Concise endpoint: keep answer-bearing identity and display content.
 fn thin_endpoint(value: &Value) -> Result<Value> {
     validate_endpoint(value)?;
     if value.get("kind").and_then(Value::as_str) == Some("literal") {
@@ -380,10 +418,6 @@ fn thin_endpoint(value: &Value) -> Result<Value> {
     let mut out = Map::from_iter([
         ("kind".into(), json!("node")),
         ("iri".into(), required_field(value, "iri", "node endpoint")?),
-        (
-            "target".into(),
-            required_field(value, "target", "node endpoint")?,
-        ),
     ]);
     if let Some(name) = value.get("name") {
         out.insert("name".into(), name.clone());
@@ -391,15 +425,18 @@ fn thin_endpoint(value: &Value) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
-/// Concise fact: keep the handle, `s`/`p`/`o`, mutability flags, and optional Spike/weight/`validTo`.
-fn thin_fact(fact: &Value) -> Result<Value> {
+/// Concise fact: keep the assertion and its epistemic or history qualifiers.
+fn thin_fact(fact: &Value, history: bool) -> Result<Value> {
     let mut out = Map::new();
-    for key in ["target", "p", "scope", "current", "rateable", "mutable"] {
-        out.insert(key.to_string(), required_field(fact, key, "fact")?);
+    out.insert("p".into(), required_field(fact, "p", "fact")?);
+    if let Some(value) = fact.get("spike").filter(|value| !value.is_null()) {
+        out.insert("spike".into(), value.clone());
     }
-    for key in ["spike", "weight", "validTo"] {
-        if let Some(value) = fact.get(key) {
-            out.insert(key.to_string(), value.clone());
+    if history {
+        for key in ["current", "validTo"] {
+            if let Some(value) = fact.get(key) {
+                out.insert(key.to_string(), value.clone());
+            }
         }
     }
     let subject = fact
@@ -413,7 +450,7 @@ fn thin_fact(fact: &Value) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
-/// Concise node: keep the handle, labels, memberships, and mutability flags.
+/// Concise standalone node: keep identity, type, and display content.
 fn thin_node(node: &Value) -> Result<Value> {
     if node.get("kind").and_then(Value::as_str) == Some("literal") {
         return thin_endpoint(node);
@@ -423,34 +460,53 @@ fn thin_node(node: &Value) -> Result<Value> {
         ("kind".into(), json!("node")),
         ("iri".into(), required_field(node, "iri", "node")?),
         ("labels".into(), required_field(node, "labels", "node")?),
-        ("scope".into(), required_field(node, "scope", "node")?),
-        ("target".into(), required_field(node, "target", "node")?),
-        ("rateable".into(), required_field(node, "rateable", "node")?),
-        ("mutable".into(), required_field(node, "mutable", "node")?),
     ]);
-    if let Some(name) = node.get("name") {
-        out.insert("name".into(), name.clone());
+    for key in ["name", "stub", "tool"] {
+        if let Some(value) = node.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
     }
     Ok(Value::Object(out))
 }
 
-/// Stamp `detail` and, for `concise`, thin facts/nodes and clear `about`.
-/// Compact witness paths are useful in both detail modes and remain intact.
+/// Remove relationship identities from answer-only witness paths.
+fn thin_paths(paths: &mut [Value]) -> Result<()> {
+    for path in paths {
+        let edges = path
+            .get_mut("edges")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| crate::operation_error!("recall path is missing its edges array"))?;
+        for edge in edges {
+            edge.as_object_mut()
+                .ok_or_else(|| crate::operation_error!("recall path edge is not an object"))?
+                .remove("iri");
+        }
+    }
+    Ok(())
+}
+
+/// Stamp `detail`; concise keeps only answer-bearing, selector-specific content.
 fn apply_detail(result: &mut Value, detail: Detail) -> Result<()> {
     result["detail"] = json!(detail.as_str());
     if detail != Detail::Concise {
         return Ok(());
     }
+    let mode = result
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| crate::operation_error!("recall result is missing its mode"))?
+        .to_string();
+    let history = mode == "history";
     let facts = result
         .get("facts")
         .and_then(Value::as_array)
         .ok_or_else(|| crate::operation_error!("recall result is missing its facts array"))?;
-    result["facts"] = Value::Array(facts.iter().map(thin_fact).collect::<Result<Vec<_>>>()?);
-    let nodes = result
-        .get("nodes")
-        .and_then(Value::as_array)
-        .ok_or_else(|| crate::operation_error!("recall result is missing its nodes array"))?;
-    result["nodes"] = Value::Array(nodes.iter().map(thin_node).collect::<Result<Vec<_>>>()?);
+    result["facts"] = Value::Array(
+        facts
+            .iter()
+            .map(|fact| thin_fact(fact, history))
+            .collect::<Result<Vec<_>>>()?,
+    );
     let lookups = result
         .get_mut("lookups")
         .and_then(Value::as_array_mut)
@@ -460,12 +516,45 @@ fn apply_detail(result: &mut Value, detail: Detail) -> Result<()> {
             .get("facts")
             .and_then(Value::as_array)
             .ok_or_else(|| crate::operation_error!("recall lookup is missing its facts array"))?;
-        lookup["facts"] = Value::Array(facts.iter().map(thin_fact).collect::<Result<Vec<_>>>()?);
+        lookup["facts"] = Value::Array(
+            facts
+                .iter()
+                .map(|fact| thin_fact(fact, history))
+                .collect::<Result<Vec<_>>>()?,
+        );
         if let Some(node) = lookup.get("node") {
             lookup["node"] = thin_node(node)?;
         }
     }
-    result["about"] = json!([]);
+    if mode == "around" {
+        let paths = result
+            .get_mut("paths")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| crate::operation_error!("around recall is missing its paths array"))?;
+        thin_paths(paths)?;
+    }
+    if mode == "catalog" {
+        let nodes = result
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| crate::operation_error!("catalog recall is missing its nodes array"))?;
+        result["nodes"] = Value::Array(nodes.iter().map(thin_node).collect::<Result<Vec<_>>>()?);
+    }
+    let out = result
+        .as_object_mut()
+        .ok_or_else(|| crate::operation_error!("recall result is not an object"))?;
+    for key in ["mode", "scope", "handles", "about"] {
+        out.remove(key);
+    }
+    if mode != "catalog" {
+        out.remove("nodes");
+    }
+    if mode != "around" {
+        out.remove("paths");
+    }
+    if mode != "iris" && mode != "history" {
+        out.remove("lookups");
+    }
     Ok(())
 }
 
@@ -497,6 +586,7 @@ pub fn finish_recall(mut result: Value, request_scope: &[String], detail: Detail
         .and_then(Value::as_array)
         .ok_or_else(|| crate::operation_error!("recall result is missing its nodes array"))?
         .is_empty();
+    // Catalog/around/iris supply `nodes`; ranked text/labels leave it empty and we synthesize from fact endpoints.
     if nodes_empty && !facts.is_empty() {
         result["nodes"] = json!(nodes_from_facts(&facts));
     }
@@ -556,20 +646,30 @@ pub fn unify_review_item(
 mod tests {
     use super::{
         decorate_fact, finish_recall, handles_bag, nodes_from_facts, omit_iris_top_level_facts,
-        record_mutable, unify_review_item, Detail,
+        unify_review_item, Detail, ToolOutput,
     };
+    use crate::layers::record_is_mutable;
     use serde_json::json;
 
     #[test]
+    fn tool_output_requires_an_object_root() {
+        assert!(ToolOutput::from_value(json!({ "scope": [] })).is_ok());
+        assert!(ToolOutput::from_value(json!([])).is_err());
+    }
+
+    #[test]
     fn global_records_are_mutable_only_in_empty_scope() {
-        assert!(record_mutable(&[], &[]));
-        assert!(!record_mutable(&[], &["project:x".into()]));
-        assert!(!record_mutable(&["project:x".into()], &[]));
-        assert!(record_mutable(
+        assert!(record_is_mutable(&[], &[]));
+        assert!(!record_is_mutable(&[], &["project:x".into()]));
+        assert!(!record_is_mutable(&["project:x".into()], &[]));
+        assert!(record_is_mutable(
             &["project:x".into()],
             &["project:x".into(), "team:y".into()]
         ));
-        assert!(!record_mutable(&["project:x".into()], &["team:y".into()]));
+        assert!(!record_is_mutable(
+            &["project:x".into()],
+            &["team:y".into()]
+        ));
     }
 
     #[test]
@@ -602,17 +702,19 @@ mod tests {
     }
 
     #[test]
-    fn finish_recall_fills_nodes_and_handles() {
+    fn concise_recall_keeps_answer_content_and_drops_operation_metadata() {
         let result = finish_recall(
             json!({
                 "ok": true,
-                "mode": "text",
+                "mode": "around",
                 "facts": [{
                     "target": {"kind":"fact","iri":"mindreader:relationship/a"},
                     "s": {"kind":"node","iri":"mindreader:element/alice","name":"Alice","labels":["Element"],"scope":["project:x"],"weight":0,"target":{"kind":"node","iri":"mindreader:element/alice"}},
                     "p": "worksOn",
                     "o": {"kind":"node","iri":"mindreader:element/mr","name":"mr","labels":["Element"],"scope":["project:x"],"weight":0,"target":{"kind":"node","iri":"mindreader:element/mr"}},
                     "scope": ["project:x"],
+                    "spike": "Knowledge",
+                    "score": 0.9,
                     "weight": 0,
                     "current": true
                 }],
@@ -634,17 +736,59 @@ mod tests {
             Detail::Concise,
         )
         .unwrap();
-        assert_eq!(result["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(result["detail"], "concise");
+        assert_eq!(result["paths"][0]["edges"][0]["p"], "worksOn");
+        assert!(result["paths"][0]["edges"][0].get("iri").is_none());
+        assert_eq!(result["facts"][0]["spike"], "Knowledge");
+        assert_eq!(result["facts"][0]["s"]["name"], "Alice");
+        assert!(result["facts"][0].get("target").is_none());
+        assert!(result["facts"][0].get("scope").is_none());
+        assert!(result["facts"][0].get("current").is_none());
+        assert!(result["facts"][0].get("mutable").is_none());
+        assert!(result["facts"][0].get("rateable").is_none());
+        assert!(result["facts"][0].get("score").is_none());
+        assert!(result.get("handles").is_none());
+        assert!(result.get("mode").is_none());
+        assert!(result.get("scope").is_none());
+        assert!(result.get("nodes").is_none());
+        assert!(result.get("about").is_none());
+        assert!(result.get("lookups").is_none());
+    }
+
+    #[test]
+    fn detailed_recall_keeps_operation_metadata() {
+        let result = finish_recall(
+            json!({
+                "ok": true,
+                "mode": "text",
+                "facts": [{
+                    "target": {"kind":"fact","iri":"mindreader:relationship/a"},
+                    "s": {"kind":"node","iri":"mindreader:element/alice","name":"Alice","labels":["Element"],"scope":["project:x"],"weight":0,"target":{"kind":"node","iri":"mindreader:element/alice"}},
+                    "p": "worksOn",
+                    "o": {"kind":"node","iri":"mindreader:element/mr","name":"mr","labels":["Element"],"scope":["project:x"],"weight":0,"target":{"kind":"node","iri":"mindreader:element/mr"}},
+                    "scope": ["project:x"],
+                    "weight": 0,
+                    "current": true
+                }],
+                "nodes": [],
+                "paths": [],
+                "about": [],
+                "lookups": [],
+                "scope": ["project:x"],
+                "truncated": false
+            }),
+            &["project:x".into()],
+            Detail::Detailed,
+        )
+        .unwrap();
+        assert_eq!(result["detail"], "detailed");
+        assert_eq!(result["facts"][0]["mutable"], true);
+        assert_eq!(result["facts"][0]["rateable"], true);
         assert_eq!(
             result["handles"]["facts"][0]["iri"],
             "mindreader:relationship/a"
         );
-        assert_eq!(result["detail"], "concise");
-        assert!(result["about"].as_array().unwrap().is_empty());
-        assert_eq!(result["paths"][0]["edges"][0]["p"], "worksOn");
-        assert_eq!(result["facts"][0]["mutable"], true);
-        assert_eq!(result["facts"][0]["rateable"], true);
-        assert!(result["facts"][0].get("score").is_none());
+        assert_eq!(result["scope"], json!(["project:x"]));
     }
 
     #[test]

@@ -3,15 +3,15 @@
 //! Text and non-schema label queries rank current ordinary `ASSERTS` facts:
 //! Spike category first, then subject+fact+object weight, then text score.
 //! `validate_recall_args` enforces exactly one selector (`text`, `iris`,
-//! `labels`, `around`, or `history`) without advertising schema unions. Catalog labels
-//! (`Class`/`Property`) do not enter this rank path. Retrieval never changes
-//! weights.
+//! `labels`, `around`, or `history`) without advertising schema unions.
+//! MCP catalog labels (`Class`/`Property`) are diverted in `service` before
+//! this rank path. Retrieval never changes weights.
 
 use crate::domain::DomainError;
 use crate::error::{Error, Result};
 use crate::graph::{endpoint_json, fact_envelope, fetch_all, node_json, rel_json, spike_rank};
 use crate::iri::{is_iri, property_iri, split_camel_case};
-use crate::layers::validate_layer_ids;
+use crate::layers::{normalize_scope, validate_layer_ids};
 use neo4rs::{query, Graph, Node, Relation};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -26,8 +26,11 @@ const MIN_KEYWORD_TOKEN_CHARS: usize = 4;
 const MAX_KEYWORD_TOKEN_BYTES: usize = 64;
 /// Very long text skips the effectively-unmatchable exact phrase channel.
 const MAX_EXACT_PHRASE_BYTES: usize = 512;
+/// Lucene sentinel that matches no indexed token (empty or oversized keyword/phrase channel).
 const NO_MATCH_QUERY: &str = "\"mindreadernokeywordmatch9f86d081884c\"";
+/// Index-score multiplier for the exact-phrase channel.
 const EXACT_TEXT_WEIGHT: f64 = 2.0;
+/// Index-score multiplier for the bounded-keyword channel (weaker than exact).
 const KEYWORD_TEXT_WEIGHT: f64 = 1.0;
 
 /// In-process ranked search (`layers` here is the request visibility union).
@@ -35,10 +38,13 @@ const KEYWORD_TEXT_WEIGHT: f64 = 1.0;
 pub struct SearchArgs {
     /// Request visibility union (named `layers` here; MCP wire field is `scope`).
     pub layers: Vec<String>,
+    /// Lexical query: exact phrase, bounded keywords, and exact property-name match.
     #[serde(default)]
     pub text: Option<String>,
+    /// Subject/object label filter for the rank path (not the Class/Property catalog).
     #[serde(default)]
     pub labels: Option<Vec<String>>,
+    /// Maximum facts; default 20, clamped to 1..=100.
     #[serde(default)]
     pub limit: Option<u32>,
 }
@@ -46,8 +52,11 @@ pub struct SearchArgs {
 /// Internal direct-search evidence used by semantic rank fusion.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct TextMatch {
+    /// Phrase or exact-property channel hit.
     pub exact: bool,
+    /// Fraction of bounded query terms present in `factText` (`1.0` when exact).
     pub keyword_confidence: f64,
+    /// May seed a semantic activation bundle (exact or full keyword coverage).
     pub bundle_eligible: bool,
 }
 
@@ -65,11 +74,14 @@ pub(crate) struct SearchResult {
     pub scope: Vec<String>,
     pub mode: &'static str,
     pub truncated: bool,
+    /// Per-fact exact/keyword evidence; must not appear on the MCP wire.
     pub text_matches: HashMap<String, TextMatch>,
+    /// Subject+property identity used to diversify semantic bundles.
     pub fact_groups: HashMap<String, FactGroup>,
 }
 
 impl SearchResult {
+    /// Drop fusion-only maps and emit the closed-world envelope (`nodes`/`paths`/`lookups` empty).
     fn into_payload(self) -> Value {
         json!({
             "ok": true,
@@ -103,7 +115,9 @@ pub struct RecallArgs {
     /// Starting node IRI for bounded graph walk; `p` and `depth` apply only here.
     #[serde(default)]
     pub around: Option<String>,
-    /// IRI mode only: `0` lookup facts, `1` also fill top-level `facts[]`.
+    /// Iris only: `0` (default) keeps incident facts on `lookups[i].facts`;
+    /// `1` also copies them to top-level `facts[]` when `detail` is `detailed`.
+    /// Concise iris recall clears top-level `facts[]` so the answer stays in lookups.
     #[serde(default)]
     pub hops: Option<u32>,
     /// Around mode only: predicate names or IRIs applied before the fact limit.
@@ -112,7 +126,7 @@ pub struct RecallArgs {
     /// Around mode only: traversal depth 1..=3.
     #[serde(default)]
     pub depth: Option<u32>,
-    /// Around mode only: `both`, `outgoing`, or `incoming` at every hop.
+    /// Around only: `both`, `outgoing`, or `incoming` for the whole path from the start node.
     #[serde(default)]
     pub direction: Option<String>,
     /// Node or fact IRI whose current and `validTo` facts are returned.
@@ -303,14 +317,6 @@ pub fn is_schema_catalog_labels(labels: &[String]) -> bool {
             let trimmed = label.trim();
             trimmed == "Class" || trimmed == "Property"
         })
-}
-
-/// Validate, sort, and stringify the request `scope` used as Cypher `$layers`.
-fn normalize_layers(raw: Vec<String>) -> Result<Vec<String>> {
-    Ok(validate_layer_ids(raw)?
-        .into_iter()
-        .map(|layer| layer.into_string())
-        .collect())
 }
 
 /// Quote a Lucene phrase and escape operators so user text cannot change query shape.
@@ -657,10 +663,11 @@ pub(crate) async fn memory_search_with_matches(
     graph: &Graph,
     args: SearchArgs,
 ) -> Result<SearchResult> {
-    let layers = normalize_layers(args.layers)?;
+    let layers = normalize_scope(args.layers)?;
     let limit = args.limit.unwrap_or(20).clamp(1, 100) as i64;
     let labels = args.labels.unwrap_or_default();
     let trimmed = args.text.unwrap_or_default().trim().to_string();
+    // In-process SearchArgs may be empty; MCP recall never reaches here without a selector.
     if trimmed.is_empty() && labels.is_empty() {
         return Ok(SearchResult {
             facts: Vec::new(),
@@ -716,6 +723,7 @@ pub(crate) async fn memory_search_with_matches(
         )?;
         fact["score"] = json!(row.get::<f64>("score")?);
         fact["effectiveWeight"] = json!(effective_weight);
+        // Endpoint-only hits get a fact group but no fusion evidence.
         if row.get::<i64>("relationshipMatched")? != 0 {
             let exact = row.get::<i64>("relationshipExact")? != 0;
             let keyword_confidence = if exact {

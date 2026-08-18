@@ -1,10 +1,10 @@
-//! Semantic recall: embed a query and fuse it with remembered activations.
+//! Semantic recall: embed a query, fuse it with remembered activations, and persist a new bundle.
 //!
-//! Exposed separately from closed-world `recall`. Combines ranked
-//! direct ordinary `ASSERTS` hits with TTL activation bundles via reciprocal
-//! rank fusion, still under the request `scope`. Query text is sent to the
-//! configured embedding provider; without a key this path fails as
-//! `missing_embedding`. Activations expire and may converge, so this operation
+//! Separate from closed-world `recall`. Under the request `scope`, fuses ranked
+//! direct ordinary `ASSERTS` hits with live TTL activation bundles (RRF) and
+//! weaker non-learning one-hop structural context. Query text goes to the
+//! configured embedding provider; a missing runtime fails as `missing_embedding`.
+//! Successful recalls may refresh, converge, or mint activations, so this path
 //! is intentionally not read-only.
 
 use crate::config::{Config, EmbeddingSpace, SemanticConfig};
@@ -14,7 +14,7 @@ use crate::graph::{
     endpoint_json, fact_envelope, fetch_all, fetch_one, rel_json, require_embedding_space,
     SEMANTIC_INDEX,
 };
-use crate::layers::validate_layer_ids;
+use crate::layers::{normalize_scope, validate_layer_ids};
 use crate::search::{memory_search_with_matches, FactGroup, SearchArgs, SearchResult, TextMatch};
 use crate::{
     embedding_error,
@@ -60,7 +60,7 @@ pub struct SemanticSearchArgs {
     pub limit: Option<u32>,
 }
 
-/// Optional embedding provider plus semantic fusion tunables for a process.
+/// Process-wide embedding provider plus fusion tunables. Absent at [`SemanticRuntime::from_config`] when no API key selected a provider.
 #[derive(Clone)]
 pub struct SemanticRuntime {
     provider: Arc<dyn EmbeddingProvider>,
@@ -84,7 +84,7 @@ impl SemanticRuntime {
         self.provider.provider()
     }
 
-    /// Model id the backend will embed with.
+    /// Provider model id that must match the stored embedding-space marker.
     pub fn model(&self) -> &str {
         self.provider.model()
     }
@@ -167,7 +167,10 @@ pub fn validate_semantic_search_args(args: &SemanticSearchArgs) -> Result<()> {
     Ok(())
 }
 
-/// Embed the query, fuse ranked direct hits with activations, return current facts.
+/// Embed the query, fuse direct `ASSERTS` hits with live activations and structural context, then persist a bundle.
+///
+/// Requires a [`SemanticRuntime`]; otherwise `missing_embedding`. Default limit is 20 (max 100).
+/// Persistence writes at most three bundle-eligible direct fact handles and may converge embeddings.
 pub async fn memory_semantic_search(
     graph: &Graph,
     runtime: Option<&SemanticRuntime>,
@@ -182,14 +185,12 @@ pub async fn memory_semantic_search(
         )
     })?;
     let text = validate_semantic_text(&args.text)?;
-    let layers = validate_layer_ids(args.scope)?
-        .into_iter()
-        .map(|layer| layer.into_string())
-        .collect::<Vec<_>>();
+    let layers = normalize_scope(args.scope)?;
     let labels = args.labels.unwrap_or_default();
     let limit = args.limit.unwrap_or(20) as usize;
     let embedding = runtime.provider.embed(&text).await?;
 
+    // Direct recall is capped at 100 so fusion can rerank before the caller limit.
     let direct_args = SearchArgs {
         layers: layers.clone(),
         text: Some(text.clone()),
@@ -328,6 +329,7 @@ pub async fn memory_semantic_search(
         .collect::<Vec<_>>();
 
     if !ranked_refs.is_empty() {
+        // Persist only bundle-eligible direct handles; structural and activation-only hits must not train the next bundle.
         let direct_ranked_refs = ranked_refs
             .into_iter()
             .filter(|iri| {
@@ -370,7 +372,7 @@ fn activation_evidence(similarity: f64, threshold: f64, keyword_weight: f64) -> 
     keyword_weight * ((similarity - threshold) / (1.0 - threshold)).clamp(0.0, 1.0)
 }
 
-/// Sort fused evidence descending, preferring direct evidence on exact score ties.
+/// Sort fused scores descending; on ties prefer a fact with a direct text match, then IRI.
 fn compare_fused(
     left: &(String, f64),
     right: &(String, f64),

@@ -4,9 +4,8 @@
 //! the first tool call (or a background warmup) bootstraps the graph.
 //! `--help` and `--version` may print to stdout and exit before serve.
 
-use mindreader::error::{Context, Result};
 use mindreader::operation_error;
-use mindreader::Mindreader;
+use mindreader::{Context, Mindreader, Result};
 use rmcp::{transport::io::stdio, ServiceExt};
 use serde_json::json;
 
@@ -42,8 +41,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    // MCP stdio: never write protocol-breaking bytes to stdout.
-    // Do not block initialize/list_tools on Neo4j.
     eprintln!(
         "{}",
         json!({

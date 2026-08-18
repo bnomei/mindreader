@@ -12,13 +12,14 @@ use crate::domain::DomainError;
 use crate::error::{Error, Result as AppResult};
 use crate::graph;
 use crate::merge::UnifyArgs;
+use crate::payload::ToolOutput;
 use crate::search::RecallArgs;
 use crate::semantic::{SemanticSearchArgs, MAX_SEMANTIC_TEXT_BYTES};
 use crate::service::MemoryService;
 use crate::tools::{JudgeArgs, PlaceArgs, ReviseArgs, WithdrawArgs, WriteArgs};
 use neo4rs::Error as Neo4jError;
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::wrapper::Parameters,
     model::{
         CallToolResult, ErrorData as McpError, Implementation, InitializeRequestParams,
         InitializeResult, ProtocolVersion, ServerCapabilities, ServerInfo,
@@ -215,7 +216,6 @@ fn error_envelope_properties() -> serde_json::Map<String, Value> {
         "reason": { "type": "string" },
         "message": { "type": "string" },
         "retryable": { "type": "boolean" },
-        "outcome": { "type": "string", "enum": ["not_applied", "unknown"] },
         "retryAfterMs": { "type": "integer", "minimum": 1 }
     }) else {
         unreachable!("literal object")
@@ -290,7 +290,7 @@ fn relationship_schema() -> Value {
     })
 }
 
-/// Compact path witnesses returned by recall surfaces.
+/// Compact path witnesses returned by recall surfaces; concise omits edge IRIs.
 fn compact_witness_path_schema() -> Value {
     json!({
         "type": "object",
@@ -308,7 +308,7 @@ fn compact_witness_path_schema() -> Value {
                         "p": { "type": "string" },
                         "to": { "type": "string" }
                     },
-                    "required": ["iri", "from", "p", "to"]
+                    "required": ["from", "p", "to"]
                 }
             }
         },
@@ -355,6 +355,13 @@ fn fact_schema() -> Value {
         },
         "required": ["target", "s", "p", "o"]
     })
+}
+
+/// Recall fact items; `target` and operation flags are optional so concise payloads stay valid.
+fn recall_fact_schema() -> Value {
+    let mut schema = fact_schema();
+    schema["required"] = json!(["s", "p", "o"]);
+    schema
 }
 
 /// Fact envelope or null, used when a no-op revise returns no replacement body.
@@ -446,13 +453,13 @@ fn handles_schema() -> Value {
     })
 }
 
-/// Recall verbosity: `concise` thins endpoints and drops `about`; `detailed` is the full envelope.
+/// Recall verbosity: answer-only `concise` or operation-ready `detailed`.
 fn detail_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["concise", "detailed"],
         "default": "detailed",
-        "description": "concise returns handles plus thin s/p/o lines. detailed is the full envelope."
+        "description": "concise returns answer-bearing graph content without handles, ranking, memberships, or operation eligibility. detailed is the full operation and audit envelope."
     })
 }
 
@@ -557,10 +564,9 @@ impl TokenBucket {
 /// Stdio MCP server: eight-tool router, lazy Neo4j service, and invoke limiter.
 #[derive(Clone)]
 pub struct Mindreader {
-    /// RMCP router for the eight memory tools.
-    pub tool_router: ToolRouter<Self>,
     /// Filled on first invoke or warmup; initialize/`tools/list` leave it empty.
     service: Arc<OnceCell<MemoryService>>,
+    /// Native config used on first Neo4j connect; unused by initialize/`tools/list`.
     cfg: Config,
     /// Process-local 120/min burst-20 bucket; never wraps in-process `tools::*`.
     limiter: Arc<TokenBucket>,
@@ -570,7 +576,6 @@ impl Mindreader {
     /// Construct the eight-tool router without connecting to Neo4j.
     fn from_config(cfg: Config) -> Self {
         Self {
-            tool_router: Self::tool_router(),
             service: Arc::new(OnceCell::new()),
             cfg,
             limiter: Arc::new(TokenBucket::new()),
@@ -620,7 +625,7 @@ impl Mindreader {
     async fn invoke<F, Fut>(&self, op: F) -> Result<CallToolResult, McpError>
     where
         F: FnOnce(MemoryService) -> Fut,
-        Fut: std::future::Future<Output = AppResult<Value>>,
+        Fut: std::future::Future<Output = AppResult<ToolOutput>>,
     {
         if let Err(retry_after_ms) = self.limiter.try_acquire() {
             return Ok(structured_error_with_retry_after(
@@ -649,15 +654,13 @@ impl Mindreader {
     }
 }
 
-/// Recoverable tool failure as `isError` with `{ok:false,reason,message,retryable,outcome}`.
+/// Recoverable tool failure as `isError` with `{ok:false,reason,message,retryable}`.
 fn structured_error(reason: &str, message: impl std::fmt::Display) -> CallToolResult {
-    let (retryable, outcome) = error_retry_metadata(reason);
     CallToolResult::structured_error(json!({
         "ok": false,
         "reason": reason,
         "message": message.to_string(),
-        "retryable": retryable,
-        "outcome": outcome,
+        "retryable": error_retryable(reason),
     }))
 }
 
@@ -667,31 +670,21 @@ fn structured_error_with_retry_after(
     message: impl std::fmt::Display,
     retry_after_ms: u64,
 ) -> CallToolResult {
-    let (retryable, outcome) = error_retry_metadata(reason);
     CallToolResult::structured_error(json!({
         "ok": false,
         "reason": reason,
         "message": message.to_string(),
-        "retryable": retryable,
-        "outcome": outcome,
+        "retryable": error_retryable(reason),
         "retryAfterMs": retry_after_ms,
     }))
 }
 
-/// Classify whether MCP may retry and whether the mutation is known not-applied.
-fn error_retry_metadata(reason: &str) -> (bool, &'static str) {
-    match reason {
-        "connect_failed" | "rate_limited" | "concurrent_mutation" => (true, "not_applied"),
-        "invalid_input"
-        | "precondition_failed"
-        | "missing_embedding"
-        | "embedding_space"
-        | "embedding_http" => (false, "not_applied"),
-        // A timeout or undifferentiated operation failure can include an
-        // ambiguous commit. Never encourage an automatic retry.
-        "timeout" | "operation" => (false, "unknown"),
-        _ => (false, "unknown"),
-    }
+/// Only failures that are known safe to repeat are advertised as retryable.
+fn error_retryable(reason: &str) -> bool {
+    matches!(
+        reason,
+        "connect_failed" | "rate_limited" | "concurrent_mutation"
+    )
 }
 
 /// Lazy Neo4j connect/bootstrap failure advertised as retryable `connect_failed`.
@@ -700,13 +693,13 @@ fn map_connect_error(error: Error) -> CallToolResult {
 }
 
 /// Stamp `ok:true` on success objects, or map application errors to structured `isError`.
-fn map_tool_result(result: AppResult<Value>) -> CallToolResult {
+fn map_tool_result(result: AppResult<ToolOutput>) -> CallToolResult {
     match result {
-        Ok(Value::Object(mut value)) => {
+        Ok(value) => {
+            let mut value = value.into_object();
             value.insert("ok".into(), Value::Bool(true));
             CallToolResult::structured(Value::Object(value))
         }
-        Ok(value) => CallToolResult::structured(json!({ "ok": true, "result": value })),
         Err(error) => structured_error(classify_tool_error(&error), error),
     }
 }
@@ -797,7 +790,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             },
             "hops": {
                 "type": "integer",
-                "description": "IRI mode only. 0 still returns incident fact handles on lookups[i].facts. 1 also fills top-level facts[] when detail is detailed. Concise iris recall keeps facts[] empty.",
+                "description": "IRI mode only. 0 still returns incident facts on lookups[i].facts. 1 also fills top-level facts[] when detail is detailed. Concise IRI recall keeps its answer in lookups without duplicate top-level facts.",
                 "enum": [0, 1],
                 "default": 0
             },
@@ -973,7 +966,7 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
         "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "handles": handles_schema(),
         "scope": scope_schema(),
-        "facts": { "type": "array", "items": fact_schema() },
+        "facts": { "type": "array", "items": recall_fact_schema() },
         "nodes": { "type": "array", "items": node_schema() },
         "paths": {
             "type": "array",
@@ -1017,7 +1010,7 @@ fn schema_out_memory_recall() -> Arc<rmcp::model::JsonObject> {
                     "iri": { "type": "string" },
                     "found": { "type": "boolean" },
                     "node": node_schema(),
-                    "facts": { "type": "array", "items": fact_schema() },
+                    "facts": { "type": "array", "items": recall_fact_schema() },
                     "truncated": { "type": "boolean" }
                 },
                 "required": ["iri", "found", "truncated"]
@@ -1035,7 +1028,7 @@ fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
         "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "handles": handles_schema(),
         "scope": scope_schema(),
-        "facts": { "type": "array", "items": fact_schema() },
+        "facts": { "type": "array", "items": recall_fact_schema() },
         "nodes": { "type": "array", "items": node_schema() },
         "paths": {
             "type": "array",
@@ -1051,7 +1044,7 @@ fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
                     "iri": { "type": "string" },
                     "found": { "type": "boolean" },
                     "node": node_schema(),
-                    "facts": { "type": "array", "items": fact_schema() }
+                    "facts": { "type": "array", "items": recall_fact_schema() }
                 },
                 "required": ["iri", "found"]
             }
@@ -1171,11 +1164,12 @@ impl Mindreader {
     #[tool(
         name = "recall",
         title = "Recall visible memory",
-        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Text recall safely combines an exact phrase with bounded OR-keyword matching of terms at least four Unicode characters long. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. limit defaults to 20 and is at most 100. hops applies only to iris; p, direction, and depth only to around, where they constrain every traversed edge and compact hub-aware witness paths remain in concise detail. history accepts one node or fact IRI and returns exact revision events plus current/historical facts. detail is concise or detailed. Class or Property labels read the global catalog.",
+        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Text recall safely combines an exact phrase with bounded OR-keyword matching of terms at least four Unicode characters long. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. limit defaults to 20 and is at most 100. hops applies only to iris; p, direction, and depth only to around, where they constrain every traversed edge. history accepts one node or fact IRI and returns exact revision events plus current/historical facts. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. Class or Property labels read the global catalog.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
     )]
+    /// Closed-world read: one selector, no embedding, no graph writes; limited and timed via `invoke`.
     async fn recall(
         &self,
         Parameters(args): Parameters<RecallArgs>,
@@ -1187,11 +1181,12 @@ impl Mindreader {
     #[tool(
         name = "recall_semantic",
         title = "Recall by meaning",
-        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. Every call combines exact and bounded keyword candidates with matching semantic activations, so untouched topics can surface lexically before later paraphrases reuse their activation group. Exact evidence outweighs keyword-only evidence, and repeated activations cannot amplify a fact by accumulation. Grounded anchors may surface bounded degree-normalized one-hop ASSERTS context; expanded facts stay weaker than anchors and never teach activations. A query with no results creates no activation. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. detail is concise or detailed. The call may maintain expiring semantic activations, so it is neither read-only nor idempotent.",
+        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. Every call combines exact and bounded keyword candidates with matching semantic activations, so untouched topics can surface lexically before later paraphrases reuse their activation group. Exact evidence outweighs keyword-only evidence, and repeated activations cannot amplify a fact by accumulation. Grounded anchors may surface bounded degree-normalized one-hop ASSERTS context; expanded facts stay weaker than anchors and never teach activations. A query with no results creates no activation. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. limit defaults to 20 and is at most 100. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. The call may maintain expiring semantic activations, so it is neither read-only nor idempotent.",
         input_schema = schema_memory_recall_semantic(),
         output_schema = schema_out_memory_recall_semantic(),
         annotations(title = "Recall by meaning", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
     )]
+    /// Embeds `text` and may persist expiring activations; not read-only; limited and timed via `invoke`.
     async fn recall_semantic(
         &self,
         Parameters(args): Parameters<SemanticSearchArgs>,
@@ -1312,12 +1307,12 @@ impl ServerHandler for Mindreader {
             )
     }
 
-    /// Negotiate [`SUPPORTED_PROTOCOL_VERSIONS`]; unknown versions fail initialize.
+    /// Negotiate `2026-07-28` or `2025-11-25`; unknown versions fail initialize.
     fn supported_protocol_versions(&self) -> Cow<'static, [ProtocolVersion]> {
         Cow::Borrowed(SUPPORTED_PROTOCOL_VERSIONS)
     }
 
-    /// Handshake without Neo4j: accept a supported version and echo it on [`get_info`].
+    /// Handshake without Neo4j: accept a supported version and echo it on [`Self::get_info`].
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -1339,6 +1334,7 @@ mod tests {
     use crate::config::Config;
     use crate::domain::DomainError;
     use crate::error::Error;
+    use crate::payload::ToolOutput;
     use rmcp::ServerHandler;
     use serde_json::Value;
 
@@ -1858,7 +1854,10 @@ mod tests {
 
     #[test]
     fn map_tool_result_returns_structured_error() {
-        let success = map_tool_result(Ok(serde_json::json!({ "scope": [] })));
+        let success = map_tool_result(Ok(ToolOutput::from_value(
+            serde_json::json!({ "scope": [] }),
+        )
+        .unwrap()));
         assert_eq!(success.is_error, Some(false));
         assert_eq!(
             success
@@ -1880,7 +1879,7 @@ mod tests {
             .expect("structured embedding_space");
         assert_eq!(space_body["reason"], "embedding_space");
         assert_eq!(space_body["retryable"], false);
-        assert_eq!(space_body["outcome"], "not_applied");
+        assert!(space_body.get("outcome").is_none());
 
         let wrapped_space = map_tool_result(Err(Error::EmbeddingSpace("dim mismatch".into())
             .context("query semantic activation vector index")));
@@ -1912,13 +1911,13 @@ mod tests {
         let timeout = structured_error("timeout", "late");
         let body = timeout.structured_content.expect("structured timeout");
         assert_eq!(body["retryable"], false);
-        assert_eq!(body["outcome"], "unknown");
+        assert!(body.get("outcome").is_none());
         let retryable = structured_error("connect_failed", "offline");
         let body = retryable
             .structured_content
             .expect("structured connect error");
         assert_eq!(body["retryable"], true);
-        assert_eq!(body["outcome"], "not_applied");
+        assert!(body.get("outcome").is_none());
     }
 
     #[test]

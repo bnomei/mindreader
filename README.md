@@ -251,12 +251,12 @@ Mindreader is agent-driven working memory, not a user-operated notebook. The age
    | Need | Selector |
    | --- | --- |
    | Names or terms | `text` |
-   | Known node IRIs | `iris` (`hops` defaults to `0`; incident fact handles still appear on `lookups[i].facts` and `handles.facts`. Use `1` to also fill top-level `facts[]`) |
+   | Known node IRIs | `iris` (`hops` defaults to `0`; incident facts still appear on `lookups[i].facts`. Use `1` to also fill top-level `facts[]` in detailed mode) |
    | Class or Property catalog | `labels: ["Class"]` or `["Property"]` |
    | Neighborhood from a node | `around`, optional `p` and `depth` |
    | Current plus historical facts | `history` (one node or fact IRI) |
 
-   Call `recall_semantic` only when lexical recall is not enough and sending the query text to the embedding provider is acceptable. Both recall tools accept `detail`: `detailed` (default) or `concise`.
+   Call `recall_semantic` only when lexical recall is not enough and sending the query text to the embedding provider is acceptable. Both recall tools accept `detail`: use answer-only `concise` when reading memory, or the default operation-ready `detailed` when handles, memberships, ranking, eligibility, or audit context may be needed.
 3. Do the work. Discussion, investigation, implementation, debugging, and review are capture triggers whenever they establish supported knowledge that another agent or session is likely to need. Reduce that knowledge to concise triples; do not copy conversation.
 4. When durable state should change, pick the smallest verb:
 
@@ -270,10 +270,10 @@ Mindreader is agent-driven working memory, not a user-operated notebook. The age
    | Two nodes are the same identity | `unify` after you choose the survivor |
 
 5. Before completing significant work or handing it off, perform a capture check for durable outcomes, decisions and rationale, constraints, unresolved commitments, and reusable lessons. Batch related changes. Do not ask the user whether qualifying memory should be saved.
-6. Paste returned handles. Every success result includes `handles` (`facts`, `nodes`, `current`, `retired`, `unify`). Do not reconstruct `mindreader:relationship/<uuid>`. Do not treat a fuzzy name hit as identity.
+6. Paste returned handles from mutations or detailed recall. Those results include `handles` (`facts`, `nodes`, `current`, `retired`, `unify`); concise recall intentionally does not. Do not reconstruct `mindreader:relationship/<uuid>`. Do not treat a fuzzy name hit as identity.
 7. `review.unify` and `review.alternatives` are queues, not commands. Judge only retrievals that materially helped, distracted, or misled (`rateable: true`). Correct or withdraw false memory instead of merely judging it.
 
-Text and semantic recall also fill `nodes[]` from returned fact endpoints. `iris` reports misses as `lookups[i].found: false`. After `revise`, the live handle is `target` / `handles.current`; `previousTarget` / `handles.retired` is the retired input. `unify` takes `{kind:"node", iri}` handles; paste `review.unify[].source` and `.target`, or `handles.unify[]`.
+Detailed text and semantic recall also fill `nodes[]` from returned fact endpoints. `iris` reports misses as `lookups[i].found: false`. After `revise`, the live handle is `target` / `handles.current`; `previousTarget` / `handles.retired` is the retired input. `unify` takes `{kind:"node", iri}` handles; paste `review.unify[].source` and `.target`, or `handles.unify[]`.
 
 A global fact can appear under a named `scope` with `mutable: false`. Revise or withdraw it with `scope: []`. The error says so.
 
@@ -343,7 +343,8 @@ Call `recall` with `around` and optional predicate names:
 For `around`, `p` constrains every traversed edge and `direction` is `both`
 (the default), `outgoing`, or `incoming` at every hop. `paths[i]` is the
 deterministic best witness path for `facts[i]`; its edges are compact
-`{iri,from,p,to}` records and remain available in concise detail. Intermediate
+`{iri,from,p,to}` records in detailed mode and answer-only `{from,p,to}` records
+in concise mode. Witness paths remain available in both modes. Intermediate
 path edges do not consume the requested fact limit. Witnesses passing through
 non-start nodes with more than 16 eligible edges receive a bounded hub penalty,
 so specific routes rank ahead of equally short routes through dense hubs.
@@ -391,7 +392,7 @@ Both `judge` and `place` accept 1–20 input items, reject duplicate targets, an
 
 All successful results include `ok:true`. Successful mutations include `noop` and `episode`, and scoped mutations echo `scope`; batch mutations include `summary:{requested,changed,noop}` plus input-ordered `items` with stable indexes, targets, statuses, and operation-specific fields. An all-noop mutation has `noop:true` and `episode:null`.
 
-Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable,outcome}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. `outcome:"not_applied"` confirms no mutation committed. `outcome:"unknown"` means the caller must not assume retrying a non-idempotent mutation is safe. Every scoped tool requires a `scope` array; permanent `unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the typed application boundary behind them. MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
+Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. Retry only when `retryable:true`. Every scoped tool requires a `scope` array; permanent `unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the application boundary behind them. MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
 
 | Tool | Required input | Optional input and defaults | Purpose |
 | --- | --- | --- | --- |
@@ -404,7 +405,7 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 | `place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
 | `unify` | same-kind `source` and `target` node handles | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |
 
-Successful results include a `handles` bag. Fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. `write` and `revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
+Mutations and detailed recall include a `handles` bag. Detailed fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. Concise recall instead returns answer-bearing triples and selector-specific evidence without handles, ranking, memberships, or operation eligibility; it retains `spike`, truncation, around witness paths, history state/revisions, catalog nodes, and IRI lookup status. `write` and `revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
 
 `recall` rejects empty selectors and fields that do not apply to its selected mode. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. Neighborhood predicate/direction constraints and deterministic hub-aware ordering happen before the result limit. `iris` applies `limit` per requested IRI and reports `lookups[i].truncated`; `around` still uses one fact budget for the walk.
 
@@ -531,7 +532,7 @@ Each state-changing mutation creates one `Episode` with its canonical tool name 
 
 `revise` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction. Its Episode records the exact previous fact, replacement fact, selected scope, and non-actionable system edge. Its result exposes the replacement as `target` and the retired handle as `previousTarget`. `recall` with `history` returns current and `validTo` facts plus newest-first `revisions[]` entries containing pasteable previous/replacement fact handles and audit-only `SUPERSEDES` metadata. Revision history is a directed event graph and may branch.
 
-Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because their outcome may be ambiguous.
+Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because the write may already have applied.
 
 `CONTRADICTS` is multi-valued. Setting `contradicts: true` on a write or revision records explicit links to conflicting visible current objects.
 
@@ -558,10 +559,9 @@ Mindreader does not add an application authentication layer in front of MCP or N
 
 ## Configuration reference
 
-When the server starts in MCP mode, Mindreader creates `config.toml` and `.env` without overwriting existing files in the OS-native configuration directory:
+When the server starts in MCP mode, Mindreader creates `config.toml` and `.env` without overwriting existing files in the configuration directory:
 
-- Linux: `${XDG_CONFIG_HOME:-$HOME/.config}/mindreader`
-- macOS: `~/Library/Application Support/mindreader`
+- Linux and macOS: `${XDG_CONFIG_HOME:-$HOME/.config}/mindreader`
 - Windows: `%APPDATA%\mindreader`
 
 The directory is mode `0700` on Unix and the generated `.env` is mode `0600`. Mindreader does not read non-secret settings from process environment variables. Put them in `config.toml`:

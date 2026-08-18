@@ -3,16 +3,17 @@
 //! MCP `unify` calls [`memory_unify`]: source memberships, history, and
 //! edges move onto a surviving target of the same canonical kind, with no
 //! `scope` filter. Bootstrap-seeded Class/Property IRIs cannot be sources.
-//! Writes may attach [`merge_suggestions_in_txn`] results as review-only
-//! `{source,target}` IRI pairs.
+//! `write` and `revise` may attach [`merge_suggestions_in_txn`] results as
+//! review-only `{source,target}` IRI pairs.
 
 use crate::domain::{DomainError, NodeHandle};
 use crate::graph::{
     acquire_fact_locks_in_txn, create_episode_in_txn, fetch_all_txn, fetch_one_txn, node_json,
-    structural_rel_for, Episode,
+    Episode,
 };
 use crate::iri::identity_kind_from_labels;
 use crate::payload::{finish_mutation, unify_review_item};
+use crate::vocabulary::{is_bootstrap_seeded, is_system_relationship, structural_relationship_for};
 use crate::{
     error::{Error, Result},
     operation_error,
@@ -36,23 +37,6 @@ const FACT_LOCK_SCOPE: &str = "@fact";
 const LAYERS_PROPERTY: &str = "mindreader:property/layers";
 const PREDICATE_USAGE_PROPERTY: &str = "mindreader:property/predicate-usage";
 const WEIGHT_PROPERTY: &str = "mindreader:property/weight";
-const SYSTEM_OWNED_RELS: &[&str] = &["CONTRADICTS", "SUPERSEDES"];
-const BOOTSTRAP_SEEDED_IRIS: &[&str] = &[
-    "mindreader:class/Class",
-    "mindreader:class/Property",
-    "mindreader:class/Element",
-    "mindreader:property/ABOUT",
-    "mindreader:property/INSTANCE_OF",
-    "mindreader:property/SUBCLASS_OF",
-    "mindreader:property/SUBPROPERTY_OF",
-    "mindreader:property/DOMAIN",
-    "mindreader:property/RANGE",
-    "mindreader:property/EVIDENCE_FOR",
-    "mindreader:property/DERIVED_FROM",
-    "mindreader:property/SUPPORTS",
-    "mindreader:property/CONTRADICTS",
-    "mindreader:property/SUPERSEDES",
-];
 
 /// Escape a display name and append `~2` for the keyword merge-candidate index.
 fn lucene_fuzzy_term(name: &str) -> String {
@@ -87,7 +71,9 @@ impl UnifyArgs {
     }
 }
 
-/// Permanently unify two same-kind nodes; MCP name is `unify`.
+/// Permanent same-kind `unify` with no `scope` filter: source memberships, edges, and history move onto `target`.
+///
+/// Bootstrap-seeded IRIs cannot be sources. Retries Neo4j transients and lock-set drift (`ConcurrentMutation`).
 pub async fn memory_unify(graph: &Graph, args: UnifyArgs) -> Result<Value> {
     for attempt in 0..3_u64 {
         match memory_unify_once(graph, &args).await {
@@ -409,15 +395,9 @@ fn require_same_kind(source: &Node, target: &Node) -> Result<String> {
 
 /// Forbid merging system-owned Properties or Properties with different structural types.
 fn require_compatible_property_merge(source_iri: &str, target_iri: &str) -> Result<()> {
-    let source_rel = structural_rel_for(source_iri);
-    let target_rel = structural_rel_for(target_iri);
-    if source_rel
-        .as_deref()
-        .is_some_and(|rel| SYSTEM_OWNED_RELS.contains(&rel))
-        || target_rel
-            .as_deref()
-            .is_some_and(|rel| SYSTEM_OWNED_RELS.contains(&rel))
-    {
+    let source_rel = structural_relationship_for(source_iri);
+    let target_rel = structural_relationship_for(target_iri);
+    if is_system_relationship(source_iri) || is_system_relationship(target_iri) {
         return Err(DomainError::InvalidInput(
             "system-owned CONTRADICTS and SUPERSEDES Properties cannot be merged".into(),
         )
@@ -431,11 +411,6 @@ fn require_compatible_property_merge(source_iri: &str, target_iri: &str) -> Resu
         .into());
     }
     Ok(())
-}
-
-/// True for Class/Property IRIs seeded at bootstrap; they may only be unify targets.
-fn is_bootstrap_seeded(iri: &str) -> bool {
-    BOOTSTRAP_SEEDED_IRIS.contains(&iri)
 }
 
 /// Reject Literal, Episode, lock, meta, and activation nodes as unify endpoints.
@@ -785,6 +760,7 @@ pub async fn merge_suggestions_in_txn(
         {
             continue;
         }
+        // Orient review pairs so bootstrap seeds stay targets; else shorter name, then lower created IRI.
         let candidate_was_created = created_set.contains(&candidate_iri);
         let created_first_on_tie = candidate_was_created && created_iri < candidate_iri;
         let created_is_target = is_bootstrap_seeded(&created_iri)
@@ -831,11 +807,12 @@ pub async fn merge_suggestions_in_txn(
 #[cfg(test)]
 mod tests {
     use super::{
-        duplicate_consolidation_plan, is_bootstrap_seeded, is_transient, lucene_fuzzy_term,
-        merge_memberships, merge_similarity_accepted, require_compatible_property_merge,
-        DuplicateFact, DuplicateRetirement, SurvivorUpdate, UnifyArgs,
+        duplicate_consolidation_plan, is_transient, lucene_fuzzy_term, merge_memberships,
+        merge_similarity_accepted, require_compatible_property_merge, DuplicateFact,
+        DuplicateRetirement, SurvivorUpdate, UnifyArgs,
     };
     use crate::error::Error;
+    use crate::vocabulary::is_bootstrap_seeded;
     use std::collections::BTreeMap;
 
     #[test]

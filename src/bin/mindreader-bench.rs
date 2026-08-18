@@ -4,12 +4,12 @@
 //! `ASSERTS`/`ABOUT` search and merge-suggestion latency. Enabled with
 //! `developer-tools`; mutates the configured database like the smoke suite.
 
-use mindreader::config::Config;
-use mindreader::error::{Context, Result};
-use mindreader::graph::{self, acquire_fact_locks_in_txn, fetch_one};
-use mindreader::merge::merge_suggestions_in_txn;
+use mindreader::developer::config::Config;
+use mindreader::developer::error::{Context, Result};
+use mindreader::developer::graph::{self, acquire_fact_locks_in_txn, fetch_one};
+use mindreader::developer::merge::merge_suggestions_in_txn;
+use mindreader::developer::service::{MemoryService, RecallArgs};
 use mindreader::operation_error;
-use mindreader::service::{MemoryService, RecallArgs};
 use neo4rs::{query, Graph};
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -100,6 +100,7 @@ async fn seed(
     layer: &str,
     entities: i64,
 ) -> Result<Vec<(String, String)>> {
+    // Ranking oracle: subject%17 + fact%13 + object%11, then IRI.
     graph
         .run(
             query(
@@ -366,7 +367,7 @@ async fn run() -> Result<Value> {
         None => Config::from_env()?,
     };
     let graph = graph::connect(&config).await?;
-    graph::bootstrap(&graph, None, mindreader::graph::SpaceReplace::Refuse).await?;
+    graph::bootstrap(&graph, None, graph::SpaceReplace::Refuse).await?;
     let service = MemoryService::new(graph.clone(), &config)?;
     let pristine = fetch_one(
         &graph,
@@ -381,6 +382,7 @@ async fn run() -> Result<Value> {
     .ok_or_else(|| operation_error!("benchmark pristine-database check returned no row"))?;
     let existing_nodes = pristine.get::<i64>("nodes")?;
     let existing_relationships = pristine.get::<i64>("relationships")?;
+    // Fresh bootstrap is model meta only; refuse a dirty or production graph.
     if existing_nodes != 15 || existing_relationships != 0 {
         return Err(operation_error!(
             "mindreader-bench requires a fresh disposable model-v{} database after bootstrap; found {existing_nodes} nodes and {existing_relationships} relationships",

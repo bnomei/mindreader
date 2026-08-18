@@ -5,7 +5,7 @@
 //! concurrent mutation. Transient Neo4j errors are classified for bounded
 //! retries. The MCP adapter maps recoverable application failures to
 //! `CallToolResult` structured errors (`isError` with
-//! `{ok:false,reason,message,retryable,outcome}`); domain validation is not
+//! `{ok:false,reason,message,retryable}`); domain validation is not
 //! JSON-RPC `-32602`.
 
 use crate::domain::DomainError;
@@ -28,16 +28,22 @@ pub enum Error {
     /// A returned row could not be decoded into the expected Bolt types.
     #[error("Neo4j row decoding failed: {0}")]
     Neo4jDecode(#[from] neo4rs::DeError),
+    /// Filesystem failure while reading `config.toml`, the colocated `.env`, or similar.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// Parse failure of the colocated `.env` secrets file.
     #[error(transparent)]
     Dotenv(#[from] dotenvy::Error),
+    /// Invalid `config.toml`.
     #[error(transparent)]
     TomlDeserialize(#[from] toml::de::Error),
+    /// Failed to encode default `config.toml` during directory init.
     #[error(transparent)]
     TomlSerialize(#[from] toml::ser::Error),
+    /// JSON encode/decode failure at an adapter or tool boundary.
     #[error(transparent)]
     Json(#[from] serde_json::Error),
+    /// Transport failure talking to the embedding provider (not an HTTP status body).
     #[error(transparent)]
     Http(#[from] reqwest::Error),
     /// Remote embedding HTTP status with a truncated body; 429 maps to MCP `rate_limited`.
@@ -45,9 +51,13 @@ pub enum Error {
         "{provider} embedding request failed with HTTP {status}: {body} (request_id={request_id:?})"
     )]
     EmbeddingHttp {
+        /// Embedding provider id (`openai` or `xai`).
         provider: &'static str,
+        /// HTTP status from the embedding API (429 → MCP `rate_limited`).
         status: u16,
+        /// Optional `x-request-id` from the provider response.
         request_id: Option<String>,
+        /// Truncated response body for diagnostics; never the API key.
         body: String,
     },
     /// Missing or invalid native configuration (including required `NEO4J_PASSWORD`).
@@ -69,16 +79,20 @@ pub enum Error {
     #[error("concurrent mutation changed {0}")]
     ConcurrentMutation(String),
     /// Commit returned an error after the transaction may already have applied.
-    #[error("{operation} commit outcome is unknown: {source}")]
+    #[error("{operation} commit result could not be confirmed: {source}")]
     AmbiguousCommit {
+        /// Tool or persistence operation whose commit result could not be confirmed.
         operation: &'static str,
+        /// Driver error returned after the write may already have applied.
         #[source]
         source: Neo4jError,
     },
     /// Operational wrapper that keeps the typed source for retry classification.
     #[error("{message}: {source}")]
     Context {
+        /// Human-readable wrap for logs and MCP `message`.
         message: String,
+        /// Typed source retained for [`Error::is_transient_neo4j`].
         #[source]
         source: Box<dyn StdError + Send + Sync>,
     },
@@ -94,6 +108,9 @@ impl Error {
     }
 
     /// Walk the source chain for Neo4j transient kinds eligible for retry.
+    ///
+    /// [`Error::AmbiguousCommit`] is never retryable, even when the driver
+    /// source is a transient kind, because the write may already have applied.
     pub fn is_transient_neo4j(&self) -> bool {
         if matches!(self, Self::AmbiguousCommit { .. }) {
             return false;
@@ -162,7 +179,7 @@ where
 #[macro_export]
 macro_rules! config_error {
     ($($arg:tt)*) => {
-        $crate::error::Error::Configuration(format!($($arg)*))
+        $crate::Error::Configuration(format!($($arg)*))
     };
 }
 
@@ -170,7 +187,7 @@ macro_rules! config_error {
 #[macro_export]
 macro_rules! embedding_error {
     ($($arg:tt)*) => {
-        $crate::error::Error::Embedding(format!($($arg)*))
+        $crate::Error::Embedding(format!($($arg)*))
     };
 }
 
@@ -178,7 +195,7 @@ macro_rules! embedding_error {
 #[macro_export]
 macro_rules! graph_error {
     ($($arg:tt)*) => {
-        $crate::error::Error::Graph(format!($($arg)*))
+        $crate::Error::Graph(format!($($arg)*))
     };
 }
 
@@ -186,7 +203,7 @@ macro_rules! graph_error {
 #[macro_export]
 macro_rules! operation_error {
     ($($arg:tt)*) => {
-        $crate::error::Error::Operation(format!($($arg)*))
+        $crate::Error::Operation(format!($($arg)*))
     };
 }
 
