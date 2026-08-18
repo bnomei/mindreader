@@ -1,134 +1,145 @@
 ---
 name: using-mindreader
-description: "Provides autonomous durable graph memory for agents. Use proactively—without waiting for a memory request—when starting, continuing, investigating, deciding, implementing, debugging, reviewing, or completing work that may depend on prior decisions, preferences, constraints, identities, relationships, conventions, commitments, project state, or lessons, or may produce future-useful facts, rationale, patterns, or insights. Also handles explicit remember, forget, and correction requests through the Mindreader MCP server."
+description: "Provides autonomous selective graph memory for agents. Use when work may depend on prior stored decisions, preferences, constraints, identities, relationships, conventions, commitments, project state, or lessons, or may produce supported knowledge worth reusing. Handles proactive recall, explicit capture, correction, withdrawal, feedback, layer placement, and identity merging through Mindreader."
 ---
 
 # Using Mindreader
 
-Mindreader is the agent's working memory, not a user-operated notebook. Own the memory lifecycle: proactively recall context before it can affect the work and proactively capture durable knowledge as the work produces or confirms it. Do not wait for the user to say "remember" or ask whether a qualifying fact should be saved. Explicit remember, forget, and correction requests are strong inputs, not the normal trigger.
+Mindreader is selective prospective memory, not conversation storage. You are the clerk: decide what deserves retention and make explicit tool calls. Mindreader performs no hidden extraction. Details you do not assert are intentionally unavailable later.
 
-Mindreader itself never extracts facts from conversation. You are the clerk: decide what is future-useful, formulate a supported subject-predicate-object assertion, choose its scope and commitment level, and make the explicit tool call. Discussion is a capture trigger when it establishes durable knowledge even if nobody uses memory-related words.
+Own the lifecycle without waiting for “remember.” Recall when prior memory can affect the work; capture supported knowledge chosen for future reuse; maintain it when evidence changes. A check may correctly produce no call.
 
-Use only the stages the task needs. A capture check can correctly conclude that no recall or mutation is warranted; autonomous does not mean storing everything.
+Use host-exposed fully qualified tool names such as `mindreader:recall`. Treat each advertised schema and tool description as the syntax authority.
 
-Always call tools by the host-exposed fully qualified name; never emit a bare tool name in a call plan or instruction. The canonical server name is `mindreader`, as in `mindreader:recall`; if a host configures an alias, replace only that prefix. Treat each tool's advertised schema and description as the syntax authority. Do not make preflight calls merely to discover payload fields.
+## Work loop
 
-## Autonomous trigger policy
+1. Use the narrowest applicable `scope`. Copy a task- or host-supplied scope exactly.
+2. Recall at the start of resumed or context-sensitive work, and before a consequential decision that prior knowledge could change. Reuse facts, IRIs, and handles already in context; otherwise make one targeted recall.
+3. Do the work. Treat recalled relationships as evidence only for what they assert.
+4. When work establishes durable reusable knowledge, select standalone supported triples and make the smallest correct mutation. Batch related items.
+5. Keep returned handles, trust a successful structured result, and stop.
 
-| Agent situation | Memory action |
-| --- | --- |
-| Starting, resuming, or revisiting work where prior context could change the approach | Recall relevant decisions, preferences, constraints, identities, conventions, commitments, project state, and lessons |
-| Before a consequential choice or an identity-sensitive mutation | Recall enough current or historical context to avoid contradicting earlier knowledge |
-| Discussion, investigation, implementation, debugging, or review establishes reusable knowledge | Write concise facts, decisions and rationale, requirements, relationships, or deliberately classified signals/patterns/insights |
-| New evidence shows one current value or effective interval is wrong | Recall its exact fact handle, then revise it when a replacement is known or withdraw it when none is |
-| A recalled target materially improves or harms the work | Judge its retrieval value; revise or withdraw instead when the stored claim is false |
-| The appropriate project, team, or other visibility membership changes | Place the existing node or fact without changing its meaning |
-| Evidence confirms that two nodes are the same identity | Unify only after confirming which node must survive |
-| Completing a significant task or preparing a handoff | Perform a capture check for durable outcomes, decisions, constraints, unresolved commitments, and reusable lessons; batch related changes |
-
-## Default workflow
-
-1. Choose the work's narrowest applicable `scope`. When the task or host supplies one, copy it exactly on every scoped call; never reconstruct, abbreviate, or embellish it.
-2. At an autonomous recall trigger, reuse facts, node IRIs, and `target` handles already in context. Otherwise make one recall using the selector that directly matches the need. Use `detail:"concise"` for answer-only reading and `detail:"detailed"` when a later operation or audit may need handles, memberships, ranking, or eligibility.
-3. Do the work. As durable knowledge emerges, reduce it to precise supported triples rather than conversation excerpts. Capture the focal durable claim before supporting detail, preserve known effective time on state facts, and resolve relative dates against a trusted dated context before writing.
-4. At an autonomous capture or maintenance trigger, choose the smallest correct mutation and batch related items.
-5. Preserve returned handles, trust a successful structured result, and stop.
-
-Add work only when it can change the decision:
-
-- Skip recall before an idempotent exact write when the fact, identities, predicate, and scope are already unambiguous. Recall before corrections, withdrawals, identity-sensitive changes, or when current state matters.
-- Do not cascade lexical, semantic, catalog, IRI, and neighborhood recalls. Stop when one result is sufficient. When a comparison is incomplete, make at most one deliberate retry with the missing entity terms, a broader unfiltered neighborhood, or semantic recall when disclosure is acceptable.
-- Inspect a nonempty review queue only when its candidates are relevant and you may act on them. Never create follow-up work solely because a queue exists.
-- Verify a successful mutation only when the response does not establish the postcondition or the change is broad or consequential.
-- Judge only retrievals that materially helped or misled. Do not rate every result or recall solely to create a rating.
-
-When answering from recalled knowledge:
-
-- For an order, count, duration, or comparison, retrieve every named anchor and its relevant dates or quantities, then perform the comparison explicitly. Start broad; constrain neighborhood predicates only after recall reveals the stored vocabulary.
-- Missing facts or temporal qualifiers mean unknown. Never infer that a dated item came before, after, or instead of an undated item merely because its representation is more complete.
-- Base the answer on relationships that assert the requested action or property. A related entity is context, not evidence that it participated in the requested event.
-
-## Scope and identity
-
-Every tool except `mindreader:unify` requires `scope`.
-
-- `[]` selects global records only. Named scopes see global records plus records whose memberships intersect any requested layer.
-- On `mindreader:write`, `scope` becomes the membership of new ordinary nodes and facts. Exact reassertion merges named memberships unless the record is already global; global membership dominates and remains global. Writing an exact identity or fact with `scope: []` makes it global, so use `[]` deliberately.
-- Use returned node IRIs for known entities and returned fact `target` handles for mutations. Never reconstruct a fact IRI or treat a fuzzy match as identity.
-- Layer IDs use lowercase kebab-case colon namespaces such as `project:graph-memory`. Colons are naming, not hierarchy. There is no process-wide default scope.
-- If another component assigns the scope, paste that exact value on later calls. A plausible-looking variant is a different layer, not a repair.
-- Layers are visibility filters, not tenant isolation or authorization. Any MCP caller can request any valid layer.
+Do not cascade recall modes. Retry once only for a plausible terminology or neighborhood miss; use semantic recall only when conceptual matching is needed and provider disclosure is acceptable. Do not verify a successful mutation unless its result leaves the postcondition unclear or the change is broad or consequential.
 
 ## Choose one operation
 
 | Intent | Tool |
 | --- | --- |
-| Read visible lexical, IRI, catalog, neighborhood, or history data | `mindreader:recall` |
-| Match a concept when lexical recall is insufficient and provider disclosure is acceptable | `mindreader:recall_semantic` |
-| Add durable current facts or merge memberships | `mindreader:write` |
+| Read lexical, IRI, catalog, neighborhood, or history assertions | `mindreader:recall` |
+| Match a concept after lexical recall is insufficient | `mindreader:recall_semantic` |
+| Add selected facts or merge memberships | `mindreader:write` |
 | Correct one exact current fact | `mindreader:revise` |
-| Soft-remove a fact or subject/predicate slice without replacement | `mindreader:withdraw` |
-| Change memberships without changing facts | `mindreader:place` |
-| Rate a recalled node or current fact | `mindreader:judge` |
+| Soft-remove current facts without replacement | `mindreader:withdraw` |
+| Change layer memberships without changing meaning | `mindreader:place` |
+| Rate retrieval utility | `mindreader:judge` |
 | Permanently merge two confirmed same-kind identities | `mindreader:unify` |
 
-Facts are set-valued. A different object or effective interval for the same subject and predicate is another current fact unless evidence establishes that the old one is wrong. Add a valid parallel value with `mindreader:write`; correct a wrong value or interval with `mindreader:revise`; remove a stale value without replacement with `mindreader:withdraw`. Newer evidence is not automatically a correction or last-write-wins update.
+## Scope and handles
 
-`spike` classifies one exact fact; it never labels an endpoint or creates `ABOUT`. Write `ABOUT` explicitly only for genuine context. Explicit ABOUT can appear in detailed recall's `about[]`, but never as an ordinary recalled fact or semantic activation result.
+Every tool except `mindreader:unify` requires `scope`. `[]` selects global records only. A named scope sees global records plus records in any requested layer; multiple names form an OR union. Layers control visibility, not authorization. Changing a supplied scope ID selects a different layer.
 
-Set `contradicts: true` only when a visible current alternative for the same subject and predicate is directly incompatible and both claims should remain current. It links the new object to the conflicting visible current objects. Do not recall solely to populate this flag. Never assert, revise, or withdraw the system-owned `CONTRADICTS` or `SUPERSEDES` relationships directly.
+Reuse returned node IRIs for established identities and fact `target` handles for exact mutations. Never reconstruct a fact IRI or treat a fuzzy suggestion as identity.
 
-## Model time deliberately
+## Recall
 
-Mindreader separates transaction time from represented world time. `Episode.at` and relationship `validFrom`/`validTo` audit when memory changed; never use them as the date a remembered state held.
+Use one mode that directly matches the need:
 
-- For a state such as residence, employment, ownership, status, or configuration, add `effective:{from,to}` when supported. Intervals are half-open `[from,to)`, bounds are timezone-qualified RFC 3339, and either bound may be omitted.
-- Omitted or null `effective` means the state time is unknown. An empty `{}` is an explicitly qualified interval open in both directions; use it only when that distinction is intended.
-- For a point or repeatable occurrence, create a stable event node with explicit date/time and participant facts. Do not encode an occurrence as a zero-length state interval.
-- Resolve “yesterday,” “last month,” and similar expressions only against a trusted session, document, or user-provided timestamp. If no trusted anchor exists, retain only what can be asserted without inventing a date.
-- Model items likely to be ordered or compared with the same temporal shape and granularity. Do not keep one item's date only inside prose while giving its peer a structured interval.
-- Use `effectiveAt` only when answering which explicitly dated state held at a world-time instant. It excludes unknown-time ordinary facts and does not recover retired transaction history. Use ordinary recall for event-date facts and `history` for revisions.
-- When a new source explicitly replaces a current state, recall the exact handle and revise it. Omit `effective` to inherit the old interval, send null to clear it, or send an object to replace it. Never silently truncate adjacent intervals or overwrite compatible parallel values.
+| Need | Call |
+| --- | --- |
+| Search entity, predicate, or object terms | `mindreader:recall` with `text` |
+| Fetch known node identities | `mindreader:recall` with `iris` |
+| Inspect facts by endpoint label or the Class/Property catalog | `mindreader:recall` with `labels` |
+| Walk relationships from a known node | `mindreader:recall` with `around` |
+| Inspect current and retired facts or revisions | `mindreader:recall` with `history` |
+| Match meaning after lexical recall is insufficient | `mindreader:recall_semantic` |
 
-Structural and system relationships cannot carry effective intervals.
+`mindreader:recall` accepts exactly one selector. Use only fields that apply to it.
 
-For exact recall selectors, semantic disclosure, detail modes, and limits, read [references/recall.md](references/recall.md). Always read [references/mutations.md](references/mutations.md) before revise, withdraw, place, judge, or unify; also read it before using contradiction or review-queue features on a write.
+- `text` works best with concrete entity and relationship terms likely to occur in a stored triple.
+- `iris` accepts node IRIs, preserves input order, reports misses, and returns incident facts per lookup. Use `hops` only when top-level one-hop facts are also needed.
+- `labels` selects facts in ordinary recall; Class or Property selects the global catalog. In semantic recall, labels only filter results.
+- `around` starts at a node IRI. Direction, depth, and predicate filters constrain every traversed edge. Omit a predicate filter until stored vocabulary is known. Paths witness returned facts; they are not additional assertions.
+- `history` accepts one node or exact fact IRI and returns current and retired facts plus revision events. Supersession edges are audit metadata, not mutation targets.
 
-## Capture future-useful knowledge, not conversation
+Use `detail:"concise"` for answer-bearing content. Use `detail:"detailed"` when handles, memberships, ranking, mutability, rateability, paths, or audit context can affect the next action. A global fact visible through a named scope is not mutable there.
 
-A memory candidate may come from the user, the agent's own reasoning, tool output, repository evidence, or the completed work. Store it only when another agent or session is likely to need it and the current evidence supports the assertion and its Spike level.
+ABOUT is explicit classified context. Detailed text recall may return it separately in `about[]`; it is not an ordinary, neighborhood, history, or semantic fact.
 
-Capture:
+Start with one direct selector and stop when it supplies enough evidence. Prefer known IRIs over text. Inspect the subject, predicate, and object: a matching endpoint or nearby node does not prove another relationship. If a deliberately stored assertion may use different wording, retry once with concrete entity terms, a close synonym, or an unfiltered neighborhood from a known node.
 
-- identities, ownership, and durable relationships;
-- preferences and standing operating instructions that should alter future agent behavior;
-- decisions, selected or rejected alternatives, and rationale that constrains later work;
-- requirements, invariants, compatibility boundaries, and other durable constraints;
-- effective intervals for durable states and explicit event/date structure when time changes meaning;
-- conventions, stable project or environment facts, and reusable operational knowledge;
-- durable commitments, unresolved blockers, and handoff state that must survive this task; and
-- reusable raw evidence, recurring observations, or interpretations deliberately classified as Signal, Pattern, or Insight rather than overstated as Knowledge.
+Missing memory remains unknown. An empty result means no matching assertion is stored and visible for that query and scope; it does not search omitted conversation details or prove an event did not occur.
 
-Before writing, ask internally: will this matter beyond the current turn, can it be expressed as a precise triple, is it supported at the selected commitment level, is its scope correct, and is it safe to store? If not, leave it in the conversation or authoritative project artifact.
+### Effective and semantic recall
 
-Once a passage qualifies for capture, preserve the assertion that makes it durable before adjacent recommendations or background: the decision, change, problem and outcome, purchase, attendance, commitment, comparison-relevant quantity, or date. Supporting detail may be omitted; the focal claim must not be crowded out by less consequential facts.
+`effectiveAt` is a state-as-of filter. It returns only transaction-current ordinary facts whose explicit half-open effective interval contains the requested instant; unknown-time facts are excluded. Do not use it merely because a question mentions a date. Recall point events and calendar-date relationships normally. Use `history` for transaction revisions; it rejects `effectiveAt` because it exposes both clocks.
 
-- Do not store greetings, acknowledgements, reasoning chatter, or raw conversation.
-- Do not store transient progress, temporary paths, build logs, disposable environment state, or one-off instructions that expire with the task.
-- Do not store secrets, credentials, tokens, or authentication material.
-- Do not dump prose, Markdown, source files, or documents into literals. Store only the concise durable assertion that future work needs.
-- Do not mirror facts that are cheaper and safer to derive from an authoritative artifact unless the durable memory captures a decision, constraint, relationship, or interpretation that the artifact does not make obvious.
-- Do not present unsupported inference as Knowledge. Either omit it or intentionally store the reusable evidence or interpretation at the appropriate lower Spike level.
+Use `mindreader:recall_semantic` only when the remaining gap is conceptual and provider disclosure is acceptable. Only query text is sent to the configured embedding provider. The call combines lexical evidence with expiring semantic activations and may add weaker one-hop context. Context aids navigation but is not independent proof and never teaches activations. The call may create or refresh activations, so it is externally disclosing, non-read-only, and non-idempotent; an empty result creates none. Ordinary recall stays closed-world, read-only, and inside Neo4j.
 
-Class/Property records and schema-definition edges are global.
+## Select what to retain
+
+Write only when the candidate is:
+
+- useful beyond the current turn;
+- a precise standalone relationship with stable identities and vocabulary;
+- supported at its chosen commitment level;
+- assigned the correct scope; and
+- safe to retain.
+
+Good candidates include durable decisions and rationale, preferences and standing instructions, requirements and invariants, identities and relationships, conventions, commitments, stable project state, reusable operational knowledge, and deliberately classified evidence or insights.
+
+Do not store raw conversation, prose or source dumps, secrets, transient progress, temporary paths, build logs, expiring one-off instructions, or unsupported inference. Do not mirror an authoritative artifact when future work can derive the fact more safely and cheaply from that artifact.
+
+Recall searches explicit graph assertions, not source conversations or documents. `mindreader:write` does not ingest conversation or infer companion facts.
+
+### Write facts precisely
+
+Facts are set-valued. A different object or effective interval is another current fact; newer evidence is not automatically a replacement. Write compatible parallel values. An exact subject, predicate, object, effective qualification, and interval has one identity: reassertion merges named memberships or is a no-op.
+
+Reuse established node and Property IRIs. Use names only when identity is unambiguous, and use the same predicate for the same concept.
+
+Spike is commitment on one exact fact:
+
+- `Signal`: reusable raw evidence;
+- `Pattern`: recurring observation;
+- `Insight`: supported interpretation;
+- `Knowledge`: a fact worth relying on.
+
+Omit Spike rather than overstate evidence. Do not auto-promote. Reassertion and revision preserve an existing Spike unless one is explicitly supplied.
+
+Set `contradicts:true` only when the new fact and visible current alternatives are directly incompatible and both should remain current. It records contradiction links; it does not replace alternatives. `review.alternatives` is advisory. Spike never creates ABOUT; write ABOUT only for genuine classified context. Never write, revise, or withdraw the system-owned CONTRADICTS or SUPERSEDES predicates directly.
+
+### Model effective time
+
+Transaction time records when memory changed. Effective time records when an ordinary state held in the represented world. Its interval is half-open `[from,to)`, uses timezone-qualified RFC 3339 bounds, and may be open on either side. Omitted or null effective metadata means unknown world time; an empty object is explicitly qualified and open in both directions.
+
+Use effective intervals for states such as residence, employment, ownership, status, or configuration. Model a point or repeatable occurrence as an event node with participant and date/time facts. Use an `xsd:date` literal when only a calendar date is known; never invent midnight or a zero-length interval. Resolve relative dates only from trusted dated context.
+
+## Maintain memory
+
+### Revise or withdraw
+
+Use a retained fact handle or one targeted detailed recall. Do not treat chronological arrival as proof that an older fact is wrong.
+
+`mindreader:revise` corrects one exact current fact when its object or interval is wrong and a replacement is known. Its scope moves only selected memberships; unrelated values and memberships remain. The subject and predicate do not change. Omitted `effective` inherits the interval, null clears it, and an object replaces it. Revision soft-closes the selected fact and records SUPERSEDES atomically.
+
+Use `mindreader:withdraw` when no replacement is known. Prefer an exact target. Subject form removes every mutable visible outgoing fact in the selected slice; add `p` only to narrow that slice and use subject form only when that breadth is intentional. Withdrawal is soft and preserves history.
+
+A global fact visible through a named scope cannot be revised or withdrawn there; use `scope:[]` only when changing the global fact is intended. Removing the final selected fact membership retires it rather than making it global.
+
+### Place memberships
+
+Use `mindreader:place` only to change visibility membership without changing meaning. Request scope selects visible targets; each edit supplies memberships to add or remove. Facts must remain visible through both endpoints in the batch's final state. When moving a fact into a layer an endpoint lacks, edit that endpoint in the same batch; persisted literal endpoints use their returned node handles.
+
+Removing a node or fact's final named membership makes it global. To move between named layers without global exposure, add the destination and remove the source in one edit.
+
+### Unify identities
+
+`review.unify` contains fuzzy same-kind candidates, not proof. Use `mindreader:unify` only when independent evidence confirms both nodes are the same identity and which IRI and name must survive. Source is permanently absorbed into target across the database. There is no scope, alias, or undo.
+
+### Judge retrieval utility
+
+Use `mindreader:judge` only after a recalled node or current fact materially helped, distracted, or misled actual work. Strengthen adds exactly +1 shared weight; weaken adds exactly -1. Weight is retrieval feedback, not confidence, truth, or recency. Correct or withdraw false knowledge instead of merely weakening it. Do not rate every result or recall solely to create feedback.
 
 ## Handle results
 
-Successful mutations include `ok: true`, `noop`, and `episode`; scoped tools echo `scope`. `mindreader:judge` and `mindreader:place` add an input-ordered `items` list and `summary`. An all-noop mutation returns `episode: null`. Preserve returned `handles`; after `mindreader:revise`, use `target` or `handles.current`, not `previousTarget` or `handles.retired`.
-
-Recoverable failures return `ok: false`, `reason`, `message`, and `retryable`:
-
-- Retry only when `retryable: true`, honoring `retryAfterMs`.
-- Never repeat `mindreader:judge` or `mindreader:unify` after a non-retryable failure merely because their effect cannot be confirmed.
-- Fix invalid input or failed preconditions instead of retrying unchanged.
-- Treat every batch as atomic; after an error, never assume earlier items applied.
+Mutation batches are atomic and record at most one Episode; an all-noop mutation records none. Retry only when `retryable` is true and honor `retryAfterMs`; otherwise fix the input or precondition rather than repeating the call. Never repeat non-idempotent `judge` or permanent `unify` merely because their effect is uncertain.

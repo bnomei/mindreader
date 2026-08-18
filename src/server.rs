@@ -70,7 +70,7 @@ fn object_schema(value: serde_json::Value) -> Arc<rmcp::model::JsonObject> {
 fn scope_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "array",
-        "description": "Visibility union. [] selects global/unlayered records only. Named records match any requested layer. IDs use lowercase kebab-case with colon namespaces, for example project:mindreader or analysis:hypothesis; colons are naming, not hierarchy. When a task or host supplies scope, copy its exact values; a modified or invented ID is a different layer.",
+        "description": "Visibility union. [] selects only global/unlayered records. A named scope sees global records plus records in any requested layer. IDs use lowercase kebab-case with colon namespaces; colons are naming, not hierarchy. Copy exact values supplied by the task or host because changing an ID selects a different layer.",
         "uniqueItems": true,
         "items": {
             "type": "string",
@@ -158,10 +158,10 @@ fn entity_input_schema(description: &str) -> serde_json::Value {
 }
 
 /// Tagged `node` or `literal` bag without schema unions; mixed fields fail at runtime.
-fn object_input_schema() -> serde_json::Value {
+fn object_input_schema(description: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "object",
-        "description": "The assertion object. Node values use kind=node with iri/name/labels; literal values use kind=literal with value and optional datatype.",
+        "description": description,
         "additionalProperties": false,
         "properties": {
             "kind": { "type": "string", "enum": ["node", "literal"] },
@@ -199,7 +199,7 @@ fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
                 "type": "array",
                 "minItems": 1,
                 "maxItems": 20,
-                "description": "Exactly 1–20 facts total. Split larger sets into additional calls before invoking and put focal durable claims first. This input-ordered batch is atomic and rolls back if any item fails.",
+                "description": "Atomic batch of 1–20 explicitly selected triples. Each item must stand alone as an assertion intended for later recall; do not bundle unrelated claims in one literal.",
                 "items": {
                     "type": "object",
                     "additionalProperties": false,
@@ -210,7 +210,7 @@ fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
                             "minLength": 1,
                             "description": "Predicate name or Property IRI describing the relationship from subject s to object o. Reuse established vocabulary for the same concept."
                         },
-                        "o": object_input_schema(),
+                        "o": object_input_schema("Object of the assertion. Use kind=node with iri or name for an entity; use kind=literal with value and optional datatype for a scalar."),
                         "spike": {
                             "type": "string",
                             "enum": ["Signal", "Pattern", "Insight", "Knowledge"],
@@ -812,7 +812,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             },
             "labels": {
                 "type": "array",
-                "description": "Node labels to catalog or filter. Class and Property select the global schema catalog.",
+                "description": "Recall selector for facts whose endpoints have these labels. Class and Property instead select the global schema catalog. In recall_semantic, labels is only a result filter.",
                 "minItems": 1,
                 "uniqueItems": true,
                 "items": label_schema()
@@ -828,7 +828,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
                 "enum": [0, 1],
                 "default": 0
             },
-            "p": predicate_list_schema("Around mode only: predicate names or IRIs to filter before limiting. Omit this filter until the stored predicate vocabulary is known, especially for counts and comparisons."),
+            "p": predicate_list_schema("Around mode only: exact predicate names or IRIs to filter before limiting. Omit this filter until the stored predicate vocabulary is known."),
             "depth": {
                 "type": "integer",
                 "description": "Around mode only: traversal depth.",
@@ -845,7 +845,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             "history": {
                 "type": "string",
                 "minLength": 1,
-                "description": "One node or fact IRI. Returns current and historical facts for that identity."
+                "description": "One node or exact fact IRI. Returns its current and historical facts plus revision events."
             },
             "effectiveAt": {
                 "type": "string",
@@ -855,7 +855,7 @@ fn schema_memory_recall() -> Arc<rmcp::model::JsonObject> {
             "detail": detail_schema(),
             "limit": {
                 "type": "integer",
-                "description": "Maximum returned facts across the selected mode.",
+                "description": "Result budget for the selected mode: facts normally, catalog nodes in catalog mode, and facts per requested IRI in iris mode.",
                 "minimum": 1,
                 "maximum": 100,
                 "default": 20
@@ -904,19 +904,31 @@ fn schema_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
 
 /// Host-compatible `revise` input: fact handle plus replacement object.
 fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
+    let mut effective = effective_interval_schema(true);
+    effective["description"] = Value::String(
+        "Replacement fact's state interval. Omit to inherit the selected fact's interval; send null to clear temporal qualification; send an object to replace it."
+            .into(),
+    );
     object_schema(json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "scope": scope_schema(),
             "target": fact_target_schema(),
-            "new": object_input_schema(),
-            "spike": { "type": "string", "enum": ["Signal", "Pattern", "Insight", "Knowledge"] },
-            "contradicts": { "type": "boolean" },
-            "reason": { "type": "string" },
-            "effective": effective_interval_schema(true)
+            "replacement": object_input_schema("Replacement object only; the selected fact's subject and predicate remain unchanged. Use kind=node with iri or name, or kind=literal with value and optional datatype."),
+            "spike": {
+                "type": "string",
+                "enum": ["Signal", "Pattern", "Insight", "Knowledge"],
+                "description": "Optional commitment for the replacement fact. Omit to preserve the selected fact's Spike."
+            },
+            "contradicts": {
+                "type": "boolean",
+                "description": "Set true only when the replacement and visible current alternatives are directly incompatible and should remain current."
+            },
+            "reason": { "type": "string", "description": "Optional audit reason for the correction." },
+            "effective": effective
         },
-        "required": ["scope", "target", "new"]
+        "required": ["scope", "target", "replacement"]
     }))
 }
 
@@ -929,42 +941,15 @@ fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
             "scope": scope_schema(),
             "target": fact_target_schema(),
             "subject": entity_input_schema("Subject node whose visible outgoing facts will be withdrawn. Use iri for an established identity; otherwise use name and optional labels. Runtime validation requires at least one of iri or name."),
-            "p": { "type": "string", "minLength": 1 },
+            "p": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Exact predicate name or Property IRI limiting a subject withdrawal. Invalid with target; omitting it withdraws the subject's entire mutable outgoing slice."
+            },
             "reason": { "type": "string", "description": "Optional audit reason." }
         },
         "required": ["scope"]
     }))
-}
-
-/// Return one existing MCP input schema for an in-process developer adapter.
-///
-/// The LongMemEval harness uses this seam to present the exact same arguments to
-/// OpenAI without constructing an MCP router or duplicating the wire contract.
-#[cfg(feature = "developer-tools")]
-pub fn developer_input_schema(name: &str) -> Option<Value> {
-    let schema = match name {
-        "recall" => schema_memory_recall(),
-        "recall_semantic" => schema_memory_recall_semantic(),
-        "write" => schema_memory_write(),
-        "revise" => schema_memory_revise(),
-        "withdraw" => schema_memory_withdraw(),
-        _ => return None,
-    };
-    Some(Value::Object(schema.as_ref().clone()))
-}
-
-/// Map one application failure into the direct developer adapter's JSON dialect.
-#[cfg(feature = "developer-tools")]
-pub fn developer_error_payload(error: &Error) -> Value {
-    let reason = classify_tool_error(error);
-    let unknown = matches!(error, Error::AmbiguousCommit { .. });
-    json!({
-        "ok": false,
-        "reason": reason,
-        "message": error.to_string(),
-        "retryable": !unknown && (error_retryable(reason) || error.is_transient_neo4j()),
-        "outcome": if unknown { "unknown" } else { "not_applied" }
-    })
 }
 
 /// Host-compatible `judge` input: 1–20 unique `strengthen`/`weaken` ratings.
@@ -984,7 +969,11 @@ fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
                     "additionalProperties": false,
                     "properties": {
                         "target": target_schema(),
-                        "mode": { "type": "string", "enum": ["strengthen", "weaken"] }
+                        "mode": {
+                            "type": "string",
+                            "enum": ["strengthen", "weaken"],
+                            "description": "Retrieval-utility feedback: strengthen adds exactly +1 shared weight; weaken adds exactly -1. Correct false facts with revise or withdraw instead."
+                        }
                     },
                     "required": ["target", "mode"]
                 }
@@ -1003,7 +992,7 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
             "scope": scope_schema(),
             "edits": {
                 "type": "array",
-                "description": "Atomic, input-ordered membership edits. Duplicate targets, add/remove overlap, and closure violations reject the whole batch. Include literal fact endpoints in the same batch as {kind:\"node\", iri}.",
+                "description": "Atomic membership edits. Duplicate targets, add/remove overlap, or invalid final endpoint closure rejects the batch. When moving a fact to a layer its endpoint lacks, include that endpoint's returned node handle in the same batch; persisted literals also use their returned kind=node handle here.",
                 "minItems": 1,
                 "maxItems": 20,
                 "items": {
@@ -1011,8 +1000,8 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
                     "additionalProperties": false,
                     "properties": {
                         "target": target_schema(),
-                        "add": layer_list_schema("Layer memberships to add."),
-                        "remove": layer_list_schema("Layer memberships to remove.")
+                        "add": layer_list_schema("Named memberships to add. Must not overlap remove."),
+                        "remove": layer_list_schema("Named memberships to remove. Must not overlap add. Removing the final named membership makes the target global.")
                     },
                     "required": ["target"]
                 }
@@ -1240,7 +1229,7 @@ impl Mindreader {
     #[tool(
         name = "recall",
         title = "Recall visible memory",
-        description = "Use proactively before acting or deciding whenever current work may depend on durable context from prior sessions: decisions, rationale, preferences, standing instructions, constraints, identities, relationships, conventions, commitments, project state, or lessons. Also use when resuming or revisiting work; the user need not request recall. This read makes no external calls or graph writes. Text recall safely combines an exact phrase with bounded OR-keyword matching of terms at least four Unicode characters long. Pass exactly one of text, iris (1–20 node IRIs), labels, around, or history. For comparisons and counts, retrieve every named anchor and avoid an around predicate filter until stored vocabulary is known. limit defaults to 20 and is at most 100. hops applies only to iris; p, direction, and depth only to around, where they constrain every traversed edge. effectiveAt is only a state-as-of filter: it excludes unknown-time facts and is invalid for history, point-event lookup, and Class/Property catalog recall. history accepts one node or fact IRI and returns exact revision events plus transaction/effective-time facts. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. Class or Property labels read the global catalog.",
+        description = "Use proactively when deliberately stored graph knowledge could affect the work, including when resuming or making a consequential decision; the user need not request recall. This searches explicit assertions, not source conversations, without external calls or writes. Choose exactly one selector: text, iris, labels, around, or history. Use effectiveAt only for state-as-of retrieval; it excludes unknown-time facts. Use concise for answer content and detailed when handles or audit metadata may be needed.",
         input_schema = schema_memory_recall(),
         output_schema = schema_out_memory_recall(),
         annotations(title = "Recall visible memory", read_only_hint = true, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1257,7 +1246,7 @@ impl Mindreader {
     #[tool(
         name = "recall_semantic",
         title = "Recall by meaning",
-        description = "Use only when autonomous recall is warranted but lexical recall cannot find conceptually related knowledge. Do not use it as the default first recall. Every call combines exact and bounded keyword candidates with matching semantic activations, so untouched topics can surface lexically before later paraphrases reuse their activation group. Exact evidence outweighs keyword-only evidence, and repeated activations cannot amplify a fact by accumulation. Grounded anchors may surface bounded degree-normalized one-hop ASSERTS context; expanded facts stay weaker than anchors and never teach activations. A query with no results creates no activation. text is required, limited to 32 KiB UTF-8, and sent to the configured embedding provider; labels optionally filter results. Optional effectiveAt filters direct, activation, and structural ordinary facts to explicitly qualified intervals containing that world-time instant. limit defaults to 20 and is at most 100. Use concise for answer-only content or detailed when handles and operation/audit metadata may be needed. The call may maintain expiring semantic activations, so it is neither read-only nor idempotent.",
+        description = "Use only after warranted lexical recall cannot find a conceptually related assertion and sending the query text to the configured embedding provider is acceptable. This combines lexical evidence with expiring semantic activations and weaker graph context. It may maintain activations, so it is externally disclosing and non-idempotent. Use effectiveAt only for explicitly time-qualified state-as-of retrieval. An empty result creates no activation.",
         input_schema = schema_memory_recall_semantic(),
         output_schema = schema_out_memory_recall_semantic(),
         annotations(title = "Recall by meaning", read_only_hint = false, destructive_hint = false, idempotent_hint = false, open_world_hint = true)
@@ -1274,7 +1263,7 @@ impl Mindreader {
     #[tool(
         name = "write",
         title = "Write facts",
-        description = "Use proactively whenever discussion, investigation, decision-making, implementation, debugging, review, or handoff establishes knowledge another agent or session should reuse: identities and relationships, preferences and standing instructions, decisions and rationale, requirements and constraints, conventions, durable commitments, stable project facts, or reusable signals, patterns, and insights. The user need not ask. Do not store secrets, chatter, transient status, raw dumps, or unsupported inference. Preserve the focal durable assertion before adjacent detail. facts contains exactly 1–20 input-ordered items under one call-level scope; split larger sets before calling and put focal claims first. The atomic batch records one Episode only when something changes. An ordinary state fact may include a complete timezone-qualified half-open effective interval [from,to), independent of transaction history; structural relationships reject it, and point events should use event/date facts instead. spike classifies only that exact fact and never creates ABOUT context; write ABOUT explicitly when intended. Exact subject/property/object/effective-interval reassertions merge memberships, and an explicit spike reclassifies that fact. Review review.unify and review.alternatives as advisory queues.",
+        description = "Use proactively when supported knowledge is deliberately selected for reuse; the user need not ask. This stores standalone triples, not conversation or inferred companion facts. Facts are set-valued: a different object or effective interval remains alongside current values, while exact reassertion merges memberships or is a no-op. Use effective intervals for states and explicit event/date facts for occurrences. Do not store secrets, transient chatter, raw dumps, or unsupported inference.",
         input_schema = schema_memory_write(),
         output_schema = schema_out_memory_write(),
         annotations(title = "Write facts", read_only_hint = false, destructive_hint = false, idempotent_hint = true, open_world_hint = false)
@@ -1290,7 +1279,7 @@ impl Mindreader {
     #[tool(
         name = "revise",
         title = "Revise a fact",
-        description = "Use when current work establishes that one exact current fact or its effective interval is wrong and its replacement is known, whether or not the user requested a correction. Recall or reuse its fact-only target, then supply the new object. scope selects the memberships moved from the previous fact; unrelated values and memberships remain. The replacement preserves the previous fact's spike classification unless a new spike is supplied. Omitted effective inherits the old interval, explicit null clears temporal qualification, and an object replaces the interval. The replacement and SUPERSEDES history commit in one transaction, and the response returns both current target and previousTarget.",
+        description = "Use when one exact current fact or effective interval is wrong and its replacement is known. Paste that fact's target. Only memberships selected by scope move to the replacement; unrelated current values and memberships remain. Omitted effective inherits the old interval, null clears it, and an object replaces it. The correction and SUPERSEDES history commit atomically.",
         input_schema = schema_memory_revise(),
         output_schema = schema_out_memory_revise(),
         annotations(title = "Revise a fact", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
@@ -1306,7 +1295,7 @@ impl Mindreader {
     #[tool(
         name = "withdraw",
         title = "Withdraw facts",
-        description = "Use when current work establishes that a stored fact is obsolete, no longer true, or should not remain current and no replacement is known. Prefer one recalled current fact target; use subject with optional p only when every visible current fact in that slice should be withdrawn. Exactly one of target or subject is required. The operation preserves validity history, never hard-deletes nodes or facts, and records one Episode only when something changes.",
+        description = "Use when stored knowledge should no longer be current and no replacement is known. Prefer one recalled fact target. Use subject with optional p only when the entire visible mutable slice should be withdrawn. Supply exactly one of target or subject. Withdrawal is soft and preserves history.",
         input_schema = schema_memory_withdraw(),
         output_schema = schema_out_memory_withdraw(),
         annotations(title = "Withdraw facts", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
@@ -1322,7 +1311,7 @@ impl Mindreader {
     #[tool(
         name = "judge",
         title = "Judge retrieved targets",
-        description = "Use after the agent actually relied on a recalled node or fact and it materially helped, distracted, or misled the work. Judge retrieval utility, not truth: revise or withdraw a false or stale claim instead, and do not rate every result. ratings contains 1–20 unique targets; strengthen or weaken changes each shared weight by exactly +1 or -1. The input-ordered batch is atomic, records one Episode, and rolls back fully on any failure. Recall itself never changes weight.",
+        description = "Use only after a recalled node or fact materially helped, distracted, or misled actual work. Judge retrieval utility, not truth; revise or withdraw a false claim instead. Each strengthen or weaken rating changes shared weight by exactly +1 or -1. Do not rate every result. The batch is atomic, and recall never changes weight automatically.",
         input_schema = schema_memory_judge(),
         output_schema = schema_out_memory_judge(),
         annotations(title = "Judge retrieved targets", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
@@ -1338,7 +1327,7 @@ impl Mindreader {
     #[tool(
         name = "place",
         title = "Place layer memberships",
-        description = "Use when the agent determines that existing memory belongs in additional, fewer, or different project, team, task, or analysis layers without changing the fact itself. This changes visibility membership, not authorization. Apply 1–20 unique node or fact edits atomically; scope controls current visibility and each edit supplies add and/or remove. Include literal fact endpoints in the same batch as {kind:\"node\", iri}. The batch is validated against its combined final endpoint-closure state, records one Episode if changed, and rolls back fully on failure.",
+        description = "Use when existing nodes or facts belong in different visibility layers without changing their meaning. scope controls which targets are currently visible; each edit changes memberships with add and/or remove. This is visibility, not authorization. The batch is atomic and must leave every fact visible through both endpoints.",
         input_schema = schema_memory_place(),
         output_schema = schema_out_memory_place(),
         annotations(title = "Place layer memberships", read_only_hint = false, destructive_hint = true, idempotent_hint = true, open_world_hint = false)
@@ -1354,7 +1343,7 @@ impl Mindreader {
     #[tool(
         name = "unify",
         title = "Permanently unify nodes",
-        description = "Use only when current evidence confirms that two same-kind nodes represent the same identity, after reviewing any review.unify suggestion and deciding which IRI and name must survive. Never unify merely because names are similar. source and target are pasteable node handles {kind:\"node\", iri}. This database-wide operation permanently absorbs source into target; reverse the pair when the other identity should survive. It has no scope because all memberships and history must be reconciled.",
+        description = "Use only when evidence confirms that two same-kind nodes are the same identity and which one must survive. Never unify merely because names are similar. This database-wide, permanent operation absorbs source into target and reconciles all memberships and history. It has no scope and no undo.",
         input_schema = schema_memory_unify(),
         output_schema = schema_out_memory_unify(),
         annotations(title = "Permanently unify nodes", read_only_hint = false, destructive_hint = true, idempotent_hint = false, open_world_hint = false)
@@ -1379,7 +1368,7 @@ impl ServerHandler for Mindreader {
                 env!("CARGO_PKG_VERSION"),
             ))
             .with_instructions(
-                "The agent owns memory: proactively recall when work may depend on prior decisions, preferences, constraints, identities, conventions, project state, or lessons; proactively write future-useful facts[], rationale, and insights learned during work. scope is an OR-union ([] is global-only). Use recall_semantic only after lexical recall is insufficient. Paste returned target handles into mutations. Never store secrets, transient chatter, or raw dumps; never assert CONTRADICTS/SUPERSEDES.",
+                "The agent owns selective prospective memory: proactively recall stored assertions when relevant; proactively write supported reusable triples. Unstored conversation is unavailable. scope is visibility: [] is global-only; named scopes also see global records. Facts are set-valued; revise exact facts for corrections. Use effective intervals for states, not events. Use recall_semantic after lexical recall when disclosure is acceptable. Never store secrets or assert CONTRADICTS/SUPERSEDES.",
             )
     }
 
@@ -1427,6 +1416,37 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string()
+    }
+
+    fn tool_schema(name: &str) -> Value {
+        Mindreader::tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == name)
+            .unwrap_or_else(|| panic!("missing tool {name}"))
+            .schema_as_json_value()
+    }
+
+    fn assert_input_surface(name: &str, expected_properties: &[&str], expected_required: &[&str]) {
+        let schema = tool_schema(name);
+        let mut properties = schema["properties"]
+            .as_object()
+            .expect("input properties")
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        properties.sort_unstable();
+        let mut expected_properties = expected_properties.to_vec();
+        expected_properties.sort_unstable();
+        assert_eq!(properties, expected_properties, "{name} input properties");
+
+        let required = schema["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .map(|value| value.as_str().expect("required field name"))
+            .collect::<Vec<_>>();
+        assert_eq!(required, expected_required, "{name} required fields");
     }
 
     fn assert_no_union_keywords(value: &Value, tool: &str) {
@@ -1571,10 +1591,10 @@ mod tests {
             .unwrap()
             .schema_as_json_value();
         let revise_required = revise_schema["required"].as_array().unwrap();
-        for name in ["scope", "target", "new"] {
+        for name in ["scope", "target", "replacement"] {
             assert!(revise_required.iter().any(|value| value == name));
         }
-        assert_eq!(revise_schema["properties"]["new"]["type"], "object");
+        assert_eq!(revise_schema["properties"]["replacement"]["type"], "object");
         assert_eq!(
             revise_schema["properties"]["effective"]["type"],
             serde_json::json!(["object", "null"])
@@ -1618,6 +1638,119 @@ mod tests {
         assert_eq!(
             place_schema["required"],
             serde_json::json!(["scope", "edits"])
+        );
+    }
+
+    #[test]
+    fn tool_input_surfaces_are_exact() {
+        assert_input_surface(
+            "recall",
+            &[
+                "scope",
+                "text",
+                "iris",
+                "labels",
+                "around",
+                "hops",
+                "p",
+                "depth",
+                "direction",
+                "history",
+                "effectiveAt",
+                "detail",
+                "limit",
+            ],
+            &["scope"],
+        );
+        assert_input_surface(
+            "recall_semantic",
+            &["scope", "text", "labels", "effectiveAt", "detail", "limit"],
+            &["scope", "text"],
+        );
+        assert_input_surface("write", &["facts", "scope"], &["facts", "scope"]);
+        assert_input_surface(
+            "revise",
+            &[
+                "scope",
+                "target",
+                "replacement",
+                "spike",
+                "contradicts",
+                "reason",
+                "effective",
+            ],
+            &["scope", "target", "replacement"],
+        );
+        assert_input_surface(
+            "withdraw",
+            &["scope", "target", "subject", "p", "reason"],
+            &["scope"],
+        );
+        assert_input_surface("judge", &["scope", "ratings"], &["scope", "ratings"]);
+        assert_input_surface("place", &["scope", "edits"], &["scope", "edits"]);
+        assert_input_surface("unify", &["source", "target"], &["source", "target"]);
+    }
+
+    #[test]
+    fn agent_critical_parameter_descriptions_are_explicit() {
+        let recall = tool_schema("recall");
+        let scope = recall["properties"]["scope"]["description"]
+            .as_str()
+            .expect("scope description");
+        for expected in [
+            "[] selects only global",
+            "sees global records plus",
+            "Copy exact values",
+        ] {
+            assert!(scope.contains(expected), "scope must explain {expected:?}");
+        }
+        assert!(recall["properties"]["labels"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("selector")
+                && description.contains("recall_semantic")));
+        assert!(recall["properties"]["limit"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("catalog nodes")
+                && description.contains("per requested IRI")));
+
+        let revise = tool_schema("revise");
+        assert!(revise["properties"]["replacement"]["description"]
+            .as_str()
+            .is_some_and(
+                |description| description.contains("subject and predicate remain unchanged")
+            ));
+        let effective = revise["properties"]["effective"]["description"]
+            .as_str()
+            .expect("revise effective description");
+        for expected in ["Omit to inherit", "null to clear", "object to replace"] {
+            assert!(
+                effective.contains(expected),
+                "revise effective must explain {expected:?}"
+            );
+        }
+
+        let withdraw = tool_schema("withdraw");
+        assert!(withdraw["properties"]["p"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("Invalid with target")
+                && description.contains("entire mutable outgoing slice")));
+
+        let judge = tool_schema("judge");
+        let mode = judge["properties"]["ratings"]["items"]["properties"]["mode"]["description"]
+            .as_str()
+            .expect("judge mode description");
+        assert!(mode.contains("+1") && mode.contains("-1") && mode.contains("false facts"));
+
+        let place = tool_schema("place");
+        assert!(place["properties"]["edits"]["description"]
+            .as_str()
+            .is_some_and(|description| description.contains("endpoint closure")
+                && description.contains("persisted literals")));
+        assert!(
+            place["properties"]["edits"]["items"]["properties"]["remove"]["description"]
+                .as_str()
+                .is_some_and(|description| description.contains("final named membership")
+                    && description.contains("global"))
         );
     }
 
@@ -1905,18 +2038,18 @@ mod tests {
     }
 
     #[test]
-    fn instructions_and_descriptions_define_autonomous_when_to_call() {
+    fn instructions_and_descriptions_are_decision_oriented() {
         let info = test_server().get_info();
         let instructions = info.instructions.expect("instructions");
         assert!(instructions.len() <= 512, "instructions exceed 512 chars");
-        assert!(instructions.contains("agent owns memory"));
+        assert!(instructions.contains("agent owns selective prospective memory"));
         assert!(instructions.contains("proactively recall"));
         assert!(instructions.contains("proactively write"));
-        assert!(instructions.contains("OR-union") || instructions.contains("OR union"));
-        assert!(instructions.contains("Recall") || instructions.contains("recall"));
+        assert!(instructions.contains("[] is global-only"));
+        assert!(instructions.contains("named scopes also see global records"));
+        assert!(instructions.contains("Facts are set-valued"));
+        assert!(instructions.contains("effective intervals for states"));
         assert!(instructions.contains("recall_semantic"));
-        assert!(instructions.contains("facts[]"));
-        assert!(instructions.contains("target"));
         assert!(instructions.contains("CONTRADICTS"));
         let tools = Mindreader::tool_router().list_all();
         for tool in &tools {
@@ -1927,6 +2060,11 @@ mod tests {
             assert!(
                 description.starts_with("Use "),
                 "{} description must start with when-to-call: {description}",
+                tool.name
+            );
+            assert!(
+                description.len() <= 600,
+                "{} description exceeds 600 chars: {description}",
                 tool.name
             );
         }
@@ -1947,8 +2085,56 @@ mod tests {
             .as_deref()
             .unwrap();
         assert!(write.contains("proactively"));
-        assert!(write.contains("The user need not ask"));
-        assert!(write.contains("future") || write.contains("another agent or session"));
+        assert!(write.contains("user need not ask"));
+        assert!(write.contains("Facts are set-valued"));
+
+        let semantic = tools
+            .iter()
+            .find(|tool| tool.name == "recall_semantic")
+            .unwrap()
+            .description
+            .as_deref()
+            .unwrap();
+        assert!(semantic.contains("embedding provider"));
+        assert!(semantic.contains("expiring semantic activations"));
+        assert!(semantic.contains("non-idempotent"));
+    }
+
+    #[test]
+    fn using_mindreader_skill_is_self_contained_and_covers_the_tool_contract() {
+        let skill = include_str!("../skills/using-mindreader/SKILL.md");
+
+        assert!(skill.split_whitespace().count() <= 2_000);
+        assert!(!skill.contains("references/"));
+        for tool in [
+            "recall",
+            "recall_semantic",
+            "write",
+            "revise",
+            "withdraw",
+            "judge",
+            "place",
+            "unify",
+        ] {
+            assert!(
+                skill.contains(&format!("mindreader:{tool}")),
+                "skill must route {tool}"
+            );
+        }
+        for invariant in [
+            "selective prospective memory",
+            "Facts are set-valued",
+            "effective interval",
+            "provider disclosure",
+            "raw conversation",
+            "Missing memory remains unknown",
+        ] {
+            assert!(
+                skill.contains(invariant),
+                "skill must preserve {invariant:?}"
+            );
+        }
+        assert!(!skill.contains("mindreader:memory_"));
     }
 
     #[test]

@@ -13,6 +13,8 @@ The agent is the clerk of the graph and owns the memory lifecycle. Without waiti
 
 Mindreader itself does not extract memory from conversation with a hidden language model, invent unstated facts, or expose raw Cypher. Autonomous means that the agent performs the editorial judgment and explicit tool calls; it does not mean that the server silently stores a transcript.
 
+Mindreader is selective prospective memory, not comprehensive chat storage. An agent has free editorial judgment over what deserves retention, and details it never asserts are intentionally unavailable later. The contract is that chosen assertions can be stored, maintained, and recalled faithfully—not that arbitrary questions can reconstruct an earlier conversation.
+
 Ordinary writes are set-valued and may qualify state facts with a half-open effective interval `[from,to)`. This world-time interval is independent of the transaction-time `Episode` and validity history. Explicit corrections close the selected old fact and link its replacement with `SUPERSEDES`. Closed-world `recall` stays inside Neo4j. Optional `recall_semantic` sends only its query text to the configured OpenAI or xAI embedding API.
 
 That is a different contract from chat-memory extractors such as [Graphiti](https://arxiv.org/abs/2501.13956): those systems ingest messages and derive facts automatically. Mindreader records only what an agent asserts, then returns pasteable identifiers for the next call rather than a prose context blob.
@@ -258,7 +260,7 @@ Mindreader is agent-driven working memory, not a user-operated notebook. The age
    | Current plus historical facts | `history` (one node or fact IRI) |
 
    Call `recall_semantic` only when lexical recall is not enough and sending the query text to the embedding provider is acceptable. Both recall tools accept `detail`: use answer-only `concise` when reading memory, or the default operation-ready `detailed` when handles, memberships, ranking, eligibility, or audit context may be needed. For state as-of a world-time instant, pass `effectiveAt`; this intentionally excludes facts whose effective time was not explicitly recorded. Do not use it merely because a point-event question mentions a date.
-3. Do the work. Discussion, investigation, implementation, debugging, and review are capture triggers whenever they establish supported knowledge that another agent or session is likely to need. Reduce that knowledge to concise triples; do not copy conversation. Once a passage qualifies, preserve its focal durable claim—such as a decision, change, problem and outcome, event, quantity, or date—before adjacent detail.
+3. Do the work. Discussion, investigation, implementation, debugging, and review are capture triggers, but the agent retains only supported knowledge it judges worth reusing. Express each chosen memory as a standalone precise triple; do not copy conversation or bundle unrelated claims into a prose literal.
 4. When durable state should change, pick the smallest verb:
 
    | Situation | Tool |
@@ -278,7 +280,7 @@ Detailed text and semantic recall also fill `nodes[]` from returned fact endpoin
 
 A global fact can appear under a named `scope` with `mutable: false`. Revise or withdraw it with `scope: []`. The error says so.
 
-Memory candidates may come from the user, the agent's reasoning, tool output, repository evidence, or completed work. Store identities and ownership, durable relationships, preferences and standing instructions, decisions and rationale, requirements and invariants, conventions, stable project or environment facts, durable commitments and blockers, reusable operational knowledge, and deliberately classified Signals, Patterns, or Insights. Keep greetings, acknowledgements, reasoning chatter, raw conversation, transient progress, temporary paths, build logs, one-off task instructions, secrets, and prose/Markdown/source dumps out of the graph. Do not mirror an authoritative artifact when future work can derive the fact more safely and cheaply from that artifact. The reusable agent guide is [`skills/using-mindreader/SKILL.md`](skills/using-mindreader/SKILL.md).
+Memory candidates may come from the user, the agent's reasoning, tool output, repository evidence, or completed work. The agent decides which supported candidates deserve durable retention; it does not preserve details merely to make arbitrary future questions answerable. Useful candidates include identities and ownership, durable relationships, preferences and standing instructions, decisions and rationale, requirements and invariants, conventions, stable project or environment facts, durable commitments and blockers, reusable operational knowledge, and deliberately classified Signals, Patterns, or Insights. Keep greetings, acknowledgements, reasoning chatter, raw conversation, transient progress, temporary paths, build logs, one-off task instructions, secrets, and prose/Markdown/source dumps out of the graph. Do not mirror an authoritative artifact when future work can derive the fact more safely and cheaply from that artifact. The reusable agent guide is [`skills/using-mindreader/SKILL.md`](skills/using-mindreader/SKILL.md).
 
 ## Minimal write, recall, and walk example
 
@@ -419,7 +421,7 @@ Recoverable failures return an MCP `isError` result with `{ok:false,reason,messa
 | `recall` | `scope` and exactly one of `text`, `iris[]`, `labels[]`, `around`, `history` | `effectiveAt` for non-history, non-catalog reads; selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `direction` (`both`\|`outgoing`\|`incoming`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, compact witness paths, revision history, or the Class/Property catalog. Text combines an exact phrase with bounded OR-keyword matching and never calls an embedding provider. `effectiveAt` returns only explicitly qualified ordinary facts whose half-open interval contains that instant; structural edges remain traversable. `history` instead exposes transaction and effective clocks together. |
 | `recall_semantic` | `scope`, non-empty `text` | `labels[]`, `effectiveAt`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall that always fuses exact and keyword candidates with expiring semantic activations. `effectiveAt` filters direct, activation, and structural ordinary facts. Sends only query text to the configured embedding provider and creates no activation when no facts resolve. |
 | `write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`), `effective` (`null`) | Add set-valued triples or merge memberships. `effective` is an optional half-open world-time interval on ordinary state facts. One Episode if any fact changed. |
-| `revise` | `scope`, fact `target`, `new` | `spike`, `contradicts`, `reason`, `effective` (omitted inherits; `null` clears; object replaces) | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
+| `revise` | `scope`, fact `target`, `replacement` | `spike`, `contradicts`, `reason`, `effective` (omitted inherits; `null` clears; object replaces) | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
 | `withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return a `withdrawn` count plus `withdrawnTargets`. |
 | `judge` | `scope`, `ratings[]` (1–20 unique targets) | None | Apply exactly `+1` or `-1` per visible node/current fact in one transaction and one Episode. |
 | `place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
@@ -460,7 +462,7 @@ An exact correction pastes the selected current fact handle and supplies the rep
     "kind": "fact",
     "iri": "mindreader:relationship/<returned-uuid>"
   },
-  "new": { "kind": "node", "name": "new-project" },
+  "replacement": { "kind": "node", "name": "new-project" },
   "reason": "corrected assignment"
 }
 ```
@@ -715,11 +717,6 @@ cargo run --release --features developer-tools --bin mindreader-bench -- --confi
 
 The benchmark refuses any database that is not pristine after model-v9 bootstrap, seeds persistent fixtures, validates the exact search order against its deterministic oracle, and reports nearest-rank latency distributions for common-hit search, batched logical locks, and merge suggestions at 1/4/20 newly created entities. Never point it at production or a database whose contents must be preserved.
 
-For end-to-end product measurement with LongMemEval, use the separate raw-OpenAI harness documented
-in [`BENCHMARK.md`](BENCHMARK.md). It dispatches typed operations through `MemoryService` without MCP,
-uses a dedicated marker-checked Neo4j volume, and keeps downloaded datasets and working results in
-ignored repository-local directories.
-
 Use Divan for graph-free CPU regressions:
 
 ```bash
@@ -747,7 +744,6 @@ The normalization matrix covers dimensions 3, 256, 512, 1536, 3072, and 4096. Ke
 | [`src/iri.rs`](src/iri.rs) | IRI detection, slugging, minting, and kind/label mappings. |
 | [`src/bin/mindreader-smoke.rs`](src/bin/mindreader-smoke.rs) | Live end-to-end graph behavior checks. |
 | [`src/bin/mindreader-bench.rs`](src/bin/mindreader-bench.rs) | Reproducible release-mode search, logical-lock, and merge-suggestion benchmarks. |
-| [`src/bin/mindreader-longmemeval.rs`](src/bin/mindreader-longmemeval.rs) | Raw-OpenAI LongMemEval clerk, reader, judge, checkpoint, and direct-service harness. |
 | [`benches/cpu_hotspots.rs`](benches/cpu_hotspots.rs) | Divan microbenchmarks for graph-free CPU paths and supported workload bounds. |
 | [`scripts/mcp_handshake_probe.py`](scripts/mcp_handshake_probe.py) | Portable MCP discovery, protocol-rejection, and tool-inventory diagnostic. |
 | [`mcp.json`](mcp.json) | Server metadata, transport, environment, and exported tool inventory. |

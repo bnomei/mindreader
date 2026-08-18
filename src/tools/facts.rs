@@ -301,7 +301,7 @@ struct RevisionPlan {
     pub s: EntityInput,
     pub p: String,
     pub old: ObjectInput,
-    pub new: ObjectInput,
+    pub replacement: ObjectInput,
     pub layers: Vec<String>,
     pub spike: Option<String>,
     pub contradicts: bool,
@@ -376,11 +376,11 @@ pub struct ReviseArgs {
     /// Pasteable current fact handle (`kind=fact`).
     pub target: TargetArgs,
     /// Replacement object; the previous object stays as history via SUPERSEDES.
-    pub new: ObjectInput,
+    pub replacement: ObjectInput,
     /// Optional Spike on the replacement fact; omitted keeps the previous Spike.
     #[serde(default)]
     pub spike: Option<String>,
-    /// When true, add CONTRADICTS from the new object to other current values.
+    /// When true, add CONTRADICTS from the replacement object to other current values.
     #[serde(default)]
     pub contradicts: bool,
     /// Optional audit note stored on the Episode and replacement fact.
@@ -1223,8 +1223,8 @@ async fn apply_revision_once(
     .resolved_iri(&subject_kind);
     let old_value = ObjectValue::from_input(args.old)?;
     let old_iri = old_value.resolved_iri();
-    let new_value = ObjectValue::from_input(args.new)?;
-    let new_iri = new_value.resolved_iri();
+    let replacement_value = ObjectValue::from_input(args.replacement)?;
+    let replacement_iri = replacement_value.resolved_iri();
     let prop_iri = predicate.iri().to_string();
     let structural = structural_relationship_for(&prop_iri);
     if structural.is_some() && !matches!(&args.effective, EffectiveUpdate::Inherit) {
@@ -1243,7 +1243,7 @@ async fn apply_revision_once(
         &subject_iri,
         &prop_iri,
         &old_iri,
-        &new_iri,
+        &replacement_iri,
         args.contradicts,
     );
     let mut txn = graph.start_txn().await?;
@@ -1273,7 +1273,7 @@ async fn apply_revision_once(
                 ))
             }
         })?;
-    if old_iri == new_iri && old_current.effective == replacement_effective {
+    if old_iri == replacement_iri && old_current.effective == replacement_effective {
         // Same object and interval is a no-op: roll back, no Episode, no SUPERSEDES.
         txn.rollback().await?;
         let target_iri = expected_fact_iri.unwrap_or(&old_current.iri);
@@ -1292,11 +1292,12 @@ async fn apply_revision_once(
     let effective_spike = spike.clone().or_else(|| old_current.spike.clone());
     let result = async {
         let subject = merge_node_in_txn(&mut txn, &subject_spec, &subject_kind, &[]).await?;
-        let (new_object, new_object_is_literal) = merge_object_in_txn(&mut txn, new_value).await?;
+        let (replacement_object, replacement_is_literal) =
+            merge_object_in_txn(&mut txn, replacement_value).await?;
         let (_, property_created, _) = ensure_property_in_txn(&mut txn, &prop_iri).await?;
         let episode = create_episode_in_txn(&mut txn, "revise", args.reason.as_deref()).await?;
         apply_node_memberships_txn(&mut txn, &subject, &layers).await?;
-        apply_node_memberships_txn(&mut txn, &new_object, &layers).await?;
+        apply_node_memberships_txn(&mut txn, &replacement_object, &layers).await?;
         change_fact_memberships_txn(
             &mut txn,
             &old_current,
@@ -1305,29 +1306,30 @@ async fn apply_revision_once(
             args.reason.as_deref(),
         )
         .await?;
-        let new_text = fact_text(&subject.name, &subject.iri, &prop_iri, &new_object);
-        let (new_relationship_iri, _, _) = ensure_relation_txn(
+        let replacement_text =
+            fact_text(&subject.name, &subject.iri, &prop_iri, &replacement_object);
+        let (replacement_relationship_iri, _, _) = ensure_relation_txn(
             &mut txn,
             &RelationWrite {
                 rel_type: structural.as_deref().unwrap_or("ASSERTS"),
                 s: &subject.iri,
-                o: &new_object.iri,
+                o: &replacement_object.iri,
                 prop_iri: &prop_iri,
                 layers: &layers,
                 episode: &episode,
                 reason: args.reason.as_deref(),
-                fact_text: &new_text,
+                fact_text: &replacement_text,
                 spike: effective_spike.as_deref(),
                 effective: replacement_effective.as_ref(),
             },
         )
         .await?;
-        let supersedes_text = format!("{} SUPERSEDES {old_iri}", new_object.iri);
+        let supersedes_text = format!("{} SUPERSEDES {old_iri}", replacement_object.iri);
         let (supersedes_iri, _, _) = ensure_relation_txn(
             &mut txn,
             &RelationWrite {
                 rel_type: "SUPERSEDES",
-                s: &new_object.iri,
+                s: &replacement_object.iri,
                 o: &old_iri,
                 prop_iri: SUPERSEDES_PROPERTY_IRI,
                 layers: &layers,
@@ -1349,7 +1351,7 @@ async fn apply_revision_once(
             )
             .param("episode", episode.iri.clone())
             .param("previousFactIri", old_current.iri.clone())
-            .param("replacementFactIri", new_relationship_iri.clone())
+            .param("replacementFactIri", replacement_relationship_iri.clone())
             .param("supersedesIri", supersedes_iri)
             .param("selectedScope", layers.clone()),
         )
@@ -1359,30 +1361,36 @@ async fn apply_revision_once(
             &subject.iri,
             &prop_iri,
             structural.as_deref(),
-            &new_object.iri,
+            &replacement_object.iri,
             &layers,
             replacement_effective.as_ref(),
         )
         .await?;
         if args.contradicts {
-            ensure_contradictions_txn(&mut txn, &new_object.iri, &conflicts, &layers, &episode)
-                .await?;
+            ensure_contradictions_txn(
+                &mut txn,
+                &replacement_object.iri,
+                &conflicts,
+                &layers,
+                &episode,
+            )
+            .await?;
         }
         let subject_json = refreshed_node_json_txn(&mut txn, &subject.iri).await?;
-        let new_json = refreshed_node_json_txn(&mut txn, &new_object.iri).await?;
+        let replacement_json = refreshed_node_json_txn(&mut txn, &replacement_object.iri).await?;
         let relationship_json = refreshed_relation_json_txn(
             &mut txn,
-            &new_relationship_iri,
+            &replacement_relationship_iri,
             &subject.iri,
-            &new_object.iri,
+            &replacement_object.iri,
         )
         .await?;
         let mut created_iris = Vec::new();
         if subject.created {
             created_iris.push(subject.iri.clone());
         }
-        if new_object.created && !new_object_is_literal {
-            created_iris.push(new_object.iri.clone());
+        if replacement_object.created && !replacement_is_literal {
+            created_iris.push(replacement_object.iri.clone());
         }
         if property_created {
             created_iris.push(prop_iri.clone());
@@ -1391,8 +1399,8 @@ async fn apply_revision_once(
         Ok::<_, Error>((
             episode,
             subject_json,
-            new_json,
-            new_relationship_iri,
+            replacement_json,
+            replacement_relationship_iri,
             relationship_json,
             conflicts,
             args.contradicts,
@@ -1403,7 +1411,7 @@ async fn apply_revision_once(
     let (
         episode,
         subject,
-        new,
+        replacement,
         relationship_iri,
         relationship,
         alternatives,
@@ -1431,7 +1439,8 @@ async fn apply_revision_once(
     } else {
         json!([])
     };
-    let mut fact = crate::graph::fact_envelope(subject, &prop_iri, new, &relationship, &layers)?;
+    let mut fact =
+        crate::graph::fact_envelope(subject, &prop_iri, replacement, &relationship, &layers)?;
     fact["conflicts"] = conflicts;
     Ok(RevisionResult {
         noop: false,
@@ -1778,7 +1787,7 @@ pub async fn memory_revise(graph: &Graph, args: ReviseArgs) -> Result<Value> {
             s,
             p,
             old,
-            new: args.new,
+            replacement: args.replacement,
             layers,
             spike: args.spike,
             contradicts: args.contradicts,

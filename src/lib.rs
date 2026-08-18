@@ -72,11 +72,6 @@ pub mod developer {
         pub use crate::merge::merge_suggestions_in_txn;
     }
 
-    /// Existing MCP input schemas reused by non-MCP developer adapters.
-    pub mod schemas {
-        pub use crate::server::{developer_error_payload, developer_input_schema};
-    }
-
     /// Deterministic semantic runtime construction for the live smoke suite.
     pub mod semantic {
         pub use crate::semantic::SemanticRuntime;

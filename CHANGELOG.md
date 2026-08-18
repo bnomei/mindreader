@@ -8,6 +8,8 @@ versions follow Semantic Versioning.
 ### Changed
 
 - Advance the fresh-database graph contract to model v8. Spike classification is stored on each exact relationship rather than as a subject-node label; exact revision Episodes retain previous/replacement fact and SUPERSEDES identities; explicit reassertion can reclassify one fact and revision preserves the old classification unless replaced.
+- Advance the graph contract again to model v9 with optional half-open effective intervals for state facts, state-as-of recall, and separate transaction/effective clocks in history.
+- Define the agent contract as selective prospective memory, tighten tool and skill guidance around lifecycle decisions, lock all eight advertised input surfaces in tests, and rename the public `revise.new` input to `revise.replacement`.
 - Expose newest-first exact `revisions[]` audit events from history, including pasteable previous/replacement fact handles and non-actionable SUPERSEDES metadata.
 - Make neighborhood predicates and incoming/outgoing direction constrain every traversed edge, retain compact witness paths in concise recall, rank witnesses with a bounded hub penalty, and report per-IRI truncation.
 - Return complete merged memberships in write responses instead of echoing only the requested membership slice.

@@ -11,10 +11,8 @@ homepage = "https://github.com/bnomei/mindreader"
 include = [
   "/src/**",
   "/benches/**",
-  "/benchmarks/longmemeval/**",
   "/Cargo.toml",
   "/Cargo.lock",
-  "/BENCHMARK.md",
   "/README.md",
   "/LICENSE",
   "/CHANGELOG.md",
@@ -53,11 +51,6 @@ required-features = ["developer-tools"]
 [[bin]]
 name = "mindreader-bench"
 path = "src/bin/mindreader-bench.rs"
-required-features = ["developer-tools"]
-
-[[bin]]
-name = "mindreader-longmemeval"
-path = "src/bin/mindreader-longmemeval.rs"
 required-features = ["developer-tools"]
 
 [package.metadata.binstall]

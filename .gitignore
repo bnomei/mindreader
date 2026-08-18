@@ -1,8 +1,6 @@
 /target
 /dist
 /tmp
-/benchmarks/longmemeval/data/
-/benchmarks/longmemeval/results/
 .env
 .orchid
 .frigg

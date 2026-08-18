@@ -397,7 +397,7 @@ mod tests {
         let base = serde_json::json!({
             "scope": [],
             "target": {"kind": "fact", "iri": "mindreader:relationship/fact"},
-            "new": {"kind": "literal", "value": "new"}
+            "replacement": {"kind": "literal", "value": "new"}
         });
         let inherited: ReviseArgs = serde_json::from_value(base.clone()).unwrap();
         assert!(matches!(inherited.effective, EffectiveUpdate::Inherit));

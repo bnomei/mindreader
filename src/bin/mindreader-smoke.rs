@@ -885,7 +885,7 @@ async fn run() -> Result<u32> {
                 kind: "fact".into(),
                 iri: second_rome_target.clone(),
             },
-            new: object_iri(temporal_rome_iri),
+            replacement: object_iri(temporal_rome_iri),
             spike: None,
             contradicts: false,
             reason: Some("correct effective state boundary".into()),
@@ -962,7 +962,7 @@ async fn run() -> Result<u32> {
                 kind: "fact".into(),
                 iri: temporal_lisbon_target.to_string(),
             },
-            new: object(format!("temporal-porto-{tag}")),
+            replacement: object(format!("temporal-porto-{tag}")),
             spike: None,
             contradicts: false,
             reason: Some("replace value while preserving effective interval".into()),
@@ -977,7 +977,7 @@ async fn run() -> Result<u32> {
                 kind: "fact".into(),
                 iri: inherited_target,
             },
-            new: inherited_revision
+            replacement: inherited_revision
                 .pointer("/fact/o/iri")
                 .and_then(Value::as_str)
                 .map(object_iri)
@@ -1220,7 +1220,7 @@ async fn run() -> Result<u32> {
                 kind: "fact".into(),
                 iri: merged_rel.clone(),
             },
-            new: object(format!("{merge_token}-new")),
+            replacement: object(format!("{merge_token}-new")),
             spike: None,
             contradicts: false,
             reason: Some("smoke scoped revision".into()),
