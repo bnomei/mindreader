@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORKFLOW="$ROOT_DIR/.github/workflows/release.yml"
+cd "$ROOT_DIR"
+
 publishing_checkout_count="$(grep -Fc "ref: \${{ needs.release_ref.outputs.sha }}" "$WORKFLOW")"
 post_crates_publish_count="$(grep -Fc "needs: [release_ref, github-release, crates-io]" "$WORKFLOW")"
 
@@ -22,5 +24,12 @@ for validation in 'git show-ref --verify --quiet' '^{commit}' 'git rev-parse HEA
     exit 1
   }
 done
+
+version="$(GITHUB_REF_NAME=main scripts/resolve-version.sh)"
+RELEASE_TAG="v$version" scripts/resolve-version.sh >/dev/null
+if RELEASE_TAG=main scripts/resolve-version.sh >/dev/null 2>&1; then
+  echo "Expected an explicit non-tag release ref to fail validation" >&2
+  exit 1
+fi
 
 echo "Release workflow checkout and version contracts are valid."

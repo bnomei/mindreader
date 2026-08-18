@@ -20,7 +20,7 @@ if [[ -z "$manifest_version" ]]; then
   exit 1
 fi
 
-tag="${RELEASE_TAG:-${GITHUB_REF_NAME:-}}"
+tag="${RELEASE_TAG:-}"
 if [[ -n "$tag" ]]; then
   if [[ "$tag" != v* ]]; then
     echo "Release tag must start with v: $tag" >&2
