@@ -7,19 +7,121 @@
 [![Discord](https://flat.badgen.net/badge/discord/bnomei?color=7289da&icon=discord&label)](https://discordapp.com/users/bnomei)
 [![Buymecoffee](https://flat.badgen.net/badge/icon/donate?icon=buymeacoffee&color=FF813F&label)](https://www.buymeacoffee.com/bnomei)
 
-Mindreader is a deterministic [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server that gives AI agents durable, inspectable Neo4j graph memory. It serves exactly eight stdio tools for storing and maintaining explicit triples: `subject -predicate-> object`.
+**Mindreader gives AI agents a memory they must curate, not a history they can search.**
 
-Use Mindreader when an agent needs reusable facts, decisions, constraints, or relationships to survive beyond its current context—not when you need a transcript or an automatic fact extractor. The agent is the clerk: it decides what is worth retaining, calls a mutation tool explicitly, and pastes returned handles into later maintenance calls. Mindreader never reads a conversation on its own, invents facts, exposes raw Cypher, or silently overwrites a stored assertion.
+Most agent-memory systems begin with a conversation or document archive and ask, “How can we retrieve the right passage later?” Mindreader begins with a different question:
 
-The resulting contract is deliberately narrow: assertions you choose to store remain scoped, auditable, and maintainable; details that were never asserted are unavailable. Ordinary recall stays closed-world in Neo4j. Optional semantic recall sends only its query text to a configured OpenAI or xAI embedding provider.
+> What did this agent learn that is important enough to become durable knowledge?
 
-At a glance:
+An agent using Mindreader deliberately keeps a small set of reusable facts, decisions, constraints, preferences, relationships, and lessons. Each memory is an explicit relationship such as `project → uses → Neo4j`. The agent can later correct it, retire it, qualify when it was true, or limit where it is visible.
 
-- **Explicit and inspectable.** Every fact is an asserted triple with a stable handle, provenance, memberships, and soft-retention history.
-- **Set-valued and correctable.** Compatible values coexist. Corrections retire one selected fact and record an explicit `SUPERSEDES` link.
-- **Scoped, not access-controlled.** A call's `scope` decides what is visible; it is a graph filter, not an authorization boundary.
-- **Temporal when needed.** State facts can carry a half-open effective interval `[from,to)` independently of transaction history.
-- **Selective by design.** No hidden extraction or chat-log reconstruction is involved.
+This makes Mindreader **selective prospective memory**: memory chosen now because it should help future work. It is not a transcript store, an automatic fact extractor, or a generic RAG system.
+
+## Why this is different
+
+The usual promise of agent memory is breadth: retain enough past material that a model can reconstruct an answer later. Mindreader instead optimizes for **precision, maintenance, and trust**.
+
+| Typical transcript or RAG memory | Mindreader |
+| --- | --- |
+| Retains conversations, chunks, or summaries | Retains deliberately selected knowledge |
+| Tries to recover what was said | Recalls what the agent chose to rely on later |
+| Retrieval quality depends on finding the right passage | Recall returns explicit entities and relationships |
+| New summaries may obscure or replace old ones | Compatible facts coexist; corrections are explicit |
+| Provenance often points to a document or message | Every durable assertion change has graph-level history and provenance |
+| Broad coverage, including incidental details | Lower coverage by design, with less noise and exposure |
+
+The practical result is a memory that behaves more like a maintained knowledge ledger than an infinite chat history:
+
+- **No facts are captured secretly.** Mindreader never listens to conversations or extracts facts on its own. The agent explicitly decides what to store.
+- **Nothing is silently overwritten.** New values can coexist. Replacing a wrong value is a deliberate correction with preserved history.
+- **Memory has structure.** Facts connect stable entities instead of living only as isolated text snippets.
+- **Memory can express change.** A fact can distinguish when Mindreader learned it from when it was true in the represented world.
+- **Memory can be separated by context.** Projects, teams, or tasks can use visibility layers without duplicating the graph.
+- **Recall is honest about absence.** No result means no matching assertion was stored and visible—not that something never happened.
+
+Mindreader stores less than archive-first systems. That is the feature and the tradeoff.
+
+## When to use Mindreader
+
+Use Mindreader when an agent needs a durable body of **working knowledge** across sessions and you care about keeping that knowledge understandable and correct.
+
+Good fits include:
+
+- project decisions and why they were made;
+- requirements, invariants, conventions, and architectural constraints;
+- user preferences and standing instructions;
+- identities, responsibilities, ownership, and relationships;
+- commitments, blockers, and stable project or environment state;
+- reusable operational lessons discovered during work;
+- facts whose current value, correction history, or period of validity matters;
+- multi-agent work where selected knowledge should be visible in specific contexts.
+
+Mindreader is especially useful when a future agent should be able to ask “What do we currently know and rely on?” rather than “What words appeared somewhere in the past?”
+
+## When not to use Mindreader
+
+Do not use Mindreader as the only memory system when you need:
+
+- complete conversation history or “what did we discuss?” recall;
+- exact quotations, original wording, speaker turns, or source excerpts;
+- arbitrary question answering over old chats or documents;
+- recovery of fleeting details that nobody knew would matter later;
+- automatic ingestion with no agent judgment;
+- first-query semantic search over a large body of unstructured text;
+- hard tenant isolation—the visibility layers are filters, not an authorization boundary.
+
+If every past detail may become answer-bearing, keep the source material in a transcript or document store. If you also need maintained current knowledge, use that archive alongside Mindreader: the archive preserves evidence; Mindreader preserves the conclusions worth carrying forward.
+
+## The deliberate tradeoff
+
+Selective memory reduces noise, duplication, privacy exposure, and the cost of maintaining irrelevant history. Structured facts are easier to inspect, connect, correct, and reuse than generated summaries.
+
+The cost is **extraction loss**. An agent can fail to save an important detail, model it poorly, or fail to combine several memories later. Mindreader cannot recover information that was never asserted. No retrieval algorithm can remove that limitation.
+
+This distinction matters when evaluating memory benchmarks. Conversation-memory tests such as LongMemEval reward systems that retain arbitrary details from source sessions. They measure the whole pipeline—capture policy, model, memory, retrieval, reasoning, and judge—not only the memory engine. Mindreader intentionally chooses a different product boundary, so a raw score on that kind of benchmark should not be presented as pure graph-retrieval quality or silently improved by turning Mindreader into an exhaustive transcript store.
+
+## Semantic recall builds associative trails
+
+Ordinary recall is precise: the agent searches with known names, terms, identities, or relationships. Mindreader's optional semantic recall is for the opposite situation—the agent knows roughly what it needs but does not know the graph's exact vocabulary. It can ask for “the constraints around shipping this project” instead of constructing a detailed query from remembered entity names and predicates.
+
+This is not a conventional vector search over every stored fact. Mindreader uses a query embedding to find **associative trails** back to explicit graph knowledge:
+
+1. A new concept must first connect to facts through strong direct text evidence.
+2. Mindreader remembers a small, expiring association between the shape of that query and up to three grounded facts.
+3. Later queries with similar meaning can follow the trail even when they use different words.
+4. Once grounded facts are found, Mindreader may also return weaker one-hop context from their **memory neighborhood**.
+
+When an associative trail successfully leads to current, visible facts, using it refreshes its lifetime. Useful trails therefore stay warm through repeated work, while unused ones fade away. Over time, an agent develops familiar routes into the parts of the knowledge graph it actually uses—without needing exact queries every time.
+
+That familiarity does not turn repetition into truth. Semantic recall never raises a fact's weight automatically, cannot make retired or hidden knowledge current, and does not let loosely related results recursively teach themselves. Durable facts remain explicit and independently maintainable; the trails are temporary navigation aids around them.
+
+Only the query text is sent to the configured OpenAI or xAI embedding provider; the provider never receives stored facts or the returned memory neighborhood. Semantic recall is optional, and every other Mindreader operation works without an embedding provider.
+
+## How it works
+
+The agent acts as the clerk of an inspectable Neo4j graph:
+
+1. **Recall** when previous knowledge could affect the work.
+2. **Do the work** using recalled facts as evidence for exactly what they assert.
+3. **Capture selectively** when a durable decision, fact, preference, constraint, commitment, or lesson emerges.
+4. **Maintain memory** when knowledge changes: revise a known error, withdraw stale knowledge, preserve compatible alternatives, or merge identities only when they are confirmed to be the same.
+
+The user does not have to say “remember this.” A capable agent can make those calls proactively, while still choosing not to store transient chatter, raw logs, secrets, temporary paths, or facts already represented more reliably in an authoritative file.
+
+Mindreader exposes exactly eight [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) tools:
+
+| Need | Tool |
+| --- | --- |
+| Retrieve explicit memory | `recall` |
+| Follow associative trails from an approximate intent to grounded facts | `recall_semantic` |
+| Store selected facts | `write` |
+| Correct one exact fact while preserving history | `revise` |
+| Retire knowledge without deleting its history | `withdraw` |
+| Record whether a retrieval helped or distracted | `judge` |
+| Change visibility memberships | `place` |
+| Permanently merge two confirmed identities | `unify` |
+
+The reusable [`using-mindreader` agent skill](skills/using-mindreader/SKILL.md) contains the detailed operating contract, request shapes, and maintenance rules. [`mcp.json`](mcp.json) contains the server metadata and tool inventory.
 
 ## Start here
 
@@ -28,38 +130,9 @@ At a glance:
 | Install the released server | [Install a release](#install-a-release) |
 | Run and verify the project from source | [Quickstart from source](#quickstart-from-source) |
 | Register it with an MCP host | [Connect an MCP client](#connect-an-mcp-client) |
-| Learn the agent's recall → paste → mutate workflow | [Agent loop](#agent-loop) and the reusable [agent skill](skills/using-mindreader/SKILL.md) |
-| See a complete first write and recall | [Minimal write, recall, and walk example](#minimal-write-recall-and-walk-example) |
-| Check an exact tool input, default, or limit | [MCP tool reference](#mcp-tool-reference) |
-| Understand scope, time, ranking, semantic recall, or history | [Memory model](#memory-model) |
-| Configure Neo4j or embeddings | [Configuration reference](#configuration-reference) |
+| Configure Neo4j or optional semantic recall | [Configuration reference](#configuration-reference) |
+| Teach an agent how to use Mindreader | [Agent integration](#agent-integration) |
 | Develop, test, or benchmark the server | [Development](#development) |
-
-## What Mindreader provides
-
-- Explicit triples in a shared Neo4j graph. No hidden extractor, no silent overwrite, no raw Cypher.
-- Agent-driven recall and capture without requiring the user to ask for memory operations.
-- Eight job-shaped tools: closed-world recall, optional semantic recall, write, revise, withdraw, judge, place, and unify.
-- Pasteable `target` handles on nodes and facts so the next tool call copies identity instead of inventing it.
-- Request-scoped layer visibility (`scope`). `[]` is global-only, not all memory. Layers are a flashlight, not an ACL.
-- RDFS schema-as-data: Class and Property nodes live in the graph and are listed with `recall` `labels`.
-- Set-valued current facts, explicit `SUPERSEDES` corrections, optional `CONTRADICTS` links, and soft withdrawal (`validTo`).
-- Bitemporal state facts: transaction history remains auditable while optional effective intervals express when a state holds in the represented world.
-- Advisory `review.unify` / `review.alternatives` queues. Merges and corrections stay intentional.
-- Shared signed weights changed only by `judge`. Retrieval never updates rank by itself.
-- Per-fact Spike categories ranked `Knowledge > Insight > Pattern > Signal`, then weight, then text.
-- A stdio MCP server that completes the handshake before Neo4j is ready and connects lazily.
-
-## Architecture and data boundary
-
-```mermaid
-flowchart LR
-    Host["MCP host or agent"] <-->|"JSON-RPC over stdio"| Server["Mindreader"]
-    Server <-->|"Bolt"| Graph["Neo4j"]
-    Server -.->|"query text for semantic search only"| Provider["OpenAI or xAI embeddings"]
-```
-
-The MCP host owns process access and authentication. Mindreader owns tool validation, graph behavior, and provenance. Neo4j stores durable graph records and expiring semantic activations. The embedding provider receives query text only when an agent calls `recall_semantic`; it does not receive stored result bundles.
 
 ## Install a release
 
@@ -183,7 +256,7 @@ Run the binary without arguments to serve MCP. It also accepts `-h`/`--help` and
 
 ## Connect an MCP client
 
-Mindreader uses stdio transport. It prefers MCP `2026-07-28` (discovery lifecycle and self-contained request metadata) and also accepts initialize `2025-11-25` so hosts that have not adopted the newer version can still list tools. Older initialization protocols are rejected rather than downgraded. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all eight tools in the [MCP tool reference](#mcp-tool-reference).
+Mindreader uses stdio transport. It prefers MCP `2026-07-28` (discovery lifecycle and self-contained request metadata) and also accepts initialize `2025-11-25` so hosts that have not adopted the newer version can still list tools. Older initialization protocols are rejected rather than downgraded. The MCP client starts the process and exchanges JSON-RPC messages over its standard input and output. Configure one of the launch methods below, restart the client, and verify that it lists all eight tools shown in [How it works](#how-it-works).
 
 ### Local binary
 
@@ -250,349 +323,11 @@ The Compose service builds and runs Mindreader while Neo4j uses the persistent `
 
 Run `docker compose up -d neo4j` before the client launches the Compose-backed server. Compose reads the repository's `.env` file.
 
-## Agent loop
+## Agent integration
 
-Mindreader is agent-driven working memory, not a user-operated notebook. The agent evaluates memory needs at task intake, before consequential decisions, while durable knowledge emerges, and before significant completion or handoff. The user does not need to say "remember." A check may correctly produce no tool call; autonomous capture does not mean storing everything. The eight tools are verbs, not a checklist.
+Give your agent the reusable [`using-mindreader` skill](skills/using-mindreader/SKILL.md). It teaches the agent when to recall, what deserves retention, what must stay out of memory, and how to maintain assertions safely. The user should not need to operate the tools manually.
 
-1. Choose the narrowest `scope` that should see the work and copy it exactly on later scoped calls; never reconstruct or embellish a supplied ID. There is no session default. `[]` means global records only.
-2. Proactively recall when starting, resuming, or revisiting work that could depend on earlier decisions, rationale, preferences, standing instructions, requirements, constraints, identities, relationships, conventions, commitments, project state, or lessons. Reuse node IRIs and fact `target` handles already in context; otherwise call `recall` with exactly one selector:
-
-   | Need | Selector |
-   | --- | --- |
-   | Names or terms | `text` |
-   | Known node IRIs | `iris` (`hops` defaults to `0`; incident facts still appear on `lookups[i].facts`. Use `1` to also fill top-level `facts[]` in detailed mode) |
-   | Class or Property catalog | `labels: ["Class"]` or `["Property"]` |
-   | Neighborhood from a node | `around`, optional `p` and `depth` |
-   | Current plus historical facts | `history` (one node or fact IRI) |
-
-   Call `recall_semantic` only when lexical recall is not enough and sending the query text to the embedding provider is acceptable. Both recall tools accept `detail`: use answer-only `concise` when reading memory, or the default operation-ready `detailed` when handles, memberships, ranking, eligibility, or audit context may be needed. For state as-of a world-time instant, pass `effectiveAt`; this intentionally excludes facts whose effective time was not explicitly recorded. Do not use it merely because a point-event question mentions a date.
-3. Do the work. Discussion, investigation, implementation, debugging, and review are capture triggers, but the agent retains only supported knowledge it judges worth reusing. Express each chosen memory as a standalone precise triple; do not copy conversation or bundle unrelated claims into a prose literal.
-4. When durable state should change, pick the smallest verb:
-
-   | Situation | Tool |
-   | --- | --- |
-   | Same `(s, p, o, effective interval)`, maybe another layer | `write` (merge or no-op) |
-   | Another valid object for the same pair | `write` |
-   | This object is wrong; replacement known | `revise` (paste the fact `target`) |
-   | This object is stale; no replacement | `withdraw` |
-   | Membership only | `place` (`scope` is visibility; `add` / `remove` is the change) |
-   | Two nodes are the same identity | `unify` after you choose the survivor |
-
-5. Before completing significant work or handing it off, perform a capture check for durable outcomes, decisions and rationale, constraints, unresolved commitments, and reusable lessons. Batch related changes. Do not ask the user whether qualifying memory should be saved.
-6. Paste returned handles from mutations or detailed recall. Those results include `handles` (`facts`, `nodes`, `current`, `retired`, `unify`); concise recall intentionally does not. Do not reconstruct `mindreader:relationship/<uuid>`. Do not treat a fuzzy name hit as identity.
-7. `review.unify` and `review.alternatives` are queues, not commands. Judge only retrievals that materially helped, distracted, or misled (`rateable: true`). Correct or withdraw false memory instead of merely judging it.
-
-Detailed text and semantic recall also fill `nodes[]` from returned fact endpoints. `iris` reports misses as `lookups[i].found: false`. After `revise`, the live handle is `target` / `handles.current`; `previousTarget` / `handles.retired` is the retired input. `unify` takes `{kind:"node", iri}` handles; paste `review.unify[].source` and `.target`, or `handles.unify[]`.
-
-A global fact can appear under a named `scope` with `mutable: false`. Revise or withdraw it with `scope: []`. The error says so.
-
-Memory candidates may come from the user, the agent's reasoning, tool output, repository evidence, or completed work. The agent decides which supported candidates deserve durable retention; it does not preserve details merely to make arbitrary future questions answerable. Useful candidates include identities and ownership, durable relationships, preferences and standing instructions, decisions and rationale, requirements and invariants, conventions, stable project or environment facts, durable commitments and blockers, reusable operational knowledge, and deliberately classified Signals, Patterns, or Insights. Keep greetings, acknowledgements, reasoning chatter, raw conversation, transient progress, temporary paths, build logs, one-off task instructions, secrets, and prose/Markdown/source dumps out of the graph. Do not mirror an authoritative artifact when future work can derive the fact more safely and cheaply from that artifact. The reusable agent guide is [`skills/using-mindreader/SKILL.md`](skills/using-mindreader/SKILL.md).
-
-## Minimal write, recall, and walk example
-
-### Write one durable fact
-
-Call `write` with `facts[]` and an explicit visibility scope:
-
-```json
-{
-  "facts": [
-    {
-      "s": { "kind": "node", "name": "Alice" },
-      "p": "worksOn",
-      "o": { "kind": "node", "name": "mindreader" }
-    }
-  ],
-  "scope": ["project:graph-memory"]
-}
-```
-
-The response includes one Episode when any fact changed, plus per-item pasteable `target` handles.
-
-For a state with known world-time validity, add a timezone-qualified half-open interval. Omitted bounds are open:
-
-```json
-{
-  "facts": [
-    {
-      "s": { "kind": "node", "name": "Alice" },
-      "p": "livesIn",
-      "o": { "kind": "node", "name": "Lisbon" },
-      "effective": {
-        "from": "2024-01-01T00:00:00Z",
-        "to": "2026-01-01T00:00:00Z"
-      }
-    }
-  ],
-  "scope": ["project:graph-memory"]
-}
-```
-
-### Recall by text
-
-Call `recall` with the same scope, or a broader OR union:
-
-```json
-{
-  "text": "Alice",
-  "scope": ["project:graph-memory", "project:agent-runtime"]
-}
-```
-
-Each fact includes a `target` you can pass to `revise`, `withdraw`, `judge`, or `place`.
-
-For conceptual recall, use the separate provider-backed tool:
-
-```json
-{
-  "text": "graph memories about agent coordination",
-  "labels": ["Decision", "Constraint"],
-  "limit": 20,
-  "scope": ["project:graph-memory"]
-}
-```
-
-This is an input to `recall_semantic`. Ordinary `recall` never sends text outside Neo4j.
-
-### Walk from a returned IRI
-
-Call `recall` with `around` and optional predicate names:
-
-```json
-{
-  "around": "mindreader:element/alice",
-  "p": ["worksOn"],
-  "depth": 2,
-  "direction": "outgoing",
-  "scope": ["project:graph-memory"]
-}
-```
-
-For `around`, `p` constrains every traversed edge and `direction` is `both`
-(the default), `outgoing`, or `incoming` at every hop. `paths[i]` is the
-deterministic best witness path for `facts[i]`; its edges are compact
-`{iri,from,p,to}` records in detailed mode and answer-only `{from,p,to}` records
-in concise mode. Witness paths remain available in both modes. Intermediate
-path edges do not consume the requested fact limit. Witnesses passing through
-non-start nodes with more than 16 eligible edges receive a bounded hub penalty,
-so specific routes rank ahead of equally short routes through dense hubs.
-
-Reasserting the same current triple merges any missing requested memberships; it returns `"noop": true` only when those memberships are already present. Writing a different object adds another current value. Use `revise` when one exact current value is a correction of another.
-
-After a returned fact helps, strengthen its shared weight explicitly:
-
-```json
-{
-  "scope": ["project:graph-memory"],
-  "ratings": [
-    {
-      "target": {
-        "kind": "fact",
-        "iri": "mindreader:relationship/<returned-uuid>"
-      },
-      "mode": "strengthen"
-    }
-  ]
-}
-```
-
-To audit memberships independently of fact values, submit the related edits together:
-
-```json
-{
-  "scope": ["project:graph-memory"],
-  "edits": [
-    {
-      "target": {
-        "kind": "fact",
-        "iri": "mindreader:relationship/<returned-uuid>"
-      },
-      "add": ["team:shared"],
-      "remove": ["project:graph-memory"]
-    }
-  ]
-}
-```
-
-Both `judge` and `place` accept 1–20 input items, reject duplicate targets, and record exactly one Episode when the batch changes state. Any invalid item rolls back the whole batch; an all-noop place batch returns `episode:null`.
-
-## MCP tool reference
-
-All successful results include `ok:true`. Successful mutations include `noop` and `episode`, and scoped mutations echo `scope`; batch mutations include `summary:{requested,changed,noop}` plus input-ordered `items` with stable indexes, targets, statuses, and operation-specific fields. An all-noop mutation has `noop:true` and `episode:null`.
-
-Recoverable failures return an MCP `isError` result with `{ok:false,reason,message,retryable}` rather than JSON-RPC `-32602`; rate-limit responses may also include `retryAfterMs`. Retry only when `retryable:true`. Every scoped tool requires a `scope` array; permanent `unify` does not. [`src/server.rs`](src/server.rs) defines the advertised schemas, and [`src/service.rs`](src/service.rs) is the application boundary behind them. MCP handlers apply a 120/min burst-20 rate limit and a 45s invoke timeout after the database is already connected. Semantic recall fails closed with `reason: embedding_space` when the database marker or vector index does not match this process. Live MCP should keep Neo4j on `bolt://127.0.0.1:7687`. Smoke and bench use the isolated `tools` Compose profile on port 7688 so they cannot rewrite the MCP embedding space.
-
-| Tool | Required input | Optional input and defaults | Purpose |
-| --- | --- | --- | --- |
-| `recall` | `scope` and exactly one of `text`, `iris[]` (1–20 unique node IRIs), `labels[]`, `around`, `history` | `effectiveAt` for non-history, non-catalog reads; selector-specific `hops` (`0`\|`1`), `p[]`, `depth` (`1..=3`), `direction` (`both`\|`outgoing`\|`incoming`), `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Closed-world lookup of visible facts, nodes, compact witness paths, revision history, or the Class/Property catalog. Text combines an exact phrase with bounded OR-keyword matching and never calls an embedding provider. `effectiveAt` returns only explicitly qualified ordinary facts whose half-open interval contains that instant; structural edges remain traversable. `history` instead exposes transaction and effective clocks together. |
-| `recall_semantic` | `scope`, non-empty `text` (at most 32 KiB UTF-8) | unique non-empty `labels[]`, `effectiveAt`, `detail` (`concise`\|`detailed`, default `detailed`), `limit` (default `20`, max `100`) | Provider-backed conceptual recall that always fuses exact and keyword candidates with expiring semantic activations. `effectiveAt` filters direct, activation, and structural ordinary facts. Sends only query text to the configured embedding provider and creates no activation when no facts resolve. |
-| `write` | `facts[]` (1–20 triples), `scope` | per-fact `spike`, `contradicts` (`false`), `effective` (`null`) | Add set-valued triples or merge memberships. `effective` is an optional half-open world-time interval on ordinary state facts. One Episode if any fact changed. |
-| `revise` | `scope`, fact `target`, `replacement` | `spike`, `contradicts`, `reason`, `effective` (omitted inherits; `null` clears; object replaces) | Move selected memberships from one current fact to its correction atomically. Returns the new current `target` and retired `previousTarget`. |
-| `withdraw` | `scope` and either fact `target` or `subject` | `p`, `reason` | Soft-withdraw a fact or subject/predicate slice and return a `withdrawn` count plus `withdrawnTargets`. |
-| `judge` | `scope`, `ratings[]` (1–20 unique targets) | None | Apply exactly `+1` or `-1` per visible node/current fact in one transaction and one Episode. |
-| `place` | `scope`, `edits[]` (1–20 unique targets) | Per edit: `add`, `remove` (at least one) | Apply node/current-fact membership changes atomically after validating final endpoint closure. |
-| `unify` | same-kind `source` and `target` node handles | None | Permanently merge two user-visible non-literal nodes; the target IRI and name survive. |
-
-Mutations and detailed recall include a `handles` bag. Detailed fact envelopes include `current`, `rateable`, and `mutable` for the request `scope`. Concise recall instead returns answer-bearing triples and selector-specific evidence without handles, ranking, memberships, or operation eligibility; it retains `spike`, truncation, around witness paths, history state/revisions, catalog nodes, and IRI lookup status. Paste only the returned `{kind, iri}` handle into a mutation, not the containing fact or node. Persisted literal endpoints also carry a `{kind:"node", iri}` handle; use it when a `place` batch must add or remove the literal's memberships for endpoint closure. `write` and `revise` return neutral review queues. `review.unify` keeps `source` and `target` as exact pasteable `{kind:"node", iri}` handles and provides `sourceName` / `targetName` alongside them for review. `review.alternatives` reports other visible current values for inspection; set-valued alternatives are not automatically corrections.
-
-`recall` rejects empty selectors and fields that do not apply to its selected mode. Omit selector-specific `hops`, `p`, `depth`, and `direction` outside that mode; their runtime defaults are intentionally not advertised as JSON Schema defaults, so hosts do not fill them into unrelated calls. `labels: ["Class"]` or `["Property"]` is a catalog into `nodes[]`, not ranked facts. `effectiveAt` is rejected for catalog and `history` selectors. Neighborhood predicate/direction constraints and deterministic hub-aware ordering happen before the result limit. `iris` applies `limit` per requested IRI and reports `lookups[i].truncated`; `around` still uses one fact budget for the walk.
-
-MCP annotations explicitly describe host-facing risk. Ordinary recall is read-only and closed-world. Semantic recall is additive, non-idempotent, and open-world because it contacts the configured provider and maintains activations. Write is additive and idempotent; place is destructive but idempotent; judge is destructive and non-idempotent. Revise, withdraw, and unify use conservative destructive, non-idempotent, closed-world hints. These hints help a host present consent UI, but Mindreader still validates every call.
-
-### Writing values
-
-Subjects and entity objects use an explicit `kind` tag and require `iri` or `name`. Node objects must not contain literal `value` or `datatype` fields:
-
-```json
-{ "kind": "node", "iri": "mindreader:element/alice", "labels": ["Element"] }
-```
-
-Literal objects use the `literal` tag, require `value`, and must not contain node `iri`, `name`, or `labels` fields. Omitted `datatype` means `xsd:string`:
-
-```json
-{
-  "kind": "literal",
-  "value": "2026-08-15",
-  "datatype": "xsd:date"
-}
-```
-
-All mutation inputs are tagged objects at both the MCP and runtime boundaries. Their advertised schemas deliberately avoid union keywords such as `anyOf` and `oneOf` for compatibility with strict MCP hosts.
-
-An exact correction pastes the selected current fact handle and supplies the replacement object:
-
-```json
-{
-  "scope": ["project:graph-memory"],
-  "target": {
-    "kind": "fact",
-    "iri": "mindreader:relationship/<returned-uuid>"
-  },
-  "replacement": { "kind": "node", "name": "new-project" },
-  "reason": "corrected assignment"
-}
-```
-
-On `revise`, omitting `effective` preserves the selected fact's complete effective interval, an explicit `null` clears temporal qualification, and an interval object replaces it. Structural and system relationships do not accept effective intervals.
-
-Withdrawal accepts either one pasteable fact `target`, or a `subject` node IRI with an optional predicate `p`. The forms are mutually exclusive, and `p` is invalid with `target`. Subject and predicate slices are intentionally broad. Subject-wide withdrawal still protects structural and system-owned relationships and does not withdraw relationships whose endpoints are Classes or Properties.
-
-`spike` is a commitment level on one exact fact along `Signal → Pattern → Insight → Knowledge`: raw evidence, a recurring observation, an interpretation, then a fact worth relying on. It is stored on the relationship, never labels the subject, and never creates another relationship. Do not auto-promote. Exact reassertion preserves an existing classification when `spike` is omitted and reclassifies only that fact when `spike` is explicit. Revision likewise preserves the retired fact's classification unless the replacement supplies one.
-
-`ABOUT` is explicit context, not a generated duplicate. Write `p:"ABOUT"` only when the relationship genuinely means that one node concerns another. Explicit `ABOUT` edges can contribute Spike context and appear in detailed recall's top-level `about[]`, but they never appear in ordinary `facts[]`, neighborhood/history facts, or semantic activation bundles.
-
-### Fixed relationship types
-
-Mindreader stores the following fixed relationship types:
-
-```text
-INSTANCE_OF, SUBCLASS_OF, SUBPROPERTY_OF, DOMAIN, RANGE,
-ASSERTS, ABOUT, EVIDENCE_FOR, DERIVED_FROM, SUPPORTS,
-CONTRADICTS, SUPERSEDES
-```
-
-Properties outside the structural set are stored as `ASSERTS` relationships with a `propertyIri`. `ABOUT` is context-only and excluded from ordinary neighborhood traversal.
-
-## Memory model
-
-Use this section to understand behavior and invariants. For exact request fields and limits, use the [MCP tool reference](#mcp-tool-reference). The implementation lives primarily in [`src/tools.rs`](src/tools.rs), [`src/search.rs`](src/search.rs), [`src/semantic.rs`](src/semantic.rs), and [`src/merge.rs`](src/merge.rs).
-
-### Layers
-
-Request `scope` is a flashlight: which records this call can see. Record `scope` is membership: where the node or fact lives. On `write` and `revise`, the request also becomes the new record's membership. On `place`, the request is visibility only; each edit's `add` / `remove` is the membership change.
-
-The required `scope` array is an OR union. A named record is visible when any membership intersects the requested names. Empty stored memberships mean global, so global records are visible in every named scope. An empty request selects only those global records:
-
-```json
-{ "scope": [] }
-```
-
-Visibility is not the right to change a global record. A global fact can appear under `["project:graph-memory"]` and still require `scope: []` for `revise` or `withdraw`.
-
-Layer IDs match lowercase kebab-case segments separated by colons, such as `project:graph-memory` or `analysis:hypothesis`. Colons provide naming namespaces, not hierarchy. Graph storage uses a `layers` property, but the public MCP request field is always `scope`.
-
-Nodes and relationships both carry memberships. A relationship is returned only when the relationship and both endpoints are visible in the request scope; traversal applies that closure to every path. Assertions inherit memberships onto endpoints. One exact `(subject, property, object, effective qualification, effective interval)` has one current relationship identity across all memberships: reasserting it with another named layer merges that membership rather than creating a duplicate relationship. The same triple at distinct intervals has distinct fact handles. An existing global relationship stays global.
-
-For named memberships, `revise` and `withdraw` affect only memberships visible in the requested scope; an old fact becomes historical only after its last membership is removed. It does not become global. `place` is the opposite: removing a target's last named membership stores `[]` and therefore makes it global. To move a record between named layers, add the destination and remove the source in the same edit.
-
-`place` audits 1–20 membership edits in one transaction, records one state-changing `place` Episode, never propagates edits implicitly, and validates relationship endpoint closure against the batch's final combined state.
-
-Layers are visibility filters, not tenant isolation. Anyone with MCP access can request any valid layer name. Use separate Neo4j databases when you need a hard data-isolation boundary.
-
-### Current facts, corrections, and contradictions
-
-Ordinary assertions are set-valued. The same `(subject, property, object, effective interval)` is idempotent apart from membership merges. A different object or effective interval becomes another current fact.
-
-| Intent | Tool |
-| --- | --- |
-| Keep both values | `write` |
-| This value is wrong; replace it | `revise` on the exact fact `target` |
-| This value is stale; no replacement | `withdraw` |
-| Both values stay current, and they cannot both be right | `contradicts: true` on the write or revision |
-
-`review.alternatives` lists other visible current values. It does not mean "revise this." `CONTRADICTS` and `SUPERSEDES` are system-owned: never send them as `p`.
-
-### Effective time and transaction time
-
-Mindreader keeps two independent clocks:
-
-- **Transaction time** records when Mindreader learned or changed a relationship. `validFrom`, `validTo`, and `Episode.at` are server wall-clock timestamps and drive current/history behavior.
-- **Effective time** records when an ordinary state fact holds in the represented world. `effective` is an optional half-open interval `[from,to)` with inclusive `from`, exclusive `to`, and open omitted bounds. Timestamps must be timezone-qualified RFC 3339 and are normalized to UTC.
-
-`effective: null` or an omitted field means unknown world time, while `{}` means an explicitly qualified interval open in both directions. These are different fact identities. Passing `effectiveAt` to lexical, IRI, neighborhood, or semantic recall returns only explicitly qualified ordinary facts containing that instant; unknown-time facts are intentionally excluded. It filters transaction-current knowledge and never resurrects a relationship retired by revision or withdrawal. Use `history` to inspect retired knowledge; `history` rejects `effectiveAt` and returns `transactionCurrent`, `transaction:{from,to}`, and `effective` together.
-
-Use effective intervals for states such as residence, employment, ownership, status, or configuration. Model a point or repeatable occurrence as an event node with explicit date/time facts and relationships to its participants; do not manufacture a zero-length state interval. Newer evidence does not silently truncate an existing interval or overwrite a current value. Revise the exact old handle only when the evidence establishes a correction, and preserve compatible parallel values.
-
-### Feedback and ranking
-
-`spike` is a per-fact commitment level, not an NLP class or node label: `Knowledge` is worth relying on, `Pattern` is a recurring observation, `Insight` is an interpretation, `Signal` is raw evidence. Do not auto-promote.
-
-Weight is a shared signed integer, not confidence and not recency. Only `judge` changes it, by exactly `+1` or `-1` per rating. Retrieval never updates weight. There is no decay. Judgment can arrive in a later turn.
-
-Pass 1–20 unique recalled node or current-fact targets with `mode:"strengthen"` or `mode:"weaken"` and the retrieval scope. Search first orders facts by their own Spike category, falling back to the strongest explicit classified `ABOUT` context on the subject (`Knowledge > Insight > Pattern > Signal`), then by the combined subject + relationship + object weight *within* a category, then by text relevance. Weaken retrieval quality; correct or withdraw a false fact. A judgment batch is atomic, records one `judge` Episode, and rolls back if any rating is invalid.
-
-Search computes that complete ordering in Neo4j before applying the fact limit, so selective and common queries use the same ranking contract. The top-level `about` array contains at most the requested fact limit of explicit classified `ABOUT` context entries for endpoints in the returned ordinary facts; it is not an unbounded summary or another copy of `facts[]`.
-
-Text retrieval runs two safe full-text channels over nodes and facts: the escaped whole query as an exact phrase and up to 16 unique Unicode-alphanumeric keyword tokens joined by application-generated `OR`. Tokens are lowercased, preserve first occurrence, require at least four Unicode characters, and skip terms over 64 UTF-8 bytes. This language-agnostic length floor removes most grammatical glue without maintaining language-specific stopword lists; shorter technical terms still use the exact-phrase channel. The exact phrase is weighted twice as strongly as the keyword channel. A fact's own indexed text is the primary lexical score; matching endpoint nodes are a fallback only when that relationship has no direct text evidence, so one popular endpoint cannot give every incident edge the same relevance. Queries over 512 bytes skip the exact phrase but retain bounded keyword retrieval. User text remains a parameter and cannot supply raw Lucene operators.
-
-### Semantic recall
-
-`recall_semantic` embeds the query with one external provider, runs the exact-plus-keyword direct search, retrieves nearby semantic activations from Neo4j's cosine vector index, resolves their relationship IRIs against the current graph and requested scope, and combines the rankings with weighted reciprocal-rank fusion. Exact relationship matches have weight `2.0` by default. Keyword relationship evidence has weight `0.5 × c`, where `c` is the fraction of the bounded unique query tokens present in that fact's indexed text. Endpoint-only lexical fallback remains useful to ordinary recall but contributes no direct semantic evidence. An admitted activation with cosine similarity `s` and threshold `t` contributes threshold-relative evidence `keyword_weight × clamp((s - t) / (1 - t), 0, 1)`: evidence is zero at the admission floor and cannot exceed the keyword channel. A rank-one activation-only fact therefore cannot outrank a rank-one complete-keyword fact; direct evidence wins an exact score tie. Only the strongest activation contribution per fact is retained, preventing repeated related activations from gaining popularity merely by accumulation.
-
-Learned bundles retain up to three strongly grounded direct facts instead of caching an entire response page: an exact relationship match or complete keyword coverage may teach a bundle, while partial keyword coverage may rank proportionally but cannot teach. Selection preserves fused order but admits at most two from one exact `(subject IRI, property IRI)` group when another group is available; a single available group can still fill all three slots. Activation-only recall can return and refresh an existing learned bundle, but it cannot create or rewrite one. This prevents recalled results from recursively becoming new semantic evidence. The default RRF `k` of `15` preserves useful differences within these short bundles, while the default activation recall threshold is `0.65`. Semantic result `score` is the final fused score. This gives untouched topics a lexical cold-start path while later paraphrases can reuse the learned activation bundle. Recalled facts must still be current, match optional `labels`, satisfy relationship-and-endpoint visibility in `scope`, and contain `effectiveAt` when that filter is supplied.
-
-After direct and activation evidence identifies grounded anchor facts, semantic recall may add their visible one-hop `ASSERTS` neighbors as ephemeral structural context. It expands at most 16 anchors and 16 facts per anchor endpoint. For anchor evidence `A`, visible endpoint degree `d`, and the number `g` of bounded adjacent candidates sharing the same anchor and property, structural evidence is `A × 0.25 / √(d × g)`. This caps an unpenalized structural route at the strongest standalone keyword or activation contribution; any graph penalty makes it weaker. Only the strongest route to a structural fact is retained; structural evidence never boosts a fact that already has direct or activation evidence and cannot outrank its anchor. Expanded facts are returned normally but never enter activation bundles, refresh activations, or teach later queries. Scope, optional labels, current-fact checks, and endpoint closure apply during expansion; `ABOUT` remains excluded.
-
-An activation is a versioned internal TTL node containing only an embedding vector, a ranked `resultRefs` list of stable relationship IRIs, and an expiry timestamp. A query that resolves no facts returns an empty result without creating an activation. Every recalled activation that contributes at least one currently resolvable fact refreshes its TTL. A query with direct evidence converges into a sufficiently similar overlapping activation or creates a new one; an activation-only query does neither. Ranking revisions isolate incompatible learned bundles without touching durable facts. The default TTL is 30 days. Expired activations are excluded immediately and APOC Extended removes them in the background. Activation maintenance does not create an `Episode` or change feedback weights.
-
-The embedding provider, model, and dimensions define one vector space for the database. If that selection changes, Mindreader discards only the ephemeral activations and recreates their vector index; durable graph memory remains intact. Semantic search requires an embedding key, but all other tools remain usable without one.
-
-### Provenance and history
-
-Each state-changing mutation creates one `Episode` with its canonical tool name (`write`, `revise`, `withdraw`, `judge`, `place`, or `unify`) and transaction timestamp; no-op mutations create none. Internal semantic-activation maintenance is excluded. Relationships carry the episode identifier. Withdrawal sets transaction-time `validTo` and optionally records a reason; it does not delete graph nodes. Effective intervals never replace these audit fields. `CONTRADICTS` and `SUPERSEDES` are system-owned history predicates and cannot be written, revised, or withdrawn directly.
-
-`revise` is the correction operation: it moves only the selected memberships from the requested old fact, preserves unrelated current values and memberships, and creates `SUPERSEDES` history in one Neo4j transaction. Its Episode records the exact previous fact, replacement fact, selected scope, and non-actionable system edge. Its result exposes the replacement as `target` and the retired handle as `previousTarget`. `recall` with `history` returns current and `validTo` facts plus newest-first `revisions[]` entries containing pasteable previous/replacement fact handles and audit-only `SUPERSEDES` metadata. Revision history is a directed event graph and may branch.
-
-Mutations acquire deterministic graph locks and retry Neo4j transient transaction failures with bounded backoff. Commit failures are never retried because the write may already have applied.
-
-`CONTRADICTS` is multi-valued. Setting `contradicts: true` on a write or revision records explicit links to conflicting visible current objects.
-
-`unify` is the intentional destructive exception to soft history: it requires matching canonical kinds and removes the source node after moving its memberships and current and historical relationships onto the target. Bootstrap-seeded Class and Property IRIs are permanent targets and cannot be sources. It records exactly one `unify` Episode, preserves the target IRI and name, combines memberships and weights, marks moved relationships with unification provenance, and soft-closes unification-created self-relations and duplicate facts. Unifying Properties rewrites their predicate references and refreshed search text transactionally, but both Properties must use the same structural relationship representation; system-owned `CONTRADICTS` and `SUPERSEDES` Properties cannot be unified. It creates no alias. Review the direction before calling it.
-
-### IRI and record identity
-
-Mindreader accepts explicit IRIs or deterministically derives the following IRIs from names and literal values:
-
-| Kind | Pattern | Slug case |
-| --- | --- | --- |
-| Class | `mindreader:class/<slug>` | Preserved |
-| Property | `mindreader:property/<slug>` | Preserved |
-| Element | `mindreader:element/<slug>` | Lowercase |
-| Literal | `mindreader:literal/<slug>-<hash>` | Lowercase |
-
-Slug normalization keeps ASCII letters, numbers, `.`, `_`, and `-`; replaces other runs with `-`; trims surrounding dashes; and falls back to `unnamed`. Literal identity includes its datatype and value.
-
-Episodes use generated `mindreader:episode/<uuid>` IRIs. Relationships use generated `mindreader:relationship/<uuid>` IRIs. These UUID-based identities are not name-derived, but they remain stable after creation and appear in retrieval results and provenance.
+The short version is the four-step loop described above: recall when prior knowledge matters, do the work, capture only durable outcomes, and explicitly maintain knowledge when it changes.
 
 ## Security and trust boundary
 
