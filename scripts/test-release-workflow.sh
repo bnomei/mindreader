@@ -25,9 +25,9 @@ for validation in 'git show-ref --verify --quiet' '^{commit}' 'git rev-parse HEA
   }
 done
 
-version="$(GITHUB_REF_NAME=main scripts/resolve-version.sh)"
-RELEASE_TAG="v$version" scripts/resolve-version.sh >/dev/null
-if RELEASE_TAG=main scripts/resolve-version.sh >/dev/null 2>&1; then
+version="$(GITHUB_OUTPUT= GITHUB_REF_NAME=main scripts/resolve-version.sh)"
+GITHUB_OUTPUT= RELEASE_TAG="v$version" scripts/resolve-version.sh >/dev/null
+if GITHUB_OUTPUT= RELEASE_TAG=main scripts/resolve-version.sh >/dev/null 2>&1; then
   echo "Expected an explicit non-tag release ref to fail validation" >&2
   exit 1
 fi
