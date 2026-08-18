@@ -720,7 +720,7 @@ The benchmark refuses any database that is not pristine after model-v9 bootstrap
 Use Divan for graph-free CPU regressions:
 
 ```bash
-cargo bench --bench cpu_hotspots
+cargo bench --features developer-tools --bench cpu_hotspots
 ```
 
 The normalization matrix covers dimensions 3, 256, 512, 1536, 3072, and 4096. Keep array work sequential unless a supported workload demonstrates a parallel crossover without changing deterministic output.

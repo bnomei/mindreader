@@ -88,3 +88,4 @@ tempfile = "3.27.0"
 [[bench]]
 name = "cpu_hotspots"
 harness = false
+required-features = ["developer-tools"]

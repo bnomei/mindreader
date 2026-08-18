@@ -420,6 +420,17 @@ fn lucene_exact_query(text: &str) -> String {
     }
 }
 
+/// Build exact and fallback queries without executing an identical keyword channel twice.
+fn lucene_search_queries(text: &str) -> (String, String) {
+    let exact = lucene_exact_query(text);
+    let keyword = lucene_keyword_query(text);
+    if keyword == exact {
+        (exact, NO_MATCH_QUERY.into())
+    } else {
+        (exact, keyword)
+    }
+}
+
 /// Phrase-quote user text and escape Lucene operators so they stay literals.
 fn lucene_escape(text: &str) -> String {
     let mut out = String::from("\"");
@@ -722,9 +733,10 @@ pub(crate) async fn memory_search_with_matches(
         .param("maxWeight", i64::MAX)
         .param("effectiveAt", effective_at);
     if text_mode {
+        let (exact_query, keyword_query) = lucene_search_queries(&trimmed);
         ranked = ranked
-            .param("qExact", lucene_exact_query(&trimmed))
-            .param("qKeywords", lucene_keyword_query(&trimmed))
+            .param("qExact", exact_query)
+            .param("qKeywords", keyword_query)
             .param("exactTextWeight", EXACT_TEXT_WEIGHT)
             .param("keywordTextWeight", KEYWORD_TEXT_WEIGHT)
             .param("predicateName", trimmed.clone())
@@ -819,8 +831,8 @@ pub(crate) async fn memory_search_with_matches(
 mod tests {
     use super::{
         fact_handle_iri, keyword_coverage, keyword_tokens, lucene_escape, lucene_exact_query,
-        lucene_keyword_query, lucene_query, ranked_query, validate_recall_args, RecallArgs,
-        MAX_EXACT_PHRASE_BYTES, MAX_KEYWORD_TOKENS,
+        lucene_keyword_query, lucene_query, lucene_search_queries, ranked_query,
+        validate_recall_args, RecallArgs, MAX_EXACT_PHRASE_BYTES, MAX_KEYWORD_TOKENS,
     };
     use serde_json::json;
 
@@ -843,6 +855,17 @@ mod tests {
         assert_eq!(
             lucene_exact_query(&"x".repeat(MAX_EXACT_PHRASE_BYTES + 1)),
             super::NO_MATCH_QUERY
+        );
+        assert_eq!(
+            lucene_search_queries("common"),
+            ("\"common\"".into(), super::NO_MATCH_QUERY.into())
+        );
+        assert_eq!(
+            lucene_search_queries("common benchmark"),
+            (
+                "\"common benchmark\"".into(),
+                "\"common\" OR \"benchmark\"".into()
+            )
         );
         assert!(ranked_query(true).contains("r.propertyIri = p.iri"));
         assert!(ranked_query(true).contains("$qExact"));
