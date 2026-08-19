@@ -1,6 +1,6 @@
 {
   "name": "@bnomei/mindreader",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Selective, explicit Neo4j graph memory for AI agents.",
   "homepage": "https://github.com/bnomei/mindreader",
   "repository": {

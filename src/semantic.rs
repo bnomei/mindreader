@@ -52,7 +52,7 @@ pub struct SemanticSearchArgs {
     /// Optional labels used to filter fused facts; catalog labels are not special here.
     #[serde(default)]
     pub labels: Option<Vec<String>>,
-    /// `concise` or `detailed`; omitted defaults to detailed.
+    /// `concise` or `detailed`; omitted defaults to concise.
     #[serde(default)]
     pub detail: Option<String>,
     /// Maximum fused facts; default 20, at most 100.

@@ -17,7 +17,7 @@ Use host-exposed fully qualified tool names such as `mindreader:recall`. Treat e
 2. Recall at the start of resumed or context-sensitive work, and before a consequential decision that prior knowledge could change. Reuse facts, IRIs, and handles already in context; otherwise make one targeted recall.
 3. Do the work. Treat recalled relationships as evidence only for what they assert.
 4. When work establishes durable reusable knowledge, select standalone supported triples and make the smallest correct mutation. Batch related items.
-5. Keep returned handles, trust a successful structured result, and stop.
+5. Trust a successful structured result and stop. Request detailed output only when the next action needs metadata omitted from the concise default.
 
 Do not cascade recall modes. Retry once only for a plausible terminology or neighborhood miss; use semantic recall only when conceptual matching is needed and provider disclosure is acceptable. Do not verify a successful mutation unless its result leaves the postcondition unclear or the change is broad or consequential.
 
@@ -61,7 +61,7 @@ Use one mode that directly matches the need:
 - `around` starts at a node IRI. Direction, depth, and predicate filters constrain every traversed edge. Omit a predicate filter until stored vocabulary is known. Paths witness returned facts; they are not additional assertions.
 - `history` accepts one node or exact fact IRI and returns current and retired facts plus revision events. Supersession edges are audit metadata, not mutation targets.
 
-Use `detail:"concise"` for answer-bearing content. Use `detail:"detailed"` when handles, memberships, ranking, mutability, rateability, paths, or audit context can affect the next action. A global fact visible through a named scope is not mutable there.
+All tools default to `detail:"concise"`. Use `detail:"detailed"` when handles, memberships, ranking, mutability, rateability, paths, per-item changes, or audit context can affect the next action. A global fact visible through a named scope is not mutable there.
 
 ABOUT is explicit classified context. Detailed text recall may return it separately in `about[]`; it is not an ordinary, neighborhood, history, or semantic fact.
 
@@ -145,3 +145,5 @@ Use `mindreader:judge` only after a recalled node or current fact materially hel
 ## Handle results
 
 Mutation batches are atomic and record at most one Episode; an all-noop mutation records none. Retry only when `retryable` is true and honor `retryAfterMs`; otherwise fix the input or precondition rather than repeating the call. Never repeat non-idempotent `judge` or permanent `unify` merely because their effect is uncertain.
+
+Concise mutation results are acknowledgements rather than complete graph envelopes. `write` returns fact targets and no-op status, resolved node handles, an Episode IRI when changed, and non-empty advisory review. Other concise mutations retain their postcondition summary or affected targets. Ask for `detail:"detailed"` before the call only when full endpoint records, memberships, before/after values, or the complete handles bag are required.

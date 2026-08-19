@@ -1,6 +1,6 @@
 {
   "name": "mindreader",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Agent-driven durable Neo4j graph memory for MCP: proactive recall, bitemporal state facts, and explicit capture without hidden extraction",
   "transport": {
     "type": "stdio",

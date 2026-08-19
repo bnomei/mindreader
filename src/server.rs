@@ -12,7 +12,7 @@ use crate::domain::DomainError;
 use crate::error::{Error, Result as AppResult};
 use crate::graph;
 use crate::merge::UnifyArgs;
-use crate::payload::ToolOutput;
+use crate::payload::{Detail, ToolOutput};
 use crate::search::RecallArgs;
 use crate::semantic::{SemanticSearchArgs, MAX_SEMANTIC_TEXT_BYTES};
 use crate::service::MemoryService;
@@ -27,6 +27,7 @@ use rmcp::{
     service::RequestContext,
     tool, tool_handler, tool_router, RoleServer, ServerHandler,
 };
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::borrow::Cow;
 use std::error::Error as StdError;
@@ -47,6 +48,15 @@ const IRI_PATTERN: &str = "^[A-Za-z][A-Za-z0-9+.-]*:";
 const FACT_IRI_PATTERN: &str = "^mindreader:relationship/";
 /// At least one non-whitespace character; stricter semantics remain runtime-validated.
 const NON_WHITESPACE_PATTERN: &str = r"\S";
+
+/// MCP-only mutation envelope: presentation detail is not part of graph semantics.
+#[derive(Debug, Deserialize)]
+struct MutationParameters<T> {
+    #[serde(flatten)]
+    args: T,
+    #[serde(default)]
+    detail: Option<String>,
+}
 /// Protocol versions this process will negotiate; initialize rejects anything else.
 ///
 /// `2026-07-28` is preferred. `2025-11-25` is accepted so hosts that have not
@@ -276,7 +286,8 @@ fn schema_memory_write() -> Arc<rmcp::model::JsonObject> {
                     "required": ["s", "p", "o"]
                 }
             },
-            "scope": scope_schema()
+            "scope": scope_schema(),
+            "detail": detail_schema()
         },
         "required": ["facts", "scope"]
     }))
@@ -442,6 +453,13 @@ fn fact_schema() -> Value {
     })
 }
 
+/// Write fact item supporting both compact acknowledgements and detailed envelopes.
+fn mutation_fact_schema() -> Value {
+    let mut schema = fact_schema();
+    schema["required"] = json!(["target"]);
+    schema
+}
+
 /// Recall fact items; `target` and operation flags are optional so concise payloads stay valid.
 fn recall_fact_schema() -> Value {
     let mut schema = fact_schema();
@@ -487,7 +505,7 @@ fn episode_schema() -> Value {
                 ]
             }
         },
-        "required": ["iri", "at", "tool"]
+        "required": ["iri"]
     })
 }
 
@@ -538,13 +556,13 @@ fn handles_schema() -> Value {
     })
 }
 
-/// Recall verbosity: answer-only `concise` or operation-ready `detailed`.
+/// Tool result verbosity: compact `concise` or audit-ready `detailed`.
 fn detail_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["concise", "detailed"],
-        "default": "detailed",
-        "description": "concise returns answer-bearing graph content without handles, ranking, memberships, or operation eligibility. detailed is the full operation and audit envelope."
+        "default": "concise",
+        "description": "concise minimizes result tokens and is the default. detailed returns the full operation and audit envelope, including handles, memberships, and per-item metadata."
     })
 }
 
@@ -736,6 +754,25 @@ impl Mindreader {
                 "tool invoke exceeded 45 seconds",
             )),
         }
+    }
+
+    /// Parse result verbosity and compact one mutation after the typed service call.
+    async fn invoke_mutation<F, Fut>(
+        &self,
+        tool: &'static str,
+        detail: Option<String>,
+        op: F,
+    ) -> Result<CallToolResult, McpError>
+    where
+        F: FnOnce(MemoryService) -> Fut,
+        Fut: std::future::Future<Output = AppResult<ToolOutput>>,
+    {
+        let detail = match Detail::parse(detail.as_deref()) {
+            Ok(detail) => detail,
+            Err(error) => return Ok(map_tool_result(Err(error))),
+        };
+        self.invoke(|service| async move { op(service).await?.with_mutation_detail(tool, detail) })
+            .await
     }
 }
 
@@ -983,7 +1020,8 @@ fn schema_memory_revise() -> Arc<rmcp::model::JsonObject> {
                 "description": "Set true only when the replacement and visible current alternatives are directly incompatible and should remain current."
             },
             "reason": { "type": "string", "description": "Optional audit reason for the correction." },
-            "effective": effective
+            "effective": effective,
+            "detail": detail_schema()
         },
         "required": ["scope", "target", "replacement"]
     }))
@@ -1003,7 +1041,8 @@ fn schema_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
                 "minLength": 1,
                 "description": "Exact predicate name or Property IRI limiting a subject withdrawal. Invalid with target; omitting it withdraws the subject's entire mutable outgoing slice."
             },
-            "reason": { "type": "string", "description": "Optional audit reason." }
+            "reason": { "type": "string", "description": "Optional audit reason." },
+            "detail": detail_schema()
         },
         "required": ["scope"]
     }))
@@ -1035,7 +1074,8 @@ fn schema_memory_judge() -> Arc<rmcp::model::JsonObject> {
                     },
                     "required": ["target", "mode"]
                 }
-            }
+            },
+            "detail": detail_schema()
         },
         "required": ["scope", "ratings"]
     }))
@@ -1064,7 +1104,8 @@ fn schema_memory_place() -> Arc<rmcp::model::JsonObject> {
                     },
                     "required": ["target"]
                 }
-            }
+            },
+            "detail": detail_schema()
         },
         "required": ["scope", "edits"]
     }))
@@ -1077,7 +1118,8 @@ fn schema_memory_unify() -> Arc<rmcp::model::JsonObject> {
         "additionalProperties": false,
         "properties": {
             "source": node_handle_schema("Same-kind node that will be permanently absorbed and removed."),
-            "target": node_handle_schema("Same-kind surviving node whose IRI and name remain. Review this direction before calling.")
+            "target": node_handle_schema("Same-kind surviving node whose IRI and name remain. Review this direction before calling."),
+            "detail": detail_schema()
         },
         "required": ["source", "target"]
     }))
@@ -1181,10 +1223,12 @@ fn schema_out_memory_recall_semantic() -> Arc<rmcp::model::JsonObject> {
 /// Write output: one Episode when changed, written facts, and advisory review.
 fn schema_out_memory_write() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "scope": scope_schema(),
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
-        "facts": { "type": "array", "items": fact_schema() },
+        "facts": { "type": "array", "items": mutation_fact_schema() },
+        "nodes": { "type": "array", "items": node_handle_schema("Resolved node handle.") },
         "review": review_schema(),
         "handles": handles_schema()
     })))
@@ -1193,6 +1237,7 @@ fn schema_out_memory_write() -> Arc<rmcp::model::JsonObject> {
 /// Revise output: current and previous fact handles plus optional replacement body.
 fn schema_out_memory_revise() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "scope": scope_schema(),
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
@@ -1207,6 +1252,7 @@ fn schema_out_memory_revise() -> Arc<rmcp::model::JsonObject> {
 /// Withdraw output: soft-retired fact handles; Episode is null when nothing changed.
 fn schema_out_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "scope": scope_schema(),
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
@@ -1220,6 +1266,7 @@ fn schema_out_memory_withdraw() -> Arc<rmcp::model::JsonObject> {
 /// Judge output: per-rating before/after weights and a single Episode.
 fn schema_out_memory_judge() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "scope": scope_schema(),
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
@@ -1248,6 +1295,7 @@ fn schema_out_memory_judge() -> Arc<rmcp::model::JsonObject> {
 /// Place output: per-edit before/after memberships and a single Episode if any changed.
 fn schema_out_memory_place() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "scope": scope_schema(),
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
@@ -1276,6 +1324,7 @@ fn schema_out_memory_place() -> Arc<rmcp::model::JsonObject> {
 /// Unify output: surviving node after a permanent same-kind merge.
 fn schema_out_memory_unify() -> Arc<rmcp::model::JsonObject> {
     schema_out(props(json!({
+        "detail": { "type": "string", "enum": ["concise", "detailed"] },
         "noop": { "type": "boolean" },
         "episode": episode_schema(),
         "node": node_schema(),
@@ -1329,10 +1378,12 @@ impl Mindreader {
     )]
     async fn write(
         &self,
-        Parameters(args): Parameters<WriteArgs>,
+        Parameters(request): Parameters<MutationParameters<WriteArgs>>,
     ) -> Result<CallToolResult, McpError> {
-        self.invoke(|service| async move { service.write(args).await })
-            .await
+        self.invoke_mutation("write", request.detail, |service| async move {
+            service.write(request.args).await
+        })
+        .await
     }
 
     #[tool(
@@ -1345,10 +1396,12 @@ impl Mindreader {
     )]
     async fn revise(
         &self,
-        Parameters(args): Parameters<ReviseArgs>,
+        Parameters(request): Parameters<MutationParameters<ReviseArgs>>,
     ) -> Result<CallToolResult, McpError> {
-        self.invoke(|service| async move { service.revise(args).await })
-            .await
+        self.invoke_mutation("revise", request.detail, |service| async move {
+            service.revise(request.args).await
+        })
+        .await
     }
 
     #[tool(
@@ -1361,10 +1414,12 @@ impl Mindreader {
     )]
     async fn withdraw(
         &self,
-        Parameters(args): Parameters<WithdrawArgs>,
+        Parameters(request): Parameters<MutationParameters<WithdrawArgs>>,
     ) -> Result<CallToolResult, McpError> {
-        self.invoke(|service| async move { service.withdraw(args).await })
-            .await
+        self.invoke_mutation("withdraw", request.detail, |service| async move {
+            service.withdraw(request.args).await
+        })
+        .await
     }
 
     #[tool(
@@ -1377,10 +1432,12 @@ impl Mindreader {
     )]
     async fn judge(
         &self,
-        Parameters(args): Parameters<JudgeArgs>,
+        Parameters(request): Parameters<MutationParameters<JudgeArgs>>,
     ) -> Result<CallToolResult, McpError> {
-        self.invoke(|service| async move { service.judge(args).await })
-            .await
+        self.invoke_mutation("judge", request.detail, |service| async move {
+            service.judge(request.args).await
+        })
+        .await
     }
 
     #[tool(
@@ -1393,10 +1450,12 @@ impl Mindreader {
     )]
     async fn place(
         &self,
-        Parameters(args): Parameters<PlaceArgs>,
+        Parameters(request): Parameters<MutationParameters<PlaceArgs>>,
     ) -> Result<CallToolResult, McpError> {
-        self.invoke(|service| async move { service.place(args).await })
-            .await
+        self.invoke_mutation("place", request.detail, |service| async move {
+            service.place(request.args).await
+        })
+        .await
     }
 
     #[tool(
@@ -1409,10 +1468,12 @@ impl Mindreader {
     )]
     async fn unify(
         &self,
-        Parameters(args): Parameters<UnifyArgs>,
+        Parameters(request): Parameters<MutationParameters<UnifyArgs>>,
     ) -> Result<CallToolResult, McpError> {
-        self.invoke(|service| async move { service.unify(args).await })
-            .await
+        self.invoke_mutation("unify", request.detail, |service| async move {
+            service.unify(request.args).await
+        })
+        .await
     }
 }
 
@@ -1453,15 +1514,16 @@ impl ServerHandler for Mindreader {
 mod tests {
     use super::{
         classify_tool_error, map_connect_error, map_tool_result, require_supported_protocol,
-        structured_error, Mindreader, TokenBucket, FACT_IRI_PATTERN, IRI_PATTERN,
-        MAX_SEMANTIC_TEXT_BYTES,
+        structured_error, Mindreader, MutationParameters, TokenBucket, FACT_IRI_PATTERN,
+        IRI_PATTERN, MAX_SEMANTIC_TEXT_BYTES,
     };
     use crate::config::Config;
     use crate::domain::DomainError;
     use crate::error::Error;
     use crate::payload::ToolOutput;
+    use crate::tools::WriteArgs;
     use rmcp::ServerHandler;
-    use serde_json::Value;
+    use serde_json::{json, Value};
 
     fn test_server() -> Mindreader {
         Mindreader::from_config(Config::stub())
@@ -1727,7 +1789,7 @@ mod tests {
             &["scope", "text", "labels", "effectiveAt", "detail", "limit"],
             &["scope", "text"],
         );
-        assert_input_surface("write", &["facts", "scope"], &["facts", "scope"]);
+        assert_input_surface("write", &["facts", "scope", "detail"], &["facts", "scope"]);
         assert_input_surface(
             "revise",
             &[
@@ -1738,17 +1800,42 @@ mod tests {
                 "contradicts",
                 "reason",
                 "effective",
+                "detail",
             ],
             &["scope", "target", "replacement"],
         );
         assert_input_surface(
             "withdraw",
-            &["scope", "target", "subject", "p", "reason"],
+            &["scope", "target", "subject", "p", "reason", "detail"],
             &["scope"],
         );
-        assert_input_surface("judge", &["scope", "ratings"], &["scope", "ratings"]);
-        assert_input_surface("place", &["scope", "edits"], &["scope", "edits"]);
-        assert_input_surface("unify", &["source", "target"], &["source", "target"]);
+        assert_input_surface(
+            "judge",
+            &["scope", "ratings", "detail"],
+            &["scope", "ratings"],
+        );
+        assert_input_surface("place", &["scope", "edits", "detail"], &["scope", "edits"]);
+        assert_input_surface(
+            "unify",
+            &["source", "target", "detail"],
+            &["source", "target"],
+        );
+    }
+
+    #[test]
+    fn mutation_detail_deserializes_outside_typed_graph_arguments() {
+        let request: MutationParameters<WriteArgs> = serde_json::from_value(json!({
+            "scope": [],
+            "detail": "detailed",
+            "facts": [{
+                "s": { "kind": "node", "name": "Subject" },
+                "p": "uses",
+                "o": { "kind": "node", "name": "Object" }
+            }]
+        }))
+        .unwrap();
+        assert_eq!(request.detail.as_deref(), Some("detailed"));
+        assert_eq!(request.args.facts.len(), 1);
     }
 
     #[test]
@@ -2086,6 +2173,7 @@ mod tests {
             recall["properties"]["detail"]["enum"],
             serde_json::json!(["concise", "detailed"])
         );
+        assert_eq!(recall["properties"]["detail"]["default"], "concise");
         assert!(recall["properties"].get("history").is_some());
         assert!(recall["properties"].get("semantic").is_none());
 

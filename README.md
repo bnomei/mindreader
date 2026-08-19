@@ -121,6 +121,8 @@ Mindreader exposes exactly eight [Model Context Protocol (MCP)](https://modelcon
 | Change visibility memberships | `place` |
 | Permanently merge two confirmed identities | `unify` |
 
+Every tool defaults to `detail:"concise"` to minimize result tokens. Recall returns answer-bearing graph content; mutations return compact acknowledgements and the identities needed for later work. Set `detail:"detailed"` only when handles, memberships, per-item changes, ranking, or audit metadata are needed. A concise `write` returns each fact target and no-op status, resolved node handles, the Episode IRI when changed, and advisory review only when non-empty.
+
 The reusable [`using-mindreader` agent skill](skills/using-mindreader/SKILL.md) contains the detailed operating contract, request shapes, and maintenance rules. [`mcp.json`](mcp.json) contains the server metadata and tool inventory.
 
 ## Start here
@@ -287,7 +289,7 @@ Pin the package version in MCP configuration so the client always starts the sam
   "mcpServers": {
     "mindreader": {
       "command": "npx",
-      "args": ["-y", "@bnomei/mindreader@0.5.0"],
+      "args": ["-y", "@bnomei/mindreader@0.6.0"],
       "env": {
         "NEO4J_PASSWORD": "<NEO4J_PASSWORD>",
         "XAI_API_KEY": "<OPTIONAL_XAI_API_KEY>"

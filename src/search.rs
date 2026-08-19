@@ -135,7 +135,7 @@ pub struct RecallArgs {
     /// Node or fact IRI whose current and `validTo` facts are returned.
     #[serde(default)]
     pub history: Option<String>,
-    /// `concise` or `detailed`; omitted defaults to detailed.
+    /// `concise` or `detailed`; omitted defaults to concise.
     #[serde(default)]
     pub detail: Option<String>,
     /// Maximum facts; default 20, at most 100.

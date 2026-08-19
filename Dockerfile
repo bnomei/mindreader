@@ -7,7 +7,7 @@ COPY src ./src
 RUN cargo build --locked --release --bin mindreader
 
 FROM debian:bookworm-slim
-ARG MINDREADER_VERSION=0.5.0
+ARG MINDREADER_VERSION=0.6.0
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*

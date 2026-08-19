@@ -13,7 +13,7 @@ exact query. It builds expiring associative trails to grounded facts, keeps usef
 through reuse, and may include nearby graph context without treating repetition as truth.
 
 ```bash
-npx -y @bnomei/mindreader@0.5.0 --version
+npx -y @bnomei/mindreader@0.6.0 --version
 ```
 
 The launcher downloads the matching checksummed GitHub Release binary on first use and then

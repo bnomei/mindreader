@@ -5,8 +5,11 @@ versions follow Semantic Versioning.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-19
+
 ### Changed
 
+- Default every tool to concise output to reduce token use. Mutation tools now accept `detail`; concise writes return fact acknowledgements, resolved node handles, compact Episode identity, and only non-empty advisory review, while `detail:"detailed"` retains the full audit envelope.
 - Advance the fresh-database graph contract to model v8. Spike classification is stored on each exact relationship rather than as a subject-node label; exact revision Episodes retain previous/replacement fact and SUPERSEDES identities; explicit reassertion can reclassify one fact and revision preserves the old classification unless replaced.
 - Advance the graph contract again to model v9 with optional half-open effective intervals for state facts, state-as-of recall, and separate transaction/effective clocks in history.
 - Define the agent contract as selective prospective memory, tighten tool and skill guidance around lifecycle decisions, lock all eight advertised input surfaces in tests, and rename the public `revise.new` input to `revise.replacement`.
@@ -113,7 +116,8 @@ versions follow Semantic Versioning.
 - Reduced semantic activation recall to metadata plus the selected convergence vector and bounded embedding-provider retries, latency, and response-body memory.
 - Added crates.io and cargo-binstall distribution alongside the existing GitHub, npm, and container release channels.
 
-[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/bnomei/mindreader/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/bnomei/mindreader/releases/tag/v0.6.0
 [0.5.0]: https://github.com/bnomei/mindreader/releases/tag/v0.5.0
 [0.4.0]: https://github.com/bnomei/mindreader/releases/tag/v0.4.0
 [0.3.0]: https://github.com/bnomei/mindreader/releases/tag/v0.3.0

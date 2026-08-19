@@ -61,7 +61,7 @@ impl fmt::Display for ToolOutput {
     }
 }
 
-/// Recall payload verbosity. Omitted/`detailed` is the full envelope.
+/// Agent-facing payload verbosity. Omitted/`concise` minimizes token use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Detail {
     /// Operation and audit envelope, including pasteable handles and mutability.
@@ -71,11 +71,11 @@ pub enum Detail {
 }
 
 impl Detail {
-    /// Parse recall verbosity; omitted or empty defaults to `detailed`.
+    /// Parse payload verbosity; omitted or empty defaults to `concise`.
     pub fn parse(value: Option<&str>) -> Result<Self> {
         match value.map(str::trim).filter(|value| !value.is_empty()) {
-            None | Some("detailed") => Ok(Self::Detailed),
-            Some("concise") => Ok(Self::Concise),
+            None | Some("concise") => Ok(Self::Concise),
+            Some("detailed") => Ok(Self::Detailed),
             Some(other) => Err(DomainError::InvalidInput(format!(
                 "detail must be concise or detailed, not {other:?}"
             ))
@@ -89,6 +89,14 @@ impl Detail {
             Self::Detailed => "detailed",
             Self::Concise => "concise",
         }
+    }
+}
+
+impl ToolOutput {
+    /// Apply MCP mutation verbosity after the typed service has produced its audit envelope.
+    pub fn with_mutation_detail(mut self, tool: &str, detail: Detail) -> Result<Self> {
+        apply_mutation_detail(&mut self.0, tool, detail)?;
+        Ok(self)
     }
 }
 
@@ -638,6 +646,137 @@ pub fn finish_mutation(
     Ok(result)
 }
 
+/// Compact one Episode to the identity needed to find its full audit record later.
+fn thin_episode(value: &Value) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    Ok(json!({
+        "iri": required_field(value, "iri", "mutation episode")?,
+    }))
+}
+
+/// Keep advisory review only when it contains an actionable suggestion or alternative.
+fn nonempty_review(value: &Value) -> Option<Value> {
+    ["unify", "alternatives"]
+        .iter()
+        .any(|key| {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .is_some_and(|items| !items.is_empty())
+        })
+        .then(|| value.clone())
+}
+
+/// Collect resolved endpoint handles, including persisted literals used by `place`.
+fn mutation_node_handles(facts: &[Value]) -> Result<Vec<Value>> {
+    let mut handles = Vec::new();
+    let mut seen = HashSet::new();
+    for fact in facts {
+        for key in ["s", "o"] {
+            let endpoint = fact
+                .get(key)
+                .ok_or_else(|| crate::operation_error!("write fact is missing {key}"))?;
+            let target = endpoint
+                .get("target")
+                .ok_or_else(|| crate::operation_error!("write fact {key} is missing target"))?;
+            exact_handle_iri(target, "node", "write endpoint target")?;
+            push_unique_handle(&mut handles, &mut seen, target.clone());
+        }
+    }
+    Ok(handles)
+}
+
+/// Compact mutation outputs by default; detailed retains the complete audit envelope.
+fn apply_mutation_detail(result: &mut Value, tool: &str, detail: Detail) -> Result<()> {
+    result["detail"] = json!(detail.as_str());
+    if detail == Detail::Detailed {
+        return Ok(());
+    }
+
+    let mut out =
+        Map::from_iter([
+            (
+                "ok".into(),
+                required_field(result, "ok", "mutation result")?,
+            ),
+            ("detail".into(), json!(detail.as_str())),
+            (
+                "noop".into(),
+                required_field(result, "noop", "mutation result")?,
+            ),
+            (
+                "episode".into(),
+                thin_episode(result.get("episode").ok_or_else(|| {
+                    crate::operation_error!("mutation result is missing episode")
+                })?)?,
+            ),
+        ]);
+
+    match tool {
+        "write" => {
+            let facts = result
+                .get("facts")
+                .and_then(Value::as_array)
+                .ok_or_else(|| crate::operation_error!("write result is missing facts"))?;
+            out.insert(
+                "facts".into(),
+                Value::Array(
+                    facts
+                        .iter()
+                        .map(|fact| {
+                            Ok(json!({
+                                "target": required_field(fact, "target", "write fact")?,
+                                "noop": required_field(fact, "noop", "write fact")?,
+                            }))
+                        })
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            );
+            let nodes = mutation_node_handles(facts)?;
+            if !nodes.is_empty() {
+                out.insert("nodes".into(), Value::Array(nodes));
+            }
+            if let Some(review) = result.get("review").and_then(nonempty_review) {
+                out.insert("review".into(), review);
+            }
+        }
+        "revise" => {
+            for key in ["target", "previousTarget"] {
+                out.insert(key.into(), required_field(result, key, "revise result")?);
+            }
+            if let Some(review) = result.get("review").and_then(nonempty_review) {
+                out.insert("review".into(), review);
+            }
+        }
+        "withdraw" => {
+            for key in ["withdrawn", "withdrawnTargets"] {
+                out.insert(key.into(), required_field(result, key, "withdraw result")?);
+            }
+        }
+        "judge" | "place" => {
+            out.insert(
+                "summary".into(),
+                required_field(result, "summary", "batch mutation result")?,
+            );
+        }
+        "unify" => {
+            let node = result
+                .get("node")
+                .ok_or_else(|| crate::operation_error!("unify result is missing node"))?;
+            out.insert("node".into(), thin_node(node)?);
+        }
+        other => {
+            return Err(crate::operation_error!(
+                "cannot apply mutation detail for unknown tool {other:?}"
+            ));
+        }
+    }
+    *result = Value::Object(out);
+    Ok(())
+}
+
 /// Advisory unify row with exact pasteable handles and separate display names.
 pub fn unify_review_item(
     source: &str,
@@ -668,6 +807,66 @@ mod tests {
     fn tool_output_requires_an_object_root() {
         assert!(ToolOutput::from_value(json!({ "scope": [] })).is_ok());
         assert!(ToolOutput::from_value(json!([])).is_err());
+    }
+
+    #[test]
+    fn omitted_detail_defaults_to_concise() {
+        assert_eq!(Detail::parse(None).unwrap(), Detail::Concise);
+        assert_eq!(Detail::parse(Some("detailed")).unwrap(), Detail::Detailed);
+    }
+
+    #[test]
+    fn concise_write_is_a_compact_acknowledgement() {
+        let output = ToolOutput::from_value(json!({
+            "ok": true,
+            "noop": false,
+            "scope": ["project:x"],
+            "episode": { "iri": "mindreader:episode/e", "at": "now", "tool": "write" },
+            "facts": [{
+                "target": { "kind": "fact", "iri": "mindreader:relationship/f" },
+                "noop": false,
+                "s": {
+                    "kind": "node",
+                    "iri": "mindreader:element/s",
+                    "target": { "kind": "node", "iri": "mindreader:element/s" }
+                },
+                "p": "uses",
+                "o": {
+                    "kind": "literal",
+                    "iri": "mindreader:literal/o",
+                    "target": { "kind": "node", "iri": "mindreader:literal/o" }
+                }
+            }],
+            "review": { "unify": [], "alternatives": [] },
+            "handles": {
+                "facts": [{ "kind": "fact", "iri": "mindreader:relationship/f" }],
+                "nodes": [{ "kind": "node", "iri": "mindreader:element/s" }],
+                "current": null,
+                "retired": null,
+                "unify": []
+            }
+        }))
+        .unwrap()
+        .with_mutation_detail("write", Detail::Concise)
+        .unwrap();
+
+        assert_eq!(
+            *output,
+            json!({
+                "ok": true,
+                "detail": "concise",
+                "noop": false,
+                "episode": { "iri": "mindreader:episode/e" },
+                "facts": [{
+                    "target": { "kind": "fact", "iri": "mindreader:relationship/f" },
+                    "noop": false
+                }],
+                "nodes": [
+                    { "kind": "node", "iri": "mindreader:element/s" },
+                    { "kind": "node", "iri": "mindreader:literal/o" }
+                ]
+            })
+        );
     }
 
     #[test]
