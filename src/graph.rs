@@ -463,8 +463,10 @@ async fn verify_required_constraints(graph: &Graph) -> Result<()> {
         let properties = row
             .get::<Vec<String>>("properties")
             .with_context(|| format!("read properties of Neo4j constraint {name}"))?;
-        if constraint_type != "UNIQUENESS"
-            || entity_type != "NODE"
+        if !matches!(
+            constraint_type.as_str(),
+            "UNIQUENESS" | "NODE_PROPERTY_UNIQUENESS"
+        ) || entity_type != "NODE"
             || !same_string_members(&labels_or_types, &[label])
             || !same_string_members(&properties, &[property])
         {
